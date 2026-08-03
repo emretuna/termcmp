@@ -1,0 +1,518 @@
+mod harness;
+
+use harness::TermcmpProcess;
+use parser::test_utils::build_osc7772_envelope;
+use std::thread;
+use std::time::Duration;
+
+/// Convert an OSC 7772 envelope (raw bytes) into a `printf`-compatible shell
+/// command string. Each non-printable byte is emitted as an octal `\NNN`
+/// escape (3-digit, leading zero) that `/bin/sh`'s `printf` interprets — we
+/// use octal `\NNN` rather than `\xHH` because hex escapes in `printf` are
+/// not universally supported, whereas octal `\NNN` is POSIX-portable.
+///
+/// `%` (0x25) is emitted as `%%`: the envelope payload is percent-encoded, so
+/// any buffer char outside the allow-list arrives as `%XX`. A literal `%` in
+/// `printf`'s format string starts a conversion specifier and would truncate
+/// the OSC frame, so it must be doubled. `'` is backslash-escaped so it does
+/// not close the single-quoted format argument.
+///
+/// The envelope is wrapped in `printf '...'` so the shell emits the bytes to
+/// its stdout (which parser sees as PTY output), and a `; read <gate>`
+/// suffix keeps the shell parked so it cannot race the popup render.
+fn osc_printf_cmd(envelope: &[u8], gate: &str) -> String {
+    let mut escaped = String::new();
+    for &b in envelope {
+        match b {
+            b'\'' => escaped.push_str("\\'"),
+            b'%' => escaped.push_str("%%"), // literal % — printf format escape
+            0x20..=0x7e => escaped.push(b as char), // printable ASCII (not quote/percent)
+            _ => escaped.push_str(&format!("\\{:03o}", b)),
+        }
+    }
+    format!("printf '{}'; read {}", escaped, gate)
+}
+
+/// A percent-encoded byte in the envelope payload (`%XX`) must be doubled to
+/// `%%XX` in the `printf` format string. A bare `%` starts a printf
+/// conversion specifier and would truncate the OSC frame at that point — see
+/// the commit that introduced this escape. A buffer containing `;` encodes to
+/// `%3B` via the OSC 7772 allow-list, exercising the percent path.
+#[test]
+fn osc_printf_cmd_doubles_percent_in_format_string() {
+    let envelope = build_osc7772_envelope("a;b", 3);
+    // Sanity: the envelope itself carries exactly one single-percent escape.
+    assert_eq!(
+        envelope.iter().filter(|&&b| b == b'%').count(),
+        1,
+        "envelope should percent-encode ';' as exactly one %3B: {:?}",
+        String::from_utf8_lossy(&envelope),
+    );
+
+    let cmd = osc_printf_cmd(&envelope, "_gate");
+    assert!(
+        cmd.contains("%%3B"),
+        "printf format must double the percent (%%3B), got: {cmd:?}",
+    );
+    // Every `%` in the format must be part of a `%%` pair: stripping all
+    // `%%` pairs must leave zero stray `%`. A bare `%3B` (the bug) leaves one.
+    let stray_percents = cmd.replace("%%", "").matches('%').count();
+    assert_eq!(
+        stray_percents, 0,
+        "printf format must not leave a bare single percent, got: {cmd:?}",
+    );
+}
+
+/// DECSC. Emitted by both `render_popup` and `clear_popup`; presence after a
+/// clean baseline indicates popup activity (not uniquely a fresh render).
+const POPUP_RENDER_MARKER: &[u8] = b"\x1b7";
+/// DECRC. Emitted near the end of `clear_popup` (an end-sync sequence may
+/// follow), so its appearance after a dismiss signals the teardown ran.
+const POPUP_TEARDOWN_MARKER: &[u8] = b"\x1b8";
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Drives a printable byte through the shell's pending read so the parser sees
+/// a display update without leaking into the next command.
+///
+/// Depends on the inner shell's TTY layer being in cooked mode with ECHO on:
+/// the byte we write to the master is consumed by `read` and only reaches the
+/// parser via the kernel echo. Do not call this against a shell that disables
+/// echo (e.g. `read -s`, `stty -echo`, or an init script that flips raw mode);
+/// the deferred trigger will never resolve and the test will time out.
+fn advance_display(proc: &mut TermcmpProcess) -> usize {
+    let mark = proc.output_len();
+    proc.write_raw(b"x");
+    mark
+}
+
+#[test]
+fn test_harness_pty_process_lock_is_exclusive() {
+    let _first_guard = harness::acquire_pty_process_lock_for_test();
+    assert!(
+        !harness::pty_process_lock_is_available_for_test(),
+        "second PTY-backed smoke process lock was available while first lock was held"
+    );
+}
+
+#[test]
+fn test_echo_passthrough() {
+    let mut proc = TermcmpProcess::spawn();
+    proc.send_line("echo hello_smoke_test");
+    proc.expect_output("hello_smoke_test");
+    proc.exit_with_code(0);
+}
+
+#[test]
+fn test_exit_code_zero() {
+    let mut proc = TermcmpProcess::spawn();
+    let code = proc.exit_with_code(0);
+    assert_eq!(code, 0, "expected exit code 0, got {}", code);
+}
+
+#[test]
+fn test_exit_code_nonzero() {
+    let mut proc = TermcmpProcess::spawn();
+    let code = proc.exit_with_code(42);
+    assert_eq!(code, 42, "expected exit code 42, got {}", code);
+}
+
+#[test]
+fn test_large_output() {
+    let mut proc = TermcmpProcess::spawn();
+    proc.send_line("seq 1 5000");
+    // Wait for a number that appears only in seq's output (not in the echoed command).
+    // "5000" also appears in "seq 1 5000", so we wait for "4999" instead.
+    proc.expect_output("4999");
+
+    // Poll until output buffer has stabilized (no new bytes for 500ms).
+    let mut prev_len = 0;
+    for _ in 0..10 {
+        thread::sleep(Duration::from_millis(500));
+        let snapshot = proc.output_snapshot();
+        if snapshot.len() == prev_len {
+            break;
+        }
+        prev_len = snapshot.len();
+    }
+
+    let snapshot = proc.output_snapshot();
+    let text = String::from_utf8_lossy(&snapshot);
+    // Check a spread of numbers. Use numbers > 4 digits to avoid false positives
+    // from ANSI escape sequence parameters (e.g. "\x1b[100;1H" cursor positioning).
+    for n in &[1000, 2500, 3333, 4999, 5000] {
+        let needle = format!("{}", n);
+        assert!(
+            text.contains(&needle),
+            "large output missing expected number {} (output {} bytes)",
+            n,
+            snapshot.len()
+        );
+    }
+    proc.exit_with_code(0);
+}
+
+#[test]
+fn test_environment_preserved() {
+    let mut proc = TermcmpProcess::spawn();
+    proc.send_line("echo HOME_IS=$HOME");
+    proc.expect_output("HOME_IS=/");
+    proc.exit_with_code(0);
+}
+
+#[test]
+fn test_pipe_passthrough() {
+    let mut proc = TermcmpProcess::spawn();
+    proc.send_line("echo pipe_marker | cat");
+    proc.expect_output("pipe_marker");
+    proc.exit_with_code(0);
+}
+
+#[test]
+fn test_rapid_input() {
+    let mut proc = TermcmpProcess::spawn();
+    for i in 0..20 {
+        proc.send_line(&format!("echo rapid_{}", i));
+    }
+    proc.expect_output("rapid_19");
+
+    let snapshot = proc.output_snapshot();
+    let text = String::from_utf8_lossy(&snapshot);
+    assert!(text.contains("rapid_0"), "missing rapid_0 in output");
+    assert!(text.contains("rapid_10"), "missing rapid_10 in output");
+    proc.exit_with_code(0);
+}
+
+#[test]
+fn test_memory_baseline() {
+    let proc = TermcmpProcess::spawn();
+    thread::sleep(Duration::from_secs(1));
+
+    if let Some(pid) = proc.child_pid() {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.to_string()])
+            .output()
+            .expect("failed to run ps");
+        let rss_str = String::from_utf8_lossy(&output.stdout);
+        if let Ok(rss_kb) = rss_str.trim().parse::<u64>() {
+            let rss_mb = rss_kb / 1024;
+            assert!(
+                rss_mb < 500,
+                "RSS is {} MB, exceeds 500 MB threshold",
+                rss_mb
+            );
+        }
+        // If we can't parse RSS (process already exited), that's fine — skip the check.
+    }
+}
+
+#[test]
+fn test_clean_startup_shutdown() {
+    let mut proc = TermcmpProcess::spawn();
+    proc.send_line("echo alive");
+    proc.expect_output("alive");
+    let code = proc.exit_with_code(0);
+    assert_eq!(code, 0, "expected clean exit 0, got {}", code);
+}
+
+#[test]
+fn test_multiple_commands() {
+    let mut proc = TermcmpProcess::spawn();
+    proc.send_line("echo aaa");
+    proc.expect_output("aaa");
+    proc.send_line("echo bbb");
+    proc.expect_output("bbb");
+    proc.send_line("echo ccc");
+    proc.expect_output("ccc");
+    proc.exit_with_code(0);
+}
+
+/// End-to-end popup smoke test.
+///
+/// Verifies the entire UX pipeline: OSC 7772 buffer-report (from simulated
+/// shell integration) -> auto-trigger -> popup renders with git-spec
+/// subcommand text -> ESC dismisses the popup.
+///
+/// Architecture notes:
+/// - The harness wraps `/bin/sh` (no shell integration). Without shell
+///   integration, the shell will NOT emit OSC 7772 buffer-report sequences,
+///   so the parser's `command_buffer` stays empty, and `handler.trigger()`
+///   would dismiss immediately (see pty/src/handler.rs: `if
+///   buffer.is_empty() { return; }`).
+/// - To simulate shell integration without installing it, we have the
+///   inner shell print OSC 7772 itself via `printf`. The shell executes
+///   printf, emits the raw ANSI bytes to its stdout, which flow through
+///   parser's VT state machine and set `command_buffer = "git "` with
+///   cursor = 4. This also sets `buffer_dirty = true`, which Task B
+///   (stdout -> terminal loop) notices and uses to fire `trigger()`
+///   automatically.
+/// - No manual Ctrl+/ is needed — the auto-trigger path from OSC 7772 is
+///   exactly what real shell integration does on every keystroke.
+///
+/// Assumptions:
+///   - The unspecced-arg fallback shows filesystem directory entries for
+///     `git ` (no spec system). Directory entries have a trailing `/` suffix.
+///   - The 150ms debounce fires after the space at the end of "git ",
+///     activating the auto-trigger path.
+///   - `clear_popup` emits DECSC (`\x1b7`) followed by blanking writes and
+///     DECRC (`\x1b8`). DECRC appearing after our ESC mark = dismissed.
+///   - Default dismiss keybind is ESC (see Keybindings::default()).
+///
+/// Determinism: byte-level polling with condvar-based wakeup, 5s timeouts,
+/// no blind sleeps.
+#[test]
+fn test_popup_renders_and_dismisses_on_trigger() {
+    let mut proc = TermcmpProcess::spawn();
+
+    // Settle the shell so our printf doesn't race with any banner output.
+    proc.send_line("echo smoke_popup_ready_marker");
+    proc.expect_output("smoke_popup_ready_marker");
+
+    // Mark the pre-trigger offset — popup render bytes must appear after.
+    let mark_before_trigger = proc.output_len();
+
+    // OSC 7772 envelope with an inline display byte so the deferred trigger
+    // resolves without advance_display. Sending "x" as a keystroke races with
+    // the popup lifecycle on slow CI runners: it gets consumed by `read`,
+    // unblocking the shell, whose prompt emission dismisses the popup
+    // asynchronously before the test's ESC/Enter can act on it.
+    let mut envelope = build_osc7772_envelope("git ", 4);
+    envelope.push(b'X');
+    proc.send_line(&osc_printf_cmd(&envelope, "_ghost_popup_hold"));
+
+    let popup_rendered = proc.wait_for_bytes_after(
+        POPUP_RENDER_MARKER,
+        mark_before_trigger,
+        Duration::from_secs(5),
+    );
+
+    if !popup_rendered {
+        let snapshot = proc.output_snapshot();
+        let since_redraw = &snapshot[mark_before_trigger..];
+        panic!(
+            "Popup did not render within 5s after OSC 7772 with inline display byte.\n\
+             Bytes since redraw mark ({} bytes, lossy UTF-8):\n{:?}",
+            since_redraw.len(),
+            String::from_utf8_lossy(since_redraw),
+        );
+    }
+
+    // Assert the popup contains suggestion rows. With the inline display
+    // byte the buffer context stays "git ", so the unspecced-arg fallback
+    // shows directory listings. Check for any Nerd Font PUA gutter icon
+    // rather than provider-specific content — the icon set is stable across
+    // themes and configs (dark/catppuccin, Ask AI on/off).
+    let snapshot_after_popup = proc.output_snapshot();
+    let popup_slice = &snapshot_after_popup[mark_before_trigger..];
+    let popup_text = String::from_utf8_lossy(popup_slice);
+
+    // Check for any Nerd Font PUA glyph — every suggestion kind maps to a
+    // PUA icon (U+E000–U+F8FF or U+F0000–U+FFFFD) except EnvVar ('$').
+    // This is theme-independent and config-independent (works with or
+    // without Ask AI enabled, dark or catppuccin theme, etc.).
+    let has_gutter_icon = popup_text
+        .chars()
+        .any(|c| matches!(c, '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..='\u{FFFFD}'));
+    assert!(
+        has_gutter_icon,
+        "Popup rendered (DECSC seen) but no suggestion rows found in its output. \
+         Expected at least one Nerd Font gutter icon (PUA codepoint).\n\
+         Popup slice ({} bytes, lossy UTF-8):\n{:?}",
+        popup_slice.len(),
+        popup_text,
+    );
+
+    // Mark offset before dismiss — dismissal bytes must appear after.
+    let mark_before_esc = proc.output_len();
+
+    // Send a lone ESC (0x1B). The input parser treats a lone ESC at end
+    // of buffer as KeyEvent::Escape, which dispatches dismiss().
+    proc.write_raw(&[0x1B]);
+
+    // clear_popup emits DECSC + movement + blanks + DECRC. The DECRC
+    // (`\x1b8`) appearing after the ESC mark is the dismiss signal.
+    let dismissed = proc.wait_for_bytes_after(
+        POPUP_TEARDOWN_MARKER,
+        mark_before_esc,
+        Duration::from_secs(5),
+    );
+
+    if !dismissed {
+        let snapshot = proc.output_snapshot();
+        let since_esc = &snapshot[mark_before_esc..];
+        panic!(
+            "Popup did not dismiss within 5s after ESC.\n\
+             Bytes since ESC mark ({} bytes, lossy UTF-8):\n{:?}",
+            since_esc.len(),
+            String::from_utf8_lossy(since_esc),
+        );
+    }
+
+    // Release the blocking `read` used to keep shell output from racing the
+    // visible-popup dismissal path.
+    proc.send_line("");
+
+    proc.exit_with_code(0);
+}
+
+#[test]
+fn test_popup_is_cleared_before_later_shell_output() {
+    let mut proc = TermcmpProcess::spawn();
+
+    proc.send_line("PS1='smoke_prompt_repaint_marker '");
+    proc.expect_output("smoke_prompt_repaint_marker");
+
+    // Inline display byte triggers the popup without unblocking the shell's
+    // `read`. This avoids the advance_display "x" race where the keystroke
+    // unblocks `read`, the shell prints its prompt (with the marker), and
+    // the popup renders AFTER the marker — making the search window miss it.
+    let mut envelope = build_osc7772_envelope("git ", 4);
+    envelope.push(b'X');
+    let mark_before_redraw = proc.output_len();
+    proc.send_line(&osc_printf_cmd(&envelope, "_tc_smoke_gate"));
+
+    let popup_rendered = proc.wait_for_bytes_after(
+        POPUP_RENDER_MARKER,
+        mark_before_redraw,
+        Duration::from_secs(5),
+    );
+    if !popup_rendered {
+        let snapshot = proc.output_snapshot();
+        let since_redraw = &snapshot[mark_before_redraw..];
+        panic!(
+            "Popup did not render after OSC 7772 with inline display byte.\n\
+             Bytes since redraw mark ({} bytes, lossy UTF-8):\n{:?}",
+            since_redraw.len(),
+            String::from_utf8_lossy(since_redraw),
+        );
+    }
+
+    let mark_after_popup = proc.output_len();
+    // Enter dismisses the popup (proxy writes \x1b8 cleanup to stdout first)
+    // and forwards \r to the PTY, unblocking `read`. The shell then prints
+    // its prompt with the marker. The proxy's ordering guarantees cleanup
+    // bytes reach the terminal before the shell's response.
+    let marker = b"smoke_prompt_repaint_marker";
+    proc.send_line("");
+    let marker_seen = proc.wait_for_bytes_after(marker, mark_after_popup, Duration::from_secs(5));
+    if !marker_seen {
+        let snapshot = proc.output_snapshot();
+        let since_popup = &snapshot[mark_after_popup..];
+        panic!(
+            "Shell repaint marker did not arrive after popup render.\n\
+             Bytes since popup mark ({} bytes, lossy UTF-8):\n{:?}",
+            since_popup.len(),
+            String::from_utf8_lossy(since_popup),
+        );
+    }
+
+    let snapshot = proc.output_snapshot();
+    let since_popup = &snapshot[mark_after_popup..];
+    let marker_pos = find_subslice(since_popup, marker).expect("marker position");
+    let before_marker = &since_popup[..marker_pos];
+    assert!(
+        find_subslice(before_marker, b"\x1b8").is_some(),
+        "popup cleanup must finish before later shell output is forwarded. \
+         Bytes before marker ({} bytes, lossy UTF-8):\n{:?}",
+        before_marker.len(),
+        String::from_utf8_lossy(before_marker),
+    );
+
+    let after_marker = &since_popup[marker_pos + marker.len()..];
+    assert!(
+        find_subslice(after_marker, b"\x1b7").is_none(),
+        "no stale popup render should follow shell repaint output. \
+         Bytes after marker ({} bytes, lossy UTF-8):\n{:?}",
+        after_marker.len(),
+        String::from_utf8_lossy(after_marker),
+    );
+
+    proc.exit_with_code(0);
+}
+
+#[test]
+fn test_popup_defers_until_display_after_osc_only_pty_read() {
+    let mut proc = TermcmpProcess::spawn();
+
+    proc.send_line("echo defer_smoke_ready_marker");
+    proc.expect_output("defer_smoke_ready_marker");
+
+    // `printf` interprets the octal escapes into ESC/BEL, which is what
+    // frames the OSC 7772 sequence; `read` then parks the shell so it cannot
+    // emit follow-up display bytes that would resolve the defer on their own.
+    proc.send_line(&osc_printf_cmd(
+        &build_osc7772_envelope("git ", 4),
+        "_tc_defer_gate",
+    ));
+
+    let mark_before_redraw = advance_display(&mut proc);
+
+    let popup_rendered = proc.wait_for_bytes_after(
+        POPUP_RENDER_MARKER,
+        mark_before_redraw,
+        Duration::from_secs(5),
+    );
+    if !popup_rendered {
+        let snapshot = proc.output_snapshot();
+        let since_redraw = &snapshot[mark_before_redraw..];
+        panic!(
+            "Deferred trigger failed to resolve into a popup render after \
+             display advanced.\n\
+             Bytes since redraw mark ({} bytes, lossy UTF-8):\n{:?}",
+            since_redraw.len(),
+            String::from_utf8_lossy(since_redraw),
+        );
+    }
+
+    // Drain anything still in flight, then unblock the shell's read.
+    proc.write_raw(&[0x1B]); // ESC dismisses the popup so a clean prompt repaint can happen.
+    proc.send_line("");
+    proc.exit_with_code(0);
+}
+
+#[test]
+fn test_popup_renders_for_osc_with_inline_display_byte() {
+    let mut proc = TermcmpProcess::spawn();
+
+    proc.send_line("echo inline_smoke_ready_marker");
+    proc.expect_output("inline_smoke_ready_marker");
+
+    let mark_before_trigger = proc.output_len();
+
+    // OSC 7772 envelope + printable byte in a single `printf` payload. The
+    // shell emits both before parking on `read`, so the popup must eventually
+    // render without any external `advance_display` nudge. Same-batch
+    // coalescing into one PTY read is not asserted here — kernel chunking can
+    // split the bytes across reads and the proxy's deferred path is allowed
+    // to resolve it.
+    let mut envelope_with_display = build_osc7772_envelope("git ", 4);
+    envelope_with_display.push(b'X');
+    proc.send_line(&osc_printf_cmd(&envelope_with_display, "_tc_inline_gate"));
+
+    let popup_rendered = proc.wait_for_bytes_after(
+        POPUP_RENDER_MARKER,
+        mark_before_trigger,
+        Duration::from_secs(5),
+    );
+    if !popup_rendered {
+        let snapshot = proc.output_snapshot();
+        let since_mark = &snapshot[mark_before_trigger..];
+        panic!(
+            "Popup did not render within 5s for OSC with inline display byte.\n\
+             Bytes since mark ({} bytes, lossy UTF-8):\n{:?}",
+            since_mark.len(),
+            String::from_utf8_lossy(since_mark),
+        );
+    }
+
+    proc.write_raw(&[0x1B]);
+    proc.send_line("");
+    proc.exit_with_code(0);
+}

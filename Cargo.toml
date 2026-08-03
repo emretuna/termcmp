@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/termcmp",
+    "crates/pty",
+    "crates/parser",
+    "crates/buffer",
+    "crates/suggest",
+    "crates/overlay",
+    "crates/config",
+    "crates/terminal",
+    "crates/llm",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+license = "MIT"
+authors = ["Emre Tuna"]
+repository = "https://github.com/emretuna/termcmp"
+homepage = "https://github.com/emretuna/termcmp"
+
+[workspace.dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-util",
+    "fs",
+    "process",
+    "signal",
+    "time",
+    "sync",
+] }
+anyhow = "1"
+tracing = "0.1"
+tracing-core = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+crossterm = "0.29"
+toml_edit = "0.25"
+toml = "1"
+sha2 = "0.11"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[profile.release]
+strip = "symbols"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

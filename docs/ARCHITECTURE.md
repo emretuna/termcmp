@@ -1,0 +1,232 @@
+# Architecture
+
+Termcmp is a terminal-native autocomplete engine that works as a PTY proxy — it sits between your terminal emulator and your shell, intercepting the data stream to render suggestion popups using native ANSI escape sequences. No Accessibility API, no IME hacks.
+
+## How It Works
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                  Terminal Emulator                        │
+│       (Ghostty, Kitty, WezTerm, Alacritty, ...)         │
+│       Receives: shell output + overlay sequences         │
+└──────────────────────┬───────────────────────────────────┘
+                       │ stdin / stdout (raw bytes)
+                       ▼
+              ┌─────────────────┐
+              │  Termcmp  │
+              │  (PTY Proxy)     │
+              │                  │
+              │  ┌────────────┐  │
+              │  │ VT Parser  │◄─┼── parses shell output, tracks cursor
+              │  └─────┬──────┘  │   position, screen dims, prompt bounds
+              │        │         │
+              │        ▼         │
+              │  ┌────────────┐  │
+              │  │ Buffer     │  │
+              │  │ Tracker    │──┼── reconstructs current command line,
+              │  └─────┬──────┘  │   detects command context
+              │        │         │
+              │        ▼         │
+              │  ┌────────────┐  │
+              │  │ Suggestion │  │
+              │  │ Engine     │──┼── fuzzy matching against completions
+              │  └─────┬──────┘  │   (commands, filesystem, history)
+              │        │         │
+              │        ▼         │
+              │  ┌────────────┐  │
+              │  │ Overlay    │  │
+              │  │ Renderer   │──┼── renders popup using ANSI sequences
+              │  └────────────┘  │   with synchronized output
+              │                  │
+              └────────┬─────────┘
+                       │ PTY master ↔ slave
+                       ▼
+              ┌──────────────────┐
+              │  Shell Process   │
+              │  (zsh/bash/fish) │
+              └──────────────────┘
+```
+
+## Data Flow
+
+1. User types a keystroke in the terminal emulator
+2. `pty` receives it on stdin — if the popup is visible, intercept navigation keys (Tab, arrows, Escape, Enter); otherwise forward to the shell PTY
+3. Shell produces output, which flows through `parser` (VT state tracking) then to terminal stdout
+4. `parser` tracks cursor position, screen dimensions, prompt boundaries, CWD, and the shell's exported env snapshot using shell-emitted OSC markers
+5. On trigger conditions (space after command, `/`, `-`, `--`, Ctrl+/, or delay timeout), `suggest` computes ranked suggestions
+6. Static suggestions (subcommands, options, templates) render immediately via `overlay`
+7. Async providers (shell completions, AI) execute in background; results merge into the popup progressively without resetting cursor position
+
+## Crate Map
+
+The workspace contains 9 crates under `crates/`:
+
+| Crate | Purpose | Key Dependencies |
+|-------|---------|------------------|
+| [`termcmp`](../crates/termcmp/) | Binary entry point, CLI (`clap`), install/uninstall, `config`, `doctor` | clap |
+| [`pty`](../crates/pty/) | PTY proxy event loop — spawns shell, multiplexes stdin/stdout with `tokio::select!`, handles SIGWINCH, async provider merge | portable-pty, tokio |
+| [`parser`](../crates/parser/) | VT escape sequence parsing — cursor position, screen dimensions, prompt boundaries (OSC 133 + OSC 7771), CWD (OSC 7), exported env (OSC 7773) | vte |
+| [`buffer`](../crates/buffer/) | Command line reconstruction — current command, argument position, pipes, redirects, quotes | |
+| [`suggest`](../crates/suggest/) | Suggestion engine — dispatches to providers, fuzzy-ranks with frizbee | frizbee, serde_json |
+| [`overlay`](../crates/overlay/) | ANSI popup rendering — cursor save/restore, synchronized output, scroll-to-make-room, scrollbar, fuzzy match highlighting | |
+| [`config`](../crates/config/) | TOML config, keybindings, themes (presets + custom styles), suggestion timeouts | serde, toml |
+| [`terminal`](../crates/terminal/) | Terminal detection and capability profiling — `TerminalProfile` with `RenderStrategy` and `PromptDetection` enums | |
+| [`llm`](../crates/llm/) | OpenAI-compatible chat-completions client powering the AI suggestion and Ask-AI providers | reqwest, serde_json |
+
+### Dependency Graph
+
+```
+termcmp ──► pty ──► parser
+                     │    ──► buffer
+                     │    ──► config
+                     │    ──► terminal
+                     │    ──► suggest ──► buffer
+                     │                  └─► config
+                     │    ──► overlay ──► suggest
+                     │                  └─► terminal
+```
+
+`parser`, `buffer`, `config`, and `terminal` are leaf crates with no internal dependencies. `suggest` depends on `buffer` and `config`. `overlay` depends on `suggest` and `terminal`. `llm` depends on `suggest` and `buffer`. `pty` depends on every other crate and ties them all together.
+
+## Key Design Decisions
+
+### PTY Proxy over Shell Plugin
+
+Termcmp runs as a PTY proxy rather than a zsh/fish plugin. The proxy sits between the terminal and the shell, seeing all bytes in both directions. This means:
+
+- **No zle widget conflicts** — doesn't hook into shell internals
+- **No plugin manager dependencies** — one binary, works after install
+- **No RPROMPT corruption** — popup rendering is independent of shell prompt
+- **Shell-agnostic core** — the same proxy works with zsh, bash, and fish
+
+The tradeoff is complexity: we have to maintain our own VT parser to track cursor position, rather than asking the shell where it is.
+
+### Parser-Only VT Tracking (vte)
+
+We use the `vte` crate — a parser-only VT state machine that fires callbacks per escape sequence. We do NOT maintain a full screen buffer (like `alacritty_terminal` or `vt100`). We only track:
+
+- Cursor position (row, column)
+- Screen dimensions
+- Prompt boundaries (via OSC 133 / OSC 7771)
+- Current working directory (via OSC 7)
+- Exported shell environment snapshot (via OSC 7773)
+
+This keeps memory usage minimal and parsing fast. The tradeoff: cursor position can drift from reality over time (complex escape sequences we don't fully model). We correct for this using CPR sync — periodically requesting the terminal's actual cursor position via `CSI 6n` and reconciling.
+
+### Frizbee for Fuzzy Matching
+
+`frizbee` is the sole fuzzy matching engine. It supports two match modes — `Fuzzy` (subsequence: `gco` matches `git checkout`) and `Substring` (contiguous: `cl` matches `clone` but not `calendar`) — with smart case sensitivity. The matcher is constructed once per query via `Matcher::from_query` and applied to the full candidate list in a single `match_list_indices` pass, returning scored matches with character-level indices for popup highlighting. For an autocomplete tool running on every keystroke, this keeps ranking well under 1ms for 10,000 candidates.
+
+### Synchronized Output (DECSET 2026)
+
+Modern terminals support DECSET 2026 — the terminal buffers all output between begin/end markers and renders it atomically. This eliminates flicker during popup rendering. Ghostty, Kitty, WezTerm, Alacritty, and Rio all support this.
+
+For terminals that don't (iTerm2, Terminal.app), we fall back to a pre-render buffer strategy: build the entire frame into a byte buffer and emit it in a single `write()` syscall, relying on kernel write atomicity.
+
+### Terminal Capability Profiling
+
+The `terminal` crate detects the terminal at startup and assigns capabilities via a `TerminalProfile`:
+
+- **RenderStrategy** — `Synchronized` (DECSET 2026) or `PreRenderBuffer` (single write)
+- **PromptDetection** — `Osc133` (native) or `ShellIntegration` (OSC 7771 markers)
+
+Detection uses `TERM_PROGRAM` plus terminal-specific env vars (`KITTY_WINDOW_ID`, `WEZTERM_UNIX_SOCKET`, `ALACRITTY_SOCKET`, `ZED_TERM`, `VSCODE_IPC_HOOK_CLI`). Inside tmux, these env vars leak through from the outer terminal, allowing detection of the host terminal.
+
+The overlay and parser crates are strategy-driven — they query the profile for capabilities rather than checking terminal names. Adding a new terminal means adding one enum variant and one match arm in `terminal`; no other crate needs changes.
+
+## Proxy Task Architecture
+
+The PTY proxy runs four concurrent worker tasks plus a main coordination loop:
+
+| Task | Spawn type | Role |
+|------|-----------|------|
+| **Task A** (stdin reader) | `spawn_blocking` | Reads user keystrokes, intercepts popup navigation when visible, forwards to shell PTY |
+| **Task B** (PTY reader) | `spawn_blocking` | Reads shell output, runs VT parser, detects triggers, renders popup, forwards to stdout |
+| **Task C** (debounce timer) | `tokio::spawn` (only when `delay_ms > 0`) | Waits for typing pauses, fires delayed suggestion triggers |
+| **Task D** (merge loop) | `tokio::spawn` | Drains async provider results from an `mpsc` channel and merges them into the visible popup |
+| **Main loop** | `tokio::select!` | Waits on `SIGWINCH`, `SIGTERM`, `SIGHUP`, child exit, and the shutdown channel |
+
+Task B notifies Task C via `tokio::sync::Notify` when the buffer is dirty but no immediate trigger fired. Task C resets its timer on each notification and fires a trigger after `delay_ms` (default 150ms) of inactivity. Task D consumes results posted by per-provider tasks so async output can land in an idle shell without waiting for the next keystroke.
+
+## Popup Rendering
+
+The popup is rendered entirely via ANSI escape sequences — no alternate screen buffer, no TUI framework. The rendering flow:
+
+1. Calculate viewport deficit (does the popup fit below the cursor?)
+2. If not, scroll the viewport by emitting newlines at the bottom
+3. Save cursor (DECSC)
+4. For each visible suggestion: position cursor (CUP), apply styling (SGR), write text
+5. Restore cursor (DECRC)
+
+All of this is wrapped in DECSET 2026 begin/end markers (or pre-rendered into a single buffer for terminals without synchronized output).
+
+**Scrollback protection**: The popup area is cleared by overwriting with spaces, never by using ED (Erase Display) or EL (Erase Line) — those would push popup text into scrollback history.
+
+## Performance
+
+| Metric | Target | Achieved |
+|--------|--------|----------|
+| Keystroke to suggestion | <50ms | <20ms typical |
+| PTY forwarding overhead | <1ms | <1ms |
+| Fuzzy match (10k candidates) | <1ms | <1ms (frizbee) |
+| Memory (idle) | <10MB | ~8MB |
+| Startup | <100ms | <50ms |
+
+Benchmarks use Criterion and live in `suggest` and `parser`. Run with `cargo bench`.
+
+## Shell Integration
+
+Shell integration scripts in `shell/` emit semantic prompt markers:
+
+- **OSC 133** — standard semantic prompt protocol (supported by Ghostty, Kitty, WezTerm, Rio)
+- **OSC 7771** — Termcmp's own marker (used as fallback on Alacritty, iTerm2, Terminal.app)
+- **OSC 7773** — Termcmp's exported environment snapshot, consumed by the proxy and stripped before terminal output
+
+Prompt markers are emitted simultaneously by the integration scripts, so the parser can use whichever the terminal supports.
+
+Without shell integration, features are limited — prompt boundary detection falls back to heuristics, and manual trigger (Ctrl+/) is the only way to invoke completions.
+
+### Buffer Reporting (OSC 7772)
+
+The shell integration reports the live edit buffer to the proxy after every
+ZLE redraw via OSC 7772:
+
+```
+\e]7772;<cursor>;<percent-encoded-utf8-buffer>\a
+```
+
+- **`<cursor>`** is a decimal codepoint count (zsh `$CURSOR`).
+- **`<percent-encoded-utf8-buffer>`** uses a deliberately small allow-list:
+  bytes in `[A-Za-z0-9._~/-]` and the literal space pass through; every
+  other byte (including `;`, `\a` (BEL), `\x1b` (ESC), `\\`, `%`, all
+  `<0x20` controls, `0x7F`, and `0x80`–`0xFF`) is encoded as `%XX`.
+  UTF-8 multibyte sequences are encoded byte-by-byte.
+
+The narrow alphabet is non-negotiable: any unencoded `;` would split the
+OSC parameter list and silently truncate the buffer at the parser; any
+unencoded BEL would terminate the envelope mid-payload; an unencoded ESC
+could smuggle a nested escape sequence into the parser's state machine.
+See [ADR 0003](adr/0003-osc7772-buffer-framing.md).
+
+OSC 7770 (the prior raw framing) is accepted by the parser as a deprecated
+read-only path for one release: the first hit per process logs a one-shot
+`tracing::warn!` and subsequent hits drop to `trace!`. The 7770 dispatch
+arm is scheduled for `#[ignore]` in v0.11.0 and removal in v0.12.0. New
+shell integrations only emit 7772.
+
+### Environment Reporting (OSC 7773)
+
+The zsh integration reports exported scalar parameters at each prompt via
+OSC 7773. The payload is a single percent-encoded field containing
+NUL-separated `KEY=value` entries:
+
+```
+\e]7773;<percent-encoded-env-snapshot>\a
+```
+
+The PTY proxy consumes the frame, stores the snapshot on parser state, and
+filters the frame out of the byte stream before writing shell output to the
+terminal. Providers use this live snapshot instead of the proxy process's
+startup environment, so `export
+AWS_PROFILE=...` or other session-level env changes affect completions on
+the next prompt.

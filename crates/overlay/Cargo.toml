@@ -1,0 +1,27 @@
+[package]
+name = "overlay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+suggest = { path = "../suggest" }
+terminal = { path = "../terminal" }
+anyhow = { workspace = true }
+unicode-width = "0.2.2"
+
+[dev-dependencies]
+# Enables the `TerminalProfile::for_*()` fixture constructors for tests only.
+terminal = { path = "../terminal", features = ["test-utils"] }
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "feedback_render"
+harness = false
+
+[[bench]]
+name = "popup_render"
+harness = false

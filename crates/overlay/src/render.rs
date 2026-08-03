@@ -1,0 +1,3966 @@
+use std::io::Write;
+
+use anyhow::{bail, Result};
+use suggest::{Suggestion, SuggestionKind};
+use terminal::TerminalProfile;
+
+use crate::ansi;
+use crate::layout;
+use crate::types::{OverlayState, PopupHints, PopupLayout};
+use crate::util::{display_text, truncate_with_ellipsis};
+
+/// Precomputed ANSI sequences for popup styling.
+/// Keeps overlay independent of config.
+pub struct PopupTheme {
+    pub selected_on: Vec<u8>,
+    pub description_on: Vec<u8>,
+    pub feedback_loading_on: Vec<u8>,
+    pub feedback_empty_on: Vec<u8>,
+    pub feedback_error_on: Vec<u8>,
+    pub match_highlight_on: Vec<u8>,
+    pub item_text_on: Vec<u8>,
+    pub scrollbar_on: Vec<u8>,
+    pub border_on: Vec<u8>,
+    pub borders: bool,
+    pub border_radius: bool,
+    pub spinner: bool,
+    pub show_provider_errors: bool,
+    pub background_on: Vec<u8>,
+    pub description_box_background_on: Vec<u8>,
+    pub kind_icon_on: Vec<u8>,
+    pub index_hints: bool,
+    pub key_hints: bool,
+    pub nerd_icons: bool,
+}
+
+impl Default for PopupTheme {
+    // Fields are Vec<u8> because config_watch.rs/proxy.rs populate them from
+    // parse_style(), which returns dynamically-built ANSI sequences.
+    fn default() -> Self {
+        Self {
+            selected_on: b"\x1b[7m".to_vec(),
+            description_on: b"\x1b[2m".to_vec(),
+            feedback_loading_on: b"\x1b[2m".to_vec(),
+            feedback_empty_on: b"\x1b[2m".to_vec(),
+            feedback_error_on: b"\x1b[2;38;2;243;139;168m".to_vec(),
+            match_highlight_on: b"\x1b[1m".to_vec(),
+            item_text_on: vec![],
+            scrollbar_on: b"\x1b[2m".to_vec(),
+            border_on: b"\x1b[2m".to_vec(),
+            borders: false,
+            border_radius: true,
+            spinner: true,
+            show_provider_errors: false,
+            background_on: vec![],
+            description_box_background_on: vec![],
+            kind_icon_on: vec![],
+            index_hints: true,
+            key_hints: true,
+            nerd_icons: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedbackKind {
+    None,
+    Loading { frame: u8 },
+    Empty,
+    Error { provider: String },
+    PartialError { providers: u8 },
+}
+
+impl FeedbackKind {
+    fn reserves_row(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    fn style<'a>(&self, theme: &'a PopupTheme) -> &'a [u8] {
+        match self {
+            Self::None => &[],
+            Self::Loading { .. } => &theme.feedback_loading_on,
+            Self::Empty => &theme.feedback_empty_on,
+            Self::Error { .. } | Self::PartialError { .. } => &theme.feedback_error_on,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn popup_additional_scroll_deficit(
+    suggestions: &[Suggestion],
+    cursor_row: u16,
+    screen_rows: u16,
+    screen_cols: u16,
+    max_visible: usize,
+    min_width: u16,
+    theme: &PopupTheme,
+    prior_deficit: u16,
+    feedback: &FeedbackKind,
+    hints: &PopupHints,
+) -> u16 {
+    if suggestions.is_empty() && !feedback.reserves_row() {
+        return 0;
+    }
+    if screen_cols < min_width {
+        return 0;
+    }
+
+    let top_pad: u16 = if theme.borders || hints.index.is_some() {
+        1
+    } else {
+        0
+    };
+    let bottom_pad: u16 = if theme.borders || hints.key_label.is_some() {
+        1
+    } else {
+        0
+    };
+    // A prior_deficit at or above cursor_row implies the real cursor sat at
+    // or above row 0, which is impossible while the cursor is on screen.
+    // The cached value is therefore stale (e.g. CPR sync failed because
+    // screen dimensions diverged) and merely clamping it would still give
+    // total_deficit == cursor_row, collapse final_cursor_row to 0, and
+    // render the popup at row 1 over prior scrollback. Discard it instead
+    // and treat this render as fresh — anchored to cursor_row, scrolling
+    // only the room actually needed below. Same guard mirrored in
+    // `render_popup_unframed` and `render_feedback_only_popup_unframed`;
+    // keep all three in sync.
+    let effective_prior = if prior_deficit >= cursor_row {
+        0
+    } else {
+        prior_deficit
+    };
+    let adj_cursor_row = cursor_row.saturating_sub(effective_prior);
+
+    if suggestions.is_empty() {
+        let base_height = 1 + top_pad + bottom_pad;
+        let space_below = screen_rows.saturating_sub(adj_cursor_row.saturating_add(1));
+        return base_height.saturating_sub(space_below);
+    }
+
+    let min_screen = 1 + top_pad + bottom_pad;
+    if screen_rows <= min_screen {
+        return 0;
+    }
+
+    let effective_max = max_visible.min((screen_rows - 1 - top_pad - bottom_pad) as usize);
+    let space_below = screen_rows.saturating_sub(adj_cursor_row.saturating_add(1));
+    let visible_count = suggestions.len().min(effective_max) as u16;
+    let loading_extra_deficit: u16 = if feedback.reserves_row() { 1 } else { 0 };
+    let total_height_needed = visible_count + top_pad + bottom_pad + loading_extra_deficit;
+    total_height_needed.saturating_sub(space_below)
+}
+
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Parse a space-separated style string into a combined ANSI SGR sequence.
+///
+/// Supported tokens: `reverse`, `dim`, `bold`, `underline`, `fg:N`, `bg:N`
+/// (where N is a 256-color index).
+///
+/// Example: `"bold fg:196"` -> `b"\x1b[1;38;5;196m"`
+fn parse_hex_rgb(hex: &str, token: &str) -> Result<(u8, u8, u8)> {
+    if hex.len() != 6 {
+        bail!("invalid hex color (need 6 chars): {}", token);
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16)
+        .map_err(|_| anyhow::anyhow!("invalid hex color: {}", token))?;
+    let g = u8::from_str_radix(&hex[2..4], 16)
+        .map_err(|_| anyhow::anyhow!("invalid hex color: {}", token))?;
+    let b = u8::from_str_radix(&hex[4..6], 16)
+        .map_err(|_| anyhow::anyhow!("invalid hex color: {}", token))?;
+    Ok((r, g, b))
+}
+
+pub fn parse_style(style_str: &str) -> Result<Vec<u8>> {
+    let mut params: Vec<String> = Vec::new();
+
+    for token in style_str.split_whitespace() {
+        match token {
+            "reverse" => params.push("7".to_string()),
+            "dim" => params.push("2".to_string()),
+            "bold" => params.push("1".to_string()),
+            "underline" => params.push("4".to_string()),
+            "italic" => params.push("3".to_string()),
+            _ if token.starts_with("fg:#") => {
+                let (r, g, b) = parse_hex_rgb(&token[4..], token)?;
+                params.push(format!("38;2;{r};{g};{b}"));
+            }
+            _ if token.starts_with("fg:") => {
+                let n: u8 = token[3..]
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("invalid fg color: {}", token))?;
+                params.push(format!("38;5;{n}"));
+            }
+            _ if token.starts_with("bg:#") => {
+                let (r, g, b) = parse_hex_rgb(&token[4..], token)?;
+                params.push(format!("48;2;{r};{g};{b}"));
+            }
+            _ if token.starts_with("bg:") => {
+                let n: u8 = token[3..]
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("invalid bg color: {}", token))?;
+                params.push(format!("48;5;{n}"));
+            }
+            _ => bail!("unknown style token: {:?}", token),
+        }
+    }
+
+    if params.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let joined = params.join(";");
+    Ok(format!("\x1b[{joined}m").into_bytes())
+}
+
+/// Render a popup into a byte buffer. Returns the layout used for positioning
+/// (needed later for cleanup).
+///
+/// `prior_deficit` is accumulated overlay-owned viewport scroll from previous
+/// renders, possibly across dismiss/re-trigger cycles until a CPR sync or
+/// resize invalidates it. It prevents re-scrolling by accounting for viewport
+/// shifts that the parser doesn't know about.
+///
+/// This is the framed public wrapper: it wraps `render_popup_unframed` in a
+/// single `with_overlay_update_frame` call so the whole update is one atomic
+/// synchronized frame on `RenderStrategy::Synchronized` terminals.
+#[allow(clippy::too_many_arguments)]
+pub fn render_popup(
+    buf: &mut Vec<u8>,
+    suggestions: &[Suggestion],
+    state: &OverlayState,
+    cursor_row: u16,
+    cursor_col: u16,
+    screen_rows: u16,
+    screen_cols: u16,
+    max_visible: usize,
+    min_width: u16,
+    max_width: u16,
+    theme: &PopupTheme,
+    prior_deficit: u16,
+    feedback: FeedbackKind,
+    hints: &PopupHints,
+    profile: &TerminalProfile,
+) -> PopupLayout {
+    // Pure wrapper: all early-exit logic lives in `render_popup_unframed`.
+    // `with_overlay_update_frame` already short-circuits a no-op body to
+    // zero bytes, so an early-exit unframed render emits nothing here too.
+    let mut layout = None;
+    crate::sync_frame::with_overlay_update_frame(buf, profile, |buf| {
+        layout = Some(render_popup_unframed(
+            buf,
+            suggestions,
+            state,
+            cursor_row,
+            cursor_col,
+            screen_rows,
+            screen_cols,
+            max_visible,
+            min_width,
+            max_width,
+            theme,
+            prior_deficit,
+            feedback,
+            hints,
+        ));
+    });
+    layout.expect("with_overlay_update_frame body always runs exactly once")
+}
+
+/// Byte-staging body of `render_popup` without sync-frame markers.
+///
+/// Callers that own a surrounding `with_overlay_update_frame` can call this
+/// directly to fold multiple overlay operations into a single atomic frame.
+/// The public `render_popup` is the framed convenience wrapper.
+///
+/// # Atomicity contract
+///
+/// This function emits NO DECSET 2026 markers. On
+/// `RenderStrategy::Synchronized` terminals, calling it without a surrounding
+/// `with_overlay_update_frame` silently loses atomicity and may flicker as
+/// partial paints reach the screen. Callers MUST either (a) call the framed
+/// wrapper `render_popup` instead, or (b) invoke this from inside a
+/// `with_overlay_update_frame` body. The `_unframed` suffix marks the
+/// type-by-convention contract; there is no compile-time enforcement.
+#[allow(clippy::too_many_arguments)]
+pub fn render_popup_unframed(
+    buf: &mut Vec<u8>,
+    suggestions: &[Suggestion],
+    state: &OverlayState,
+    cursor_row: u16,
+    cursor_col: u16,
+    screen_rows: u16,
+    screen_cols: u16,
+    max_visible: usize,
+    min_width: u16,
+    max_width: u16,
+    theme: &PopupTheme,
+    prior_deficit: u16,
+    feedback: FeedbackKind,
+    hints: &PopupHints,
+) -> PopupLayout {
+    if suggestions.is_empty() && !feedback.reserves_row() {
+        return PopupLayout {
+            start_row: 0,
+            start_col: 0,
+            width: 0,
+            height: 0,
+            scroll_deficit: prior_deficit,
+        };
+    }
+
+    // Suppress rendering when terminal is too narrow — must check BEFORE any
+    // terminal state mutation (scrolling, cursor save) to avoid corruption.
+    // Sync markers, if any, are emitted by the caller
+    // (`with_overlay_update_frame`), which rolls back the speculative
+    // `begin_sync` when this early return leaves the body buffer untouched.
+    if screen_cols < min_width {
+        return PopupLayout {
+            start_row: 0,
+            start_col: 0,
+            width: 0,
+            height: 0,
+            scroll_deficit: prior_deficit,
+        };
+    }
+
+    if suggestions.is_empty() {
+        return render_feedback_only_popup_unframed(
+            buf,
+            cursor_row,
+            cursor_col,
+            screen_rows,
+            screen_cols,
+            min_width,
+            max_width,
+            theme,
+            prior_deficit,
+            feedback,
+        );
+    }
+
+    // Row padding: borders and/or hint rows above/below content
+    let top_pad: u16 = if theme.borders || hints.index.is_some() {
+        1
+    } else {
+        0
+    };
+    let bottom_pad: u16 = if theme.borders || hints.key_label.is_some() {
+        1
+    } else {
+        0
+    };
+
+    // Cap popup height to screen_rows - 1 (leave room for prompt row)
+    let min_screen = 1 + top_pad + bottom_pad; // need at least 1 content row + pads
+    let effective_max = if screen_rows > min_screen {
+        max_visible.min((screen_rows - 1 - top_pad - bottom_pad) as usize)
+    } else {
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "termcmp: popup suppressed — screen too small ({screen_rows} rows, need > {min_screen})"
+        );
+        return PopupLayout {
+            start_row: 0,
+            start_col: 0,
+            width: 0,
+            height: 0,
+            scroll_deficit: prior_deficit,
+        };
+    };
+
+    // See `popup_additional_scroll_deficit` for the rationale: a
+    // prior_deficit at or above cursor_row is logically impossible (would
+    // place the real cursor above row 0). When that happens the cached
+    // deficit is stale and clamping it would still pin the popup to row 1.
+    // Discard it and recompute as a fresh render — the popup re-anchors to
+    // the actual cursor position, doing whatever new viewport scroll is
+    // needed below. The next CPR sync corrects state; until then we render
+    // correctly from frame one.
+    let effective_prior = if prior_deficit >= cursor_row {
+        0
+    } else {
+        prior_deficit
+    };
+    let adj_cursor_row = cursor_row.saturating_sub(effective_prior);
+
+    // Indicator occupies exactly 1 row; bordered case shifts bottom border down by 1.
+    let space_below = screen_rows.saturating_sub(adj_cursor_row.saturating_add(1));
+    let visible_count = suggestions.len().min(effective_max) as u16;
+    let loading_extra_deficit: u16 = if feedback.reserves_row() { 1 } else { 0 };
+    let total_height_needed = visible_count + top_pad + bottom_pad + loading_extra_deficit;
+    let new_deficit = total_height_needed.saturating_sub(space_below);
+    let total_deficit = effective_prior.saturating_add(new_deficit);
+    let final_cursor_row = cursor_row.saturating_sub(total_deficit);
+
+    // Scroll viewport if we need more room
+    if new_deficit > 0 {
+        // Move to last viewport row so newlines cause actual scrolls
+        ansi::move_to(buf, screen_rows - 1, 0);
+        for _ in 0..new_deficit {
+            buf.push(b'\n');
+        }
+        // Reposition cursor to the adjusted prompt location
+        ansi::move_to(buf, final_cursor_row, cursor_col);
+    }
+
+    // Save cursor AFTER scroll repositioning
+    ansi::save_cursor(buf);
+
+    let layout = layout::compute_layout(
+        suggestions,
+        state.scroll_offset,
+        final_cursor_row,
+        cursor_col,
+        screen_rows,
+        screen_cols,
+        effective_max,
+        min_width,
+        max_width,
+        theme.borders,
+        hints,
+    );
+
+    if layout.height == 0 {
+        ansi::restore_cursor(buf);
+        return PopupLayout {
+            scroll_deficit: total_deficit,
+            ..layout
+        };
+    }
+
+    // Content dimensions: subtract horizontal border pad and vertical row pads
+    let content_width = layout
+        .width
+        .saturating_sub(if theme.borders { 2 } else { 0 });
+    let content_height = layout.height.saturating_sub(top_pad + bottom_pad);
+    let border_col = layout.start_col;
+    let top_border_row = layout.start_row;
+    let bottom_border_row = if bottom_pad > 0 {
+        Some(layout.start_row + layout.height - 1)
+    } else {
+        None
+    };
+
+    let needs_scrollbar = suggestions.len() > effective_max;
+    let (thumb_pos, thumb_size) = if needs_scrollbar {
+        let total = suggestions.len();
+        let visible = content_height as usize;
+        let ts = std::cmp::max(1, visible * visible / total).min(visible);
+        let tp = if total > visible {
+            (state.scroll_offset * (visible - ts) / (total - visible))
+                .min(visible.saturating_sub(ts))
+        } else {
+            0
+        };
+        (tp, ts)
+    } else {
+        (0, 0)
+    };
+    let item_width = if needs_scrollbar {
+        content_width.saturating_sub(1)
+    } else {
+        content_width
+    };
+
+    let end = (state.scroll_offset + content_height as usize).min(suggestions.len());
+    let visible = &suggestions[state.scroll_offset..end];
+
+    // Draw top row: border (optionally with index hint) or plain index hint
+    if top_pad > 0 {
+        ansi::move_to(buf, top_border_row, border_col);
+        emit_bg(buf, theme);
+        if theme.borders {
+            if !theme.border_on.is_empty() {
+                buf.extend_from_slice(&theme.border_on);
+            }
+            if let Some((idx, total)) = hints.index {
+                // Corner glyph is always drawn so the border radius stays visible.
+                let corner = if theme.border_radius { "╭" } else { "┌" };
+                buf.extend_from_slice(corner.as_bytes());
+                // Index label follows the corner, shifted right by one column.
+                let label = format!("{idx}/{total} ");
+                let label_cols = display_cols(&label);
+                let avail = content_width as usize; // dash columns after the corner
+                if label_cols <= avail {
+                    buf.extend_from_slice(label.as_bytes());
+                    for _ in 0..(avail - label_cols) {
+                        buf.extend_from_slice("─".as_bytes());
+                    }
+                } else {
+                    let (trunc, _) = truncate_to_display_cols(&label, avail);
+                    buf.extend_from_slice(trunc.as_bytes());
+                }
+            } else {
+                let corner = if theme.border_radius { "╭" } else { "┌" };
+                buf.extend_from_slice(corner.as_bytes());
+                for _ in 0..content_width {
+                    buf.extend_from_slice("─".as_bytes());
+                }
+            }
+            buf.extend_from_slice(if theme.border_radius { "╮" } else { "┐" }.as_bytes());
+            ansi::reset(buf);
+            emit_bg(buf, theme);
+        } else if let Some((idx, total)) = hints.index {
+            // Borderless: plain index text
+            let label = format!(" {idx}/{total}");
+            let (text, _) = truncate_to_display_cols(&label, content_width as usize);
+            buf.extend_from_slice(text.as_bytes());
+            ansi::reset(buf);
+            emit_bg(buf, theme);
+        }
+    }
+
+    // Draw content rows (with left/right borders when enabled)
+    let content_start_row = top_border_row + top_pad;
+    for (i, suggestion) in visible.iter().enumerate() {
+        let row = content_start_row + i as u16;
+        let is_selected = state.selected == Some(state.scroll_offset + i);
+
+        ansi::move_to(buf, row, border_col);
+        emit_bg(buf, theme);
+
+        // Left border
+        if theme.borders {
+            if !theme.border_on.is_empty() {
+                buf.extend_from_slice(&theme.border_on);
+            }
+            buf.extend_from_slice("│".as_bytes());
+            ansi::reset(buf);
+            emit_bg(buf, theme);
+        }
+
+        // Content
+        if is_selected {
+            buf.extend_from_slice(&theme.selected_on);
+        } else if !theme.item_text_on.is_empty() {
+            buf.extend_from_slice(&theme.item_text_on);
+        }
+
+        format_item(buf, suggestion, item_width, is_selected, theme);
+
+        // Explicit cursor positioning before scrollbar/border to guard
+        // against Nerd Font PUA icon width discrepancies. unicode-width
+        // reports PUA icons as 1 column but they may render as 2. If the
+        // actual glyph width differs from GUTTER_COLS, format_item's
+        // output is off by 1 column. This move_to guarantees alignment.
+        let scrollbar_col = border_col + (if theme.borders { 1 } else { 0 }) + item_width;
+
+        if needs_scrollbar {
+            // Cover the potential 1-column gap from PUA icon width discrepancy.
+            // unicode-width reports PUA icons as 0-width but terminals may render
+            // them as 1 or 2 columns. If the glyph is narrower than GUTTER_COLS
+            // assumes, format_item's output falls short of scrollbar_col by 1.
+            // This space fills that gap with the correct background; the move_to
+            // below repositions the cursor regardless, so in the Nerd Font case
+            // (no gap) the scrollbar char simply overwrites this space.
+            emit_bg(buf, theme);
+            if is_selected {
+                buf.extend_from_slice(&theme.selected_on);
+            }
+            buf.push(b' ');
+            ansi::move_to(buf, row, scrollbar_col);
+            emit_bg(buf, theme);
+            let row_idx = i;
+            if row_idx >= thumb_pos && row_idx < thumb_pos + thumb_size {
+                ansi::reset(buf);
+                emit_bg(buf, theme);
+                if !theme.scrollbar_on.is_empty() {
+                    buf.extend_from_slice(&theme.scrollbar_on);
+                }
+                let _ = buf.write_all("█".as_bytes());
+            } else {
+                ansi::reset(buf);
+                emit_bg(buf, theme);
+                if !theme.scrollbar_on.is_empty() {
+                    buf.extend_from_slice(&theme.scrollbar_on);
+                }
+                let _ = buf.write_all("┆".as_bytes());
+            }
+        } else if theme.borders {
+            // No scrollbar: the column between the item text and the right
+            // border can still be left unpainted when a Nerd Font PUA icon
+            // renders wider than unicode-width reports (0 columns). Fill it
+            // with the popup background so the terminal default background
+            // never shows through as a dark stripe in the border column.
+            emit_bg(buf, theme);
+            if is_selected {
+                buf.extend_from_slice(&theme.selected_on);
+            }
+            buf.push(b' ');
+        }
+
+        // Right border
+        if theme.borders {
+            let right_border_col = border_col + layout.width - 1;
+            ansi::move_to(buf, row, right_border_col);
+            emit_bg(buf, theme);
+            ansi::reset(buf);
+            emit_bg(buf, theme);
+            if !theme.border_on.is_empty() {
+                buf.extend_from_slice(&theme.border_on);
+            }
+            buf.extend_from_slice("│".as_bytes());
+            ansi::reset(buf);
+            emit_bg(buf, theme);
+        } else {
+            ansi::reset(buf);
+            emit_bg(buf, theme);
+        }
+    }
+
+    // Indicator row: drawn while generators run or after they end with no suggestions.
+    let loading_extra = if feedback.reserves_row() {
+        let loading_row = bottom_border_row.unwrap_or(layout.start_row + layout.height);
+        if loading_row < screen_rows {
+            ansi::move_to(buf, loading_row, border_col);
+            emit_bg(buf, theme);
+            if theme.borders {
+                if !theme.border_on.is_empty() {
+                    buf.extend_from_slice(&theme.border_on);
+                }
+                buf.extend_from_slice("│".as_bytes());
+                ansi::reset(buf);
+                emit_bg(buf, theme);
+            }
+            write_indicator_content(buf, content_width, theme, &feedback);
+            ansi::reset(buf);
+            emit_bg(buf, theme);
+            if theme.borders {
+                if !theme.border_on.is_empty() {
+                    buf.extend_from_slice(&theme.border_on);
+                }
+                buf.extend_from_slice("│".as_bytes());
+                ansi::reset(buf);
+                emit_bg(buf, theme);
+
+                // Draw bottom border below loading row
+                if draw_bottom_border_row(
+                    buf,
+                    loading_row + 1,
+                    border_col,
+                    content_width,
+                    theme,
+                    hints,
+                    screen_rows,
+                ) {
+                    1 // loading row extends 1 row beyond layout.height (border is within that row)
+                } else {
+                    0 // bottom border was NOT drawn (clipped), no extra row
+                }
+            } else {
+                1 // no borders, just the loading row
+            }
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    // Draw bottom row: border (optionally with key hint) or plain key hint
+    if let (Some(bbr), 0) = (bottom_border_row, loading_extra) {
+        if theme.borders {
+            draw_bottom_border_row(
+                buf,
+                bbr,
+                border_col,
+                content_width,
+                theme,
+                hints,
+                screen_rows,
+            );
+        } else if let Some(label) = &hints.key_label {
+            // Borderless: right-aligned key hint, dropped when too wide
+            // (matches bordered behavior — a clipped hint looks broken).
+            let hint_cols = display_cols(label);
+            if hint_cols <= content_width as usize {
+                ansi::move_to(buf, bbr, border_col);
+                emit_bg(buf, theme);
+                let pad = (content_width as usize).saturating_sub(hint_cols);
+                write_padding(buf, pad);
+                buf.extend_from_slice(label.as_bytes());
+                ansi::reset(buf);
+                emit_bg(buf, theme);
+            }
+        }
+    }
+
+    ansi::restore_cursor(buf);
+
+    PopupLayout {
+        height: layout.height + loading_extra,
+        scroll_deficit: total_deficit,
+        ..layout
+    }
+}
+
+/// Draw a bottom border row (`╰───╯`) with an optional key hint embedded
+/// before the right corner. Returns `false` when `row` is clipped by the
+/// screen so callers can skip the extra-row accounting.
+fn draw_bottom_border_row(
+    buf: &mut Vec<u8>,
+    row: u16,
+    border_col: u16,
+    content_width: u16,
+    theme: &PopupTheme,
+    hints: &PopupHints,
+    screen_rows: u16,
+) -> bool {
+    if row >= screen_rows {
+        return false;
+    }
+    ansi::move_to(buf, row, border_col);
+    emit_bg(buf, theme);
+    if !theme.border_on.is_empty() {
+        buf.extend_from_slice(&theme.border_on);
+    }
+    buf.extend_from_slice(if theme.border_radius { "╰" } else { "└" }.as_bytes());
+    if let Some(label) = &hints.key_label {
+        let hint_seg = format!(" {label} ");
+        let hint_cols = display_cols(&hint_seg);
+        let avail = content_width as usize;
+        if hint_cols <= avail {
+            for _ in 0..(avail - hint_cols) {
+                buf.extend_from_slice("─".as_bytes());
+            }
+            ansi::reset(buf);
+            emit_bg(buf, theme);
+            buf.extend_from_slice(hint_seg.as_bytes());
+            if !theme.border_on.is_empty() {
+                buf.extend_from_slice(&theme.border_on);
+            }
+        } else {
+            // Hint too wide: fill with dashes, skip the hint
+            for _ in 0..avail {
+                buf.extend_from_slice("─".as_bytes());
+            }
+        }
+    } else {
+        for _ in 0..content_width {
+            buf.extend_from_slice("─".as_bytes());
+        }
+    }
+    buf.extend_from_slice(if theme.border_radius { "╯" } else { "┘" }.as_bytes());
+    ansi::reset(buf);
+    emit_bg(buf, theme);
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_feedback_only_popup_unframed(
+    buf: &mut Vec<u8>,
+    cursor_row: u16,
+    cursor_col: u16,
+    screen_rows: u16,
+    screen_cols: u16,
+    min_width: u16,
+    max_width: u16,
+    theme: &PopupTheme,
+    prior_deficit: u16,
+    feedback: FeedbackKind,
+) -> PopupLayout {
+    let border_pad: u16 = if theme.borders { 2 } else { 0 };
+    let effective_max_w = max_width.min(screen_cols).max(min_width);
+    let width = min_width.min(effective_max_w);
+    let base_height = 1 + border_pad;
+    // Mirror the discard logic in `render_popup_unframed`: when prior_deficit >=
+    // cursor_row the cached value is stale and would pin the indicator at
+    // row 1 even after clamping. Drop it and recompute fresh.
+    let effective_prior = if prior_deficit >= cursor_row {
+        0
+    } else {
+        prior_deficit
+    };
+    let adj_cursor_row = cursor_row.saturating_sub(effective_prior);
+    let space_below = screen_rows.saturating_sub(adj_cursor_row.saturating_add(1));
+    let new_deficit = base_height.saturating_sub(space_below);
+    let total_deficit = effective_prior.saturating_add(new_deficit);
+    let final_cursor_row = cursor_row.saturating_sub(total_deficit);
+    let start_row = final_cursor_row + 1;
+    let start_col = if cursor_col + width > screen_cols {
+        screen_cols.saturating_sub(width)
+    } else {
+        cursor_col
+    };
+    let content_width = width.saturating_sub(border_pad);
+
+    if new_deficit > 0 {
+        ansi::move_to(buf, screen_rows - 1, 0);
+        for _ in 0..new_deficit {
+            buf.push(b'\n');
+        }
+        ansi::move_to(buf, final_cursor_row, cursor_col);
+    }
+    ansi::save_cursor(buf);
+
+    if theme.borders {
+        ansi::move_to(buf, start_row, start_col);
+        if !theme.border_on.is_empty() {
+            buf.extend_from_slice(&theme.border_on);
+        }
+        let corner = if theme.border_radius { "╭" } else { "┌" };
+        buf.extend_from_slice(corner.as_bytes());
+        for _ in 0..content_width {
+            buf.extend_from_slice("─".as_bytes());
+        }
+        buf.extend_from_slice(if theme.border_radius { "╮" } else { "┐" }.as_bytes());
+        ansi::reset(buf);
+        emit_bg(buf, theme);
+    }
+
+    let content_row = start_row + u16::from(theme.borders);
+    ansi::move_to(buf, content_row, start_col);
+    emit_bg(buf, theme);
+    if theme.borders {
+        if !theme.border_on.is_empty() {
+            buf.extend_from_slice(&theme.border_on);
+        }
+        buf.extend_from_slice("│".as_bytes());
+        ansi::reset(buf);
+        emit_bg(buf, theme);
+    }
+    write_indicator_content(buf, content_width, theme, &feedback);
+    ansi::reset(buf);
+    emit_bg(buf, theme);
+    if theme.borders {
+        if !theme.border_on.is_empty() {
+            buf.extend_from_slice(&theme.border_on);
+        }
+        buf.extend_from_slice("│".as_bytes());
+        ansi::reset(buf);
+        emit_bg(buf, theme);
+
+        ansi::move_to(buf, content_row + 1, start_col);
+        emit_bg(buf, theme);
+        if !theme.border_on.is_empty() {
+            buf.extend_from_slice(&theme.border_on);
+        }
+        buf.extend_from_slice(if theme.border_radius { "╰" } else { "└" }.as_bytes());
+        for _ in 0..content_width {
+            buf.extend_from_slice("─".as_bytes());
+        }
+        buf.extend_from_slice(if theme.border_radius { "╯" } else { "┘" }.as_bytes());
+        ansi::reset(buf);
+        emit_bg(buf, theme);
+    }
+
+    ansi::restore_cursor(buf);
+
+    PopupLayout {
+        start_row,
+        start_col,
+        width,
+        height: base_height,
+        scroll_deficit: total_deficit,
+    }
+}
+
+pub fn render_indicator_row(
+    buf: &mut Vec<u8>,
+    layout: &PopupLayout,
+    theme: &PopupTheme,
+    feedback: FeedbackKind,
+    hints: &PopupHints,
+) {
+    let bottom_pad: u16 = if theme.borders || hints.key_label.is_some() {
+        1
+    } else {
+        0
+    };
+    if layout.height <= bottom_pad || !feedback.reserves_row() {
+        return;
+    }
+    let content_width = layout
+        .width
+        .saturating_sub(if theme.borders { 2 } else { 0 });
+    let row = layout.start_row + layout.height - 1 - bottom_pad;
+    ansi::save_cursor(buf);
+    ansi::move_to(buf, row, layout.start_col);
+    emit_bg(buf, theme);
+    if theme.borders {
+        if !theme.border_on.is_empty() {
+            buf.extend_from_slice(&theme.border_on);
+        }
+        buf.extend_from_slice("│".as_bytes());
+        ansi::reset(buf);
+        emit_bg(buf, theme);
+    }
+    write_indicator_content(buf, content_width, theme, &feedback);
+    ansi::reset(buf);
+    emit_bg(buf, theme);
+    if theme.borders {
+        if !theme.border_on.is_empty() {
+            buf.extend_from_slice(&theme.border_on);
+        }
+        buf.extend_from_slice("│".as_bytes());
+        ansi::reset(buf);
+        emit_bg(buf, theme);
+    }
+    ansi::restore_cursor(buf);
+}
+
+fn write_indicator_content(
+    buf: &mut Vec<u8>,
+    content_width: u16,
+    theme: &PopupTheme,
+    feedback: &FeedbackKind,
+) {
+    let label = indicator_label(feedback, content_width, theme.spinner);
+    let style = feedback.style(theme);
+    if !style.is_empty() {
+        buf.extend_from_slice(style);
+    }
+    let max_cols = content_width as usize;
+    let label_cols = display_cols(&label);
+    let label_cols = if label_cols <= max_cols {
+        let _ = buf.write_all(label.as_bytes());
+        label_cols
+    } else {
+        let (label, label_cols) = truncate_to_display_cols(&label, max_cols);
+        let _ = buf.write_all(label.as_bytes());
+        label_cols
+    };
+    let pad = (content_width as usize).saturating_sub(label_cols);
+    write_padding(buf, pad);
+}
+
+fn indicator_label(feedback: &FeedbackKind, content_width: u16, spinner: bool) -> String {
+    match feedback {
+        FeedbackKind::None => String::new(),
+        FeedbackKind::Loading { frame } => {
+            let glyph = if spinner && content_width >= 25 {
+                SPINNER_FRAMES[*frame as usize % SPINNER_FRAMES.len()]
+            } else {
+                "…"
+            };
+            format!("  {glyph} Loading")
+        }
+        FeedbackKind::Empty => "  (no matches)".to_string(),
+        FeedbackKind::Error { provider } if provider.is_empty() => {
+            "  ! provider failed".to_string()
+        }
+        FeedbackKind::Error { provider } => {
+            format!("  ! failed: {}", sanitize_display_text(provider))
+        }
+        FeedbackKind::PartialError { providers } => {
+            if *providers == 1 {
+                "  ! 1 provider failed".to_string()
+            } else {
+                format!("  ! {providers} providers failed")
+            }
+        }
+    }
+}
+
+fn display_cols(text: &str) -> usize {
+    if text.is_ascii() {
+        text.len()
+    } else {
+        unicode_width::UnicodeWidthStr::width(text)
+    }
+}
+
+fn truncate_to_display_cols(text: &str, max_cols: usize) -> (String, usize) {
+    let mut out = String::new();
+    let mut cols = 0;
+    for ch in text.chars() {
+        let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cols + width > max_cols {
+            break;
+        }
+        out.push(ch);
+        cols += width;
+    }
+    (out, cols)
+}
+
+/// Clear the popup area by overwriting with spaces.
+///
+/// This is the framed public wrapper: it wraps `clear_popup_unframed` in a
+/// single `with_overlay_update_frame` call so the whole clear is one atomic
+/// synchronized frame on `RenderStrategy::Synchronized` terminals.
+pub fn clear_popup(buf: &mut Vec<u8>, layout: &PopupLayout, profile: &TerminalProfile) {
+    // Pure wrapper: the zero-size guard lives in `clear_popup_unframed`.
+    // `with_overlay_update_frame` short-circuits a no-op body to zero bytes.
+    crate::sync_frame::with_overlay_update_frame(buf, profile, |buf| {
+        clear_popup_unframed(buf, layout);
+    });
+}
+
+/// Byte-staging body of `clear_popup` without sync-frame markers.
+///
+/// Callers that own a surrounding `with_overlay_update_frame` can call this
+/// directly to fold multiple overlay operations into a single atomic frame.
+/// The public `clear_popup` is the framed convenience wrapper.
+///
+/// # Atomicity contract
+///
+/// This function emits NO DECSET 2026 markers. On
+/// `RenderStrategy::Synchronized` terminals, calling it without a surrounding
+/// `with_overlay_update_frame` silently loses atomicity and may flicker as
+/// partial paints reach the screen. Callers MUST either (a) call the framed
+/// wrapper `clear_popup` instead, or (b) invoke this from inside a
+/// `with_overlay_update_frame` body. The `_unframed` suffix marks the
+/// type-by-convention contract; there is no compile-time enforcement.
+pub fn clear_popup_unframed(buf: &mut Vec<u8>, layout: &PopupLayout) {
+    if layout.height == 0 || layout.width == 0 {
+        return;
+    }
+    ansi::save_cursor(buf);
+
+    for row_offset in 0..layout.height {
+        let row = layout.start_row + row_offset;
+        ansi::move_to(buf, row, layout.start_col);
+        for _ in 0..layout.width {
+            let _ = buf.write_all(b" ");
+        }
+    }
+
+    ansi::restore_cursor(buf);
+}
+
+/// Strip control characters (including ESC) from text to prevent ANSI injection
+/// via malicious filenames, git branches, or other suggestion sources.
+pub(crate) fn sanitize_display_text(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Icon character for the gutter of a given suggestion kind.
+///
+/// Nerd Font glyph when `nerd_icons` is true; single-width ASCII fallback
+/// when false (for terminals without Nerd Fonts).
+pub(crate) fn kind_icon(kind: SuggestionKind, nerd_icons: bool) -> char {
+    if nerd_icons {
+        match kind {
+            SuggestionKind::Command => '\u{F018D}',       // console
+            SuggestionKind::Subcommand => '\u{F07B7}',    // chevron-right
+            SuggestionKind::Flag => '\u{F0240}',          // flag
+            SuggestionKind::FilePath => '\u{F0214}',      // file
+            SuggestionKind::Directory => '\u{F024B}',     // folder
+            SuggestionKind::History => '\u{F02DA}',       // time
+            SuggestionKind::EnvVar => '\u{F022E}',        // usd
+            SuggestionKind::ProviderValue => '\u{F05B7}', // wrench
+            SuggestionKind::Llm => '\u{F06A9}',           // cog
+            SuggestionKind::AskAi => '\u{F169F}',         // question-sign
+        }
+    } else {
+        match kind {
+            SuggestionKind::Command => '>',
+            SuggestionKind::Subcommand => '.',
+            SuggestionKind::Flag => '-',
+            SuggestionKind::FilePath => 'f',
+            SuggestionKind::Directory => 'd',
+            SuggestionKind::History => 'h',
+            SuggestionKind::EnvVar => '$',
+            SuggestionKind::ProviderValue => 'w',
+            SuggestionKind::Llm => '*',
+            SuggestionKind::AskAi => '?',
+        }
+    }
+}
+
+/// Write the leading gutter (`" K "`) for a suggestion row. Always occupies
+/// `layout::GUTTER_COLS` display columns.
+fn write_gutter(buf: &mut Vec<u8>, kind: SuggestionKind, is_selected: bool, theme: &PopupTheme) {
+    let kind_char = kind_icon(kind, theme.nerd_icons);
+    if !theme.kind_icon_on.is_empty() {
+        ansi::reset(buf);
+        emit_bg(buf, theme);
+        if is_selected {
+            buf.extend_from_slice(&theme.selected_on);
+        }
+        buf.extend_from_slice(&theme.kind_icon_on);
+    }
+    let _ = write!(buf, " {kind_char}  ");
+    if !theme.kind_icon_on.is_empty() {
+        restore_base_style(buf, is_selected, theme);
+    }
+}
+
+/// Re-enable the row's base text style after an `ansi::reset` inside
+/// `format_item`. Selected rows get `selected_on` (reverse video); unselected
+/// rows get `item_text_on` when a custom style is configured.
+fn restore_base_style(buf: &mut Vec<u8>, is_selected: bool, theme: &PopupTheme) {
+    emit_bg(buf, theme);
+    if is_selected {
+        buf.extend_from_slice(&theme.selected_on);
+    } else if !theme.item_text_on.is_empty() {
+        buf.extend_from_slice(&theme.item_text_on);
+    }
+}
+
+#[inline]
+fn emit_bg(buf: &mut Vec<u8>, theme: &PopupTheme) {
+    if !theme.background_on.is_empty() {
+        buf.extend_from_slice(&theme.background_on);
+    }
+}
+
+/// Write `n` padding spaces to `buf`.
+fn write_padding(buf: &mut Vec<u8>, n: usize) {
+    for _ in 0..n {
+        let _ = buf.write_all(b" ");
+    }
+}
+
+/// Translate `raw_match_indices` (char indices into `s.text`, as produced by
+/// `suggest::fuzzy::rank` against the raw suggestion text) into char
+/// indices that refer to positions in `sanitized_display_text`.
+///
+/// This collapses two coordinate-space adjustments into one pass:
+///
+///   1. The basename-prefix offset: for `FilePath` / `Directory` suggestions,
+///      `display_text()` drops a leading path prefix (e.g. `"src/"`). Any
+///      match index that lands in that prefix must be discarded — it points
+///      at a character we will never render.
+///   2. The sanitizer offset: `sanitize_display_text()` removes control
+///      characters (ESC, CSI, OSC, BEL, ...) from the basename. Each such
+///      character shortens the emitted string by one without changing the
+///      raw index numbering, so every match index past the stripped char
+///      would otherwise land on the wrong character.
+///
+/// The result is indexed against `sanitized_display_text` and is already
+/// sorted (we walk left-to-right), so the caller can `binary_search` it
+/// directly.
+pub(crate) fn translate_match_indices(
+    raw_basename: &str,
+    sanitized_display_text: &str,
+    prefix_char_count: usize,
+    raw_match_indices: &[u32],
+) -> Vec<u32> {
+    // Fast path: no upstream matches means no translation needed.
+    if raw_match_indices.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity(raw_match_indices.len());
+    let mut sanitized_char_idx: u32 = 0;
+    for (basename_char_idx, ch) in raw_basename.chars().enumerate() {
+        // The upstream matcher operates on `s.text`, so a basename char at
+        // local index `i` corresponds to raw index `prefix_char_count + i`.
+        let raw_idx = prefix_char_count as u32 + basename_char_idx as u32;
+
+        if ch.is_control() {
+            // Sanitizer drops this char. Do NOT advance sanitized_char_idx,
+            // and do NOT emit an index for it even if it was a "match" —
+            // there is no rendered character to highlight.
+            continue;
+        }
+
+        if raw_match_indices.binary_search(&raw_idx).is_ok() {
+            out.push(sanitized_char_idx);
+        }
+        sanitized_char_idx += 1;
+    }
+
+    // Sanity check in debug builds: the number of non-control chars we walked
+    // must equal the number of chars in `sanitized_display_text`. Any mismatch
+    // would mean the two sanitizers have diverged.
+    debug_assert_eq!(
+        sanitized_char_idx as usize,
+        sanitized_display_text.chars().count(),
+        "translate_match_indices: sanitized walk length mismatch"
+    );
+
+    out
+}
+
+/// Write suggestion text with fuzzy-match highlighting, clipped to
+/// `max_text_chars` display columns. Returns the number of display columns
+/// actually written.
+///
+/// `match_indices` MUST be char indices into `display_text` itself — both
+/// inputs share the same post-sanitization, post-prefix-strip coordinate
+/// space. See `translate_match_indices` for how the caller derives them from
+/// the raw upstream indices.
+fn write_highlighted_text(
+    buf: &mut Vec<u8>,
+    display_text: &str,
+    match_indices: &[u32],
+    max_text_chars: usize,
+    is_selected: bool,
+    theme: &PopupTheme,
+) -> usize {
+    let mut in_highlight = false;
+    let mut cols_written: usize = 0;
+    for (char_idx, ch) in display_text.chars().enumerate() {
+        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cols_written + ch_width > max_text_chars {
+            break;
+        }
+        let should_highlight = !theme.match_highlight_on.is_empty()
+            && match_indices.binary_search(&(char_idx as u32)).is_ok();
+        if should_highlight && !in_highlight {
+            buf.extend_from_slice(&theme.match_highlight_on);
+            in_highlight = true;
+        } else if !should_highlight && in_highlight {
+            ansi::reset(buf);
+            restore_base_style(buf, is_selected, theme);
+            in_highlight = false;
+        }
+        let mut utf8 = [0u8; 4];
+        buf.extend_from_slice(ch.encode_utf8(&mut utf8).as_bytes());
+        cols_written += ch_width;
+    }
+    // Close highlight if still active at end of text
+    if in_highlight {
+        ansi::reset(buf);
+        restore_base_style(buf, is_selected, theme);
+    }
+    cols_written
+}
+
+/// Render the description (if any) plus trailing padding to fill the row.
+/// When no description is available or the row is too narrow to fit one,
+/// pads the remainder of the row with spaces.
+///
+/// `gutter_text_len` is the display columns already consumed by the gutter
+/// plus the suggestion text — used to compute how much room is left for the
+/// description and its trailing padding.
+fn write_description(
+    buf: &mut Vec<u8>,
+    desc: Option<&str>,
+    total_width: usize,
+    gutter_text_len: usize,
+    is_selected: bool,
+    theme: &PopupTheme,
+) {
+    // Sanitize to prevent ANSI injection via malicious descriptions.
+    let desc = desc.map(sanitize_display_text).unwrap_or_default();
+    let max_desc_cols = total_width.saturating_sub(
+        gutter_text_len + crate::layout::DESC_GAP_COLS + crate::layout::TRAILING_PAD_COLS,
+    );
+
+    if desc.is_empty() || max_desc_cols <= 2 {
+        write_padding(buf, total_width.saturating_sub(gutter_text_len));
+        return;
+    }
+
+    write_padding(buf, crate::layout::DESC_GAP_COLS);
+    if !is_selected {
+        ansi::reset(buf);
+        emit_bg(buf, theme);
+        buf.extend_from_slice(&theme.description_on);
+    }
+    // Truncate description by display columns, not char count. Appends a
+    // single-column ellipsis (`…`) when the description didn't fit so users
+    // can tell the text was cut.
+    let (truncated, desc_cols) = truncate_with_ellipsis(&desc, max_desc_cols);
+    let _ = write!(buf, "{truncated}");
+    if !is_selected {
+        ansi::reset(buf);
+        emit_bg(buf, theme);
+        if !theme.item_text_on.is_empty() {
+            buf.extend_from_slice(&theme.item_text_on);
+        }
+    }
+    write_padding(
+        buf,
+        total_width.saturating_sub(gutter_text_len + crate::layout::DESC_GAP_COLS + desc_cols),
+    );
+}
+
+/// Thin orchestrator: lay out gutter, highlighted text, and description for a
+/// single suggestion row. All heavy lifting is delegated to helpers above.
+fn format_item(
+    buf: &mut Vec<u8>,
+    s: &Suggestion,
+    width: u16,
+    is_selected: bool,
+    theme: &PopupTheme,
+) {
+    write_gutter(buf, s.kind, is_selected, theme);
+
+    let total_width = width as usize;
+    let max_text_chars = total_width.saturating_sub(crate::layout::GUTTER_COLS);
+
+    // For filesystem entries, show just the last path component (the user
+    // already typed the prefix, so repeating it wastes popup space).
+    // Also compute the prefix char count for offsetting match indices.
+    let (raw_display_text, prefix_char_count) = display_text(s);
+    // Sanitize to prevent ANSI injection via malicious filenames/branches.
+    let display_text = sanitize_display_text(raw_display_text);
+    // Translate match indices from the raw-text coordinate space (what the
+    // upstream fuzzy matcher produced) into the sanitized display-text
+    // coordinate space, so `write_highlighted_text` can treat them as direct
+    // char offsets into `display_text` without any skew.
+    let match_indices = translate_match_indices(
+        raw_display_text,
+        &display_text,
+        prefix_char_count,
+        &s.match_indices,
+    );
+
+    let cols_written = write_highlighted_text(
+        buf,
+        &display_text,
+        &match_indices,
+        max_text_chars,
+        is_selected,
+        theme,
+    );
+
+    let gutter_text_len = crate::layout::GUTTER_COLS + cols_written;
+    write_description(
+        buf,
+        s.description.as_deref(),
+        total_width,
+        gutter_text_len,
+        is_selected,
+        theme,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{DEFAULT_MAX_POPUP_WIDTH, DEFAULT_MAX_VISIBLE, DEFAULT_MIN_POPUP_WIDTH};
+    use suggest::SuggestionSource;
+
+    fn ghostty_profile() -> TerminalProfile {
+        TerminalProfile::for_ghostty()
+    }
+
+    fn iterm2_profile() -> TerminalProfile {
+        TerminalProfile::for_iterm2()
+    }
+
+    fn bordered_theme() -> PopupTheme {
+        PopupTheme {
+            borders: true,
+            ..PopupTheme::default()
+        }
+    }
+
+    fn make(text: &str, desc: Option<&str>, kind: SuggestionKind) -> Suggestion {
+        Suggestion {
+            text: text.to_string(),
+            description: desc.map(String::from),
+            kind,
+            source: SuggestionSource::Commands,
+            ..Default::default()
+        }
+    }
+
+    fn make_suggestions() -> Vec<Suggestion> {
+        vec![
+            make(
+                "checkout",
+                Some("Switch branches"),
+                SuggestionKind::Subcommand,
+            ),
+            make("commit", Some("Record changes"), SuggestionKind::Subcommand),
+            make("push", Some("Update remote"), SuggestionKind::Subcommand),
+        ]
+    }
+
+    fn printable_output(output: &str) -> String {
+        let mut printable = String::new();
+        let mut chars = output.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                if chars.peek().copied() == Some('[') {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if !ch.is_control() || ch == ' ' {
+                printable.push(ch);
+            }
+        }
+
+        printable
+    }
+
+    #[test]
+    fn test_render_produces_sync_wrapper() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new();
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.starts_with("\x1b[?2026h"),
+            "should start with begin_sync"
+        );
+        assert!(output.ends_with("\x1b[?2026l"), "should end with end_sync");
+    }
+
+    #[test]
+    fn test_render_pre_render_buffer_skips_sync() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new();
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &iterm2_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            !output.contains("\x1b[?2026h"),
+            "PreRenderBuffer should NOT contain begin_sync"
+        );
+        assert!(
+            !output.contains("\x1b[?2026l"),
+            "PreRenderBuffer should NOT contain end_sync"
+        );
+        // Should still have save/restore cursor
+        assert!(output.contains("\x1b7"), "should still save cursor");
+        assert!(output.contains("\x1b8"), "should still restore cursor");
+    }
+
+    #[test]
+    fn test_clear_pre_render_buffer_skips_sync() {
+        let mut buf = Vec::new();
+        let layout = PopupLayout {
+            start_row: 5,
+            start_col: 0,
+            width: 20,
+            height: 3,
+            scroll_deficit: 0,
+        };
+        clear_popup(&mut buf, &layout, &iterm2_profile());
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            !output.contains("\x1b[?2026h"),
+            "PreRenderBuffer clear should NOT contain begin_sync"
+        );
+        assert!(
+            !output.contains("\x1b[?2026l"),
+            "PreRenderBuffer clear should NOT contain end_sync"
+        );
+    }
+
+    #[test]
+    fn test_render_saves_restores_cursor() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new();
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(output.contains("\x1b7"), "should contain save cursor");
+        assert!(output.contains("\x1b8"), "should contain restore cursor");
+    }
+
+    #[test]
+    fn test_render_positions_at_layout() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new();
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        // Popup below cursor at row 5 → starts at row 6 (1-indexed: 7)
+        assert!(
+            output.contains("\x1b[7;1H"),
+            "should position at row 7 col 1"
+        );
+    }
+
+    #[test]
+    fn test_selected_item_has_reverse_video() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let mut state = OverlayState::new();
+        state.selected = Some(0);
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.contains("\x1b[7m"),
+            "should contain reverse video for selected"
+        );
+    }
+
+    #[test]
+    fn test_format_item_shows_kind_gutter() {
+        let mut buf = Vec::new();
+        let s = make("checkout", None, SuggestionKind::Subcommand);
+        format_item(&mut buf, &s, 30, false, &bordered_theme());
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.starts_with(" \u{F07B7}  checkout"),
+            "should show kind icon for subcommand: got '{output}'"
+        );
+    }
+
+    #[test]
+    fn test_format_item_shows_only_filename_for_directory() {
+        let mut buf = Vec::new();
+        let s = make(
+            "Desktop/coding/advent-of-code/master/2023-rust/",
+            None,
+            SuggestionKind::Directory,
+        );
+        format_item(&mut buf, &s, 40, false, &bordered_theme());
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.contains("2023-rust/"),
+            "should show only dirname: got '{output}'"
+        );
+        assert!(
+            !output.contains("Desktop/"),
+            "should NOT show full path prefix: got '{output}'"
+        );
+    }
+
+    #[test]
+    fn test_format_item_shows_only_filename_for_file() {
+        let mut buf = Vec::new();
+        let s = make("src/main/java/App.java", None, SuggestionKind::FilePath);
+        format_item(&mut buf, &s, 40, false, &bordered_theme());
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.contains("App.java"),
+            "should show only filename: got '{output}'"
+        );
+        assert!(
+            !output.contains("src/"),
+            "should NOT show path prefix: got '{output}'"
+        );
+    }
+
+    #[test]
+    fn test_format_item_no_slash_shows_full_name() {
+        let mut buf = Vec::new();
+        let s = make("Desktop/", None, SuggestionKind::Directory);
+        format_item(&mut buf, &s, 40, false, &bordered_theme());
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.contains("Desktop/"),
+            "single-component dir should show full name: got '{output}'"
+        );
+    }
+
+    #[test]
+    fn test_format_item_truncates_long_text() {
+        let mut buf = Vec::new();
+        let long_text = "https://api.github.com/orgs/Example/packages?package_type=container";
+        let s = make(long_text, None, SuggestionKind::History);
+        let width: u16 = 30;
+        format_item(&mut buf, &s, width, false, &bordered_theme());
+        // Count printable characters (no ANSI escape sequences)
+        let output = String::from_utf8_lossy(&buf);
+        let printable: String = output
+            .chars()
+            .filter(|c| !c.is_control() || *c == ' ')
+            .collect();
+        let char_count = printable.chars().count();
+        assert!(
+            char_count <= width as usize,
+            "printable chars ({char_count}) must not exceed width ({width}): '{printable}'"
+        );
+    }
+
+    #[test]
+    fn test_format_item_short_description_no_ellipsis() {
+        // 30-col row: max_desc_cols = 30 - GUTTER(4) - "cmd"(3) - GAP(2) - PAD(1) = 20.
+        // 5-char description fits cleanly, must render verbatim with no ellipsis.
+        let mut buf = Vec::new();
+        let s = make("cmd", Some("short"), SuggestionKind::Command);
+        format_item(&mut buf, &s, 30, false, &bordered_theme());
+        let output = String::from_utf8_lossy(&buf);
+        let printable = printable_output(&output);
+        let ellipsis_count = printable.chars().filter(|ch| *ch == '\u{2026}').count();
+        assert_eq!(
+            ellipsis_count, 0,
+            "fitting description must not get an ellipsis: {printable}"
+        );
+    }
+
+    #[test]
+    fn test_format_item_exact_fit_description_no_ellipsis() {
+        // 30-col row with text "cmd": max_desc_cols = 30-5-3-2-1 = 19. A 19-char
+        // description fits exactly and must render without an ellipsis.
+        let mut buf = Vec::new();
+        let exact = "a".repeat(19);
+        let s = make("cmd", Some(&exact), SuggestionKind::Command);
+        format_item(&mut buf, &s, 30, false, &bordered_theme());
+        let output = String::from_utf8_lossy(&buf);
+        let printable = printable_output(&output);
+        let ellipsis_count = printable.chars().filter(|ch| *ch == '\u{2026}').count();
+        assert_eq!(
+            ellipsis_count, 0,
+            "exact-fit description must not get an ellipsis: {printable}"
+        );
+    }
+
+    #[test]
+    fn test_format_item_truncates_description() {
+        let mut buf = Vec::new();
+        let long_desc = "a".repeat(200);
+        let s = make("cmd", Some(&long_desc), SuggestionKind::Command);
+        let width: u16 = 30;
+        format_item(&mut buf, &s, width, false, &bordered_theme());
+
+        let output = String::from_utf8_lossy(&buf);
+        let printable = printable_output(&output);
+        let printable_width = unicode_width::UnicodeWidthStr::width(printable.as_str());
+        let ellipsis_count = printable.chars().filter(|ch| *ch == '\u{2026}').count();
+
+        assert_eq!(
+            ellipsis_count, 1,
+            "truncated description should contain one ellipsis: {printable}"
+        );
+        assert!(
+            printable.trim_end().ends_with('\u{2026}'),
+            "truncated description should end with ellipsis: {printable}"
+        );
+        assert!(
+            printable_width <= width as usize,
+            "printable width ({printable_width}) must not exceed row width ({width}): {printable}"
+        );
+    }
+
+    #[test]
+    fn test_clear_writes_spaces() {
+        let mut buf = Vec::new();
+        let layout = PopupLayout {
+            start_row: 5,
+            start_col: 0,
+            width: 20,
+            height: 3,
+            scroll_deficit: 0,
+        };
+        clear_popup(&mut buf, &layout, &ghostty_profile());
+        let output = String::from_utf8_lossy(&buf);
+        assert!(!output.contains("\x1b[K"), "should not use erase_to_eol");
+        assert!(
+            output.contains("                    "),
+            "should write spaces"
+        );
+    }
+
+    #[test]
+    fn test_clear_correct_dimensions() {
+        let mut buf = Vec::new();
+        let layout = PopupLayout {
+            start_row: 10,
+            start_col: 5,
+            width: 25,
+            height: 4,
+            scroll_deficit: 0,
+        };
+        clear_popup(&mut buf, &layout, &ghostty_profile());
+        let output = String::from_utf8_lossy(&buf);
+        assert!(output.contains("\x1b[11;6H"), "row 10 -> ANSI row 11");
+        assert!(output.contains("\x1b[12;6H"), "row 11 -> ANSI row 12");
+        assert!(output.contains("\x1b[13;6H"), "row 12 -> ANSI row 13");
+        assert!(output.contains("\x1b[14;6H"), "row 13 -> ANSI row 14");
+    }
+
+    #[test]
+    fn test_render_with_scroll_offset() {
+        let mut buf = Vec::new();
+        let suggestions: Vec<Suggestion> = (0..15)
+            .map(|i| make(&format!("item{i}"), None, SuggestionKind::Command))
+            .collect();
+        let mut state = OverlayState::new();
+        state.scroll_offset = 5;
+        state.selected = Some(5);
+        let layout = render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.contains("item5"),
+            "should show item5 at scroll_offset=5"
+        );
+        assert!(
+            !output.contains("item0"),
+            "should not show item0 when scrolled"
+        );
+        assert_eq!(layout.height, 12); // DEFAULT_MAX_VISIBLE + 2 border rows
+    }
+
+    #[test]
+    fn test_render_empty_suggestions() {
+        let mut buf = Vec::new();
+        let suggestions: Vec<Suggestion> = vec![];
+        let state = OverlayState::new();
+        let layout = render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        assert_eq!(layout.height, 0);
+        assert!(
+            buf.is_empty(),
+            "should produce no output for empty suggestions"
+        );
+    }
+
+    #[test]
+    fn test_render_empty_no_feedback_preserves_prior_deficit() {
+        let mut buf = Vec::new();
+        let state = OverlayState::new();
+        let layout = render_popup(
+            &mut buf,
+            &[],
+            &state,
+            22,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            4,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+
+        assert!(buf.is_empty());
+        assert_eq!(layout.height, 0);
+        assert_eq!(layout.scroll_deficit, 4);
+    }
+
+    // --- parse_style tests ---
+
+    #[test]
+    fn test_parse_style_reverse() {
+        assert_eq!(parse_style("reverse").unwrap(), b"\x1b[7m");
+    }
+
+    #[test]
+    fn test_parse_style_dim_bold() {
+        assert_eq!(parse_style("dim bold").unwrap(), b"\x1b[2;1m");
+    }
+
+    #[test]
+    fn test_parse_style_fg_color() {
+        assert_eq!(parse_style("fg:196").unwrap(), b"\x1b[38;5;196m");
+    }
+
+    #[test]
+    fn test_parse_style_bg_bold() {
+        assert_eq!(parse_style("bg:236 bold").unwrap(), b"\x1b[48;5;236;1m");
+    }
+
+    #[test]
+    fn test_parse_style_underline() {
+        assert_eq!(parse_style("underline").unwrap(), b"\x1b[4m");
+    }
+
+    #[test]
+    fn test_parse_style_italic() {
+        assert_eq!(parse_style("italic").unwrap(), b"\x1b[3m");
+    }
+
+    #[test]
+    fn test_parse_style_empty() {
+        assert_eq!(parse_style("").unwrap(), b"");
+    }
+
+    #[test]
+    fn test_parse_style_invalid_token() {
+        assert!(parse_style("blink").is_err());
+    }
+
+    #[test]
+    fn test_parse_style_invalid_fg_number() {
+        assert!(parse_style("fg:abc").is_err());
+    }
+
+    #[test]
+    fn test_parse_style_invalid_fg_overflow() {
+        assert!(parse_style("fg:999").is_err());
+    }
+
+    // --- scroll-to-make-room tests ---
+
+    #[test]
+    fn test_render_scroll_when_deficit_needed() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions(); // 3 items
+        let state = OverlayState::new();
+        // cursor at row 22 on 24-row screen: space_below = 1, need 3+2(borders)=5, deficit = 4
+        let layout = render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            22,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        // Should CUP to last row before newlines
+        assert!(
+            output.contains("\x1b[24;1H"),
+            "should CUP to last row: {output}"
+        );
+        // Should contain newlines (deficit = 4)
+        assert!(
+            output.contains("\n\n\n\n"),
+            "should emit 4 deficit newlines: {output}"
+        );
+        assert_eq!(layout.scroll_deficit, 4);
+        // final_cursor = 22 - 4 = 18, start_row = 19
+        assert_eq!(layout.start_row, 19);
+    }
+
+    #[test]
+    fn test_render_no_scroll_when_room_below() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions(); // 3 items
+        let state = OverlayState::new();
+        let layout = render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        // No newlines means no scrolling occurred (popup uses CUP, not newlines)
+        assert!(
+            !buf.contains(&b'\n'),
+            "should not contain newlines (no scroll needed)"
+        );
+        assert_eq!(layout.scroll_deficit, 0);
+        assert_eq!(layout.start_row, 6);
+    }
+
+    #[test]
+    fn test_render_prior_deficit_prevents_rescroll() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions(); // 3 items
+        let state = OverlayState::new();
+        // prior_deficit=4: adjusted cursor = 22-4 = 18, space_below = 5, need 3+2=5, no new deficit
+        let layout = render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            22,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            4,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        // No newlines means no scrolling occurred (popup uses CUP, not newlines)
+        assert!(
+            !buf.contains(&b'\n'),
+            "should not contain newlines (no re-scroll)"
+        );
+        assert_eq!(layout.scroll_deficit, 4); // carries forward
+        assert_eq!(layout.start_row, 19);
+    }
+
+    #[test]
+    fn test_feedback_only_prior_deficit_prevents_rescroll() {
+        let mut buf = Vec::new();
+        let state = OverlayState::new();
+
+        let layout = render_popup(
+            &mut buf,
+            &[],
+            &state,
+            22,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            2,
+            FeedbackKind::Loading { frame: 0 },
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+
+        assert!(
+            !buf.contains(&b'\n'),
+            "feedback-only render must account for prior deficit instead of scrolling again"
+        );
+        assert_eq!(layout.scroll_deficit, 2);
+        assert_eq!(layout.start_row, 21);
+    }
+
+    #[test]
+    fn test_render_incremental_deficit() {
+        // First render: 3 items, cursor at row 22, screen 24 -> deficit = 4 (3 items + 2 borders - 1 space)
+        let mut buf1 = Vec::new();
+        let suggestions_3 = make_suggestions(); // 3 items
+        let state = OverlayState::new();
+        let layout1 = render_popup(
+            &mut buf1,
+            &suggestions_3,
+            &state,
+            22,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        assert_eq!(layout1.scroll_deficit, 4);
+
+        // Second render: 8 items, same cursor, prior_deficit=4
+        // adj_cursor = 22-4 = 18, space_below = 5, need 8+2=10, new_deficit = 5
+        let mut buf2 = Vec::new();
+        let suggestions_8: Vec<Suggestion> = (0..8)
+            .map(|i| make(&format!("item{i}"), None, SuggestionKind::Command))
+            .collect();
+        let layout2 = render_popup(
+            &mut buf2,
+            &suggestions_8,
+            &state,
+            22,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            4, // prior_deficit from first render
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output2 = String::from_utf8_lossy(&buf2);
+        // Should scroll 5 more (total = 4 + 5 = 9)
+        assert!(
+            output2.contains("\x1b[24;1H"),
+            "should scroll for incremental deficit"
+        );
+        assert_eq!(layout2.scroll_deficit, 9);
+        // final_cursor = 22 - 9 = 13, start_row = 14
+        assert_eq!(layout2.start_row, 14);
+    }
+
+    #[test]
+    fn test_render_pins_popup_to_cursor_when_prior_deficit_exceeds_cursor_row() {
+        // Regression for the codex/fix-terminal-rendering-corruption bug:
+        // when CPR sync fails (e.g. cached screen_rows is stale and the
+        // terminal reports a row past it), `overlay_scroll_deficit` is
+        // never reset and accumulates past `cursor_row`. The previous
+        // saturating math (and even a naive clamp to cursor_row) collapsed
+        // `final_cursor_row` to 0 and rendered the popup at row 1, smeared
+        // across prior scrollback. A pathological prior_deficit must be
+        // discarded entirely so the popup re-anchors directly below the
+        // current cursor row (start_row == cursor_row + 1 with plenty of
+        // space below, or scrolled appropriately if not).
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions(); // 3 items
+        let state = OverlayState::new();
+        let cursor_row = 10u16;
+        let layout = render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            cursor_row,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            // Wildly stale prior_deficit, much larger than cursor_row —
+            // this is what the production log captured before the fix.
+            500,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        assert_eq!(
+            layout.start_row,
+            cursor_row + 1,
+            "popup must re-anchor below cursor when prior_deficit is stale; \
+             got start_row={} cursor_row={cursor_row}",
+            layout.start_row
+        );
+        assert_eq!(
+            layout.scroll_deficit, 0,
+            "stale prior_deficit must be discarded (no scroll required since cursor_row=10 \
+             on screen=24 has plenty of room below); got scroll_deficit={}",
+            layout.scroll_deficit
+        );
+    }
+
+    #[test]
+    fn test_render_discards_prior_deficit_equal_to_cursor_row() {
+        // Boundary case: prior_deficit == cursor_row implies the real
+        // cursor sat at row 0. The cached value can't be distinguished from
+        // a stale one of equal magnitude, so we err on the side of
+        // discarding — the cost is one extra scroll-via-newline pass on the
+        // rare legitimate case (real cursor at top of screen), which is
+        // strictly better than the row-1 popup failure on the common stale
+        // case (deficit accumulated under a missed CPR sync).
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new();
+        let cursor_row = 8u16;
+        let layout = render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            cursor_row,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            cursor_row, // == cursor_row exactly
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        assert_eq!(
+            layout.start_row,
+            cursor_row + 1,
+            "prior_deficit == cursor_row is treated as stale — popup anchors below cursor"
+        );
+    }
+
+    #[test]
+    fn test_render_discards_pathological_prior_deficit_and_recomputes_fresh() {
+        // u16::MAX prior_deficit is impossible — the real cursor cannot be
+        // 65535 rows above the parser's view. The render path discards the
+        // stale value entirely and recomputes scroll_deficit from scratch
+        // based on the actual room available below cursor_row. This is what
+        // pulls the popup back under the cursor instead of plastering it at
+        // row 1, which is the production regression mode.
+        let mut buf = Vec::new();
+        let suggestions: Vec<Suggestion> = (0..5)
+            .map(|i| make(&format!("item{i}"), None, SuggestionKind::Command))
+            .collect();
+        let state = OverlayState::new();
+
+        let cursor_row = 22u16;
+        let layout = render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            cursor_row,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            u16::MAX,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+
+        // 5 items + 2 borders = 7 rows needed; cursor=22 on screen=24 leaves
+        // 1 row below, so new_deficit = 6. After discarding the stale
+        // u16::MAX prior, total_deficit = 6, final_cursor_row = 16,
+        // start_row = 17 — clearly anchored below cursor, not at row 1.
+        assert_eq!(
+            layout.scroll_deficit, 6,
+            "scroll_deficit recomputed from current cursor_row, ignoring stale prior; got {}",
+            layout.scroll_deficit
+        );
+        assert_eq!(
+            layout.start_row,
+            cursor_row - 6 + 1,
+            "popup must anchor one row below the (re-adjusted) cursor; got start_row={}",
+            layout.start_row
+        );
+    }
+
+    #[test]
+    fn test_render_decsc_after_scroll_not_before() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new();
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            22,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        let cup_to_adjusted = "\x1b[19;1H"; // adj_row=18, ANSI row=19
+        let decsc = "\x1b7";
+        let cup_pos = output
+            .find(cup_to_adjusted)
+            .expect("should contain CUP to adjusted position");
+        let decsc_pos = output.find(decsc).expect("should contain DECSC");
+        assert!(
+            decsc_pos > cup_pos,
+            "DECSC must come AFTER CUP to adjusted position"
+        );
+    }
+
+    #[test]
+    fn test_render_small_terminal_caps_height() {
+        let mut buf = Vec::new();
+        let suggestions: Vec<Suggestion> = (0..15)
+            .map(|i| make(&format!("item{i}"), None, SuggestionKind::Command))
+            .collect();
+        let state = OverlayState::new();
+        let layout = render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            4,
+            0,
+            6, // only 6 rows
+            80,
+            15, // max_visible bigger than screen
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        // capped to screen_rows - 1 - 2(borders) = 3 content + 2 borders = 5
+        assert!(
+            layout.height <= 5,
+            "height {} should be <= 5",
+            layout.height
+        );
+        assert!(layout.start_row >= 1);
+    }
+
+    #[test]
+    fn test_render_adj_row_never_underflows() {
+        let mut buf = Vec::new();
+        // cursor at row 2, 6-row terminal, 15 suggestions, max_visible=15
+        // effective_max = min(15, 6-1-2) = 3
+        // adj_cursor = 2, space_below = 6-2-1 = 3, visible=3+2(borders)=5, deficit = 2
+        // total_deficit = 2, final_cursor = 2 - 2 = 0 (not underflowed)
+        let suggestions: Vec<Suggestion> = (0..15)
+            .map(|i| make(&format!("item{i}"), None, SuggestionKind::Command))
+            .collect();
+        let state = OverlayState::new();
+        let layout = render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            2,
+            0,
+            6,
+            80,
+            15,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        // final_cursor = 0, start_row = 1
+        assert_eq!(layout.start_row, 1);
+        assert_eq!(layout.scroll_deficit, 2);
+    }
+
+    #[test]
+    fn test_parse_style_hex_fg() {
+        assert_eq!(
+            parse_style("fg:#89b4fa").unwrap(),
+            b"\x1b[38;2;137;180;250m"
+        );
+    }
+
+    #[test]
+    fn test_parse_style_hex_bg() {
+        assert_eq!(parse_style("bg:#1e1e2e").unwrap(), b"\x1b[48;2;30;30;46m");
+    }
+
+    #[test]
+    fn test_parse_style_hex_case_insensitive() {
+        assert_eq!(
+            parse_style("fg:#89B4FA").unwrap(),
+            parse_style("fg:#89b4fa").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_parse_style_hex_mixed_with_256() {
+        assert_eq!(
+            parse_style("fg:#89b4fa bg:236 bold").unwrap(),
+            b"\x1b[38;2;137;180;250;48;5;236;1m"
+        );
+    }
+
+    #[test]
+    fn test_parse_style_hex_too_short() {
+        assert!(parse_style("fg:#89b4").is_err());
+    }
+
+    #[test]
+    fn test_parse_style_hex_invalid_chars() {
+        assert!(parse_style("fg:#gggggg").is_err());
+    }
+
+    #[test]
+    fn test_parse_style_hex_missing_hash() {
+        assert!(parse_style("fg:89b4fa").is_err());
+    }
+
+    #[test]
+    fn test_non_selected_row_has_item_text_style() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let mut state = OverlayState::new();
+        state.selected = Some(0); // Only first item selected
+        let theme = PopupTheme {
+            item_text_on: b"\x1b[2m".to_vec(), // explicitly dim for this test
+            ..bordered_theme()
+        };
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &theme,
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        // Count occurrences of dim (\x1b[2m) — should appear for non-selected rows
+        let dim_count = output.matches("\x1b[2m").count();
+        // At least 2 non-selected rows should have dim styling
+        // (existing description dim + new item_text dim)
+        assert!(
+            dim_count >= 2,
+            "non-selected rows should be dimmed, got {dim_count} dim sequences"
+        );
+    }
+
+    #[test]
+    fn test_selected_row_no_item_text_style() {
+        let mut buf = Vec::new();
+        let suggestions = vec![make("only", None, SuggestionKind::Command)];
+        let mut state = OverlayState::new();
+        state.selected = Some(0);
+        let theme = PopupTheme {
+            item_text_on: b"\x1b[2m".to_vec(),
+            selected_on: b"\x1b[7m".to_vec(),
+            ..bordered_theme()
+        };
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &theme,
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        // Selected row should have reverse, not dim
+        assert!(output.contains("\x1b[7m"), "selected should have reverse");
+    }
+
+    #[test]
+    fn test_empty_item_text_style_no_extra_escapes() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new(); // Nothing selected
+        let theme = PopupTheme {
+            item_text_on: vec![], // Empty — no styling
+            ..bordered_theme()
+        };
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &theme,
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        // Dim sequences come from: border_on (dim) + description_on (dim) for each row
+        // 3 content rows × (2 border + 1 desc) + 2 border rows = 11 dim sequences
+        let dim_count = output.matches("\x1b[2m").count();
+        assert!(
+            dim_count <= 12,
+            "expected ~11 dim sequences (borders + descriptions), got {dim_count}: {output}"
+        );
+    }
+
+    #[test]
+    fn test_highlight_matched_chars() {
+        let mut buf = Vec::new();
+        let mut s = make(
+            "checkout",
+            Some("Switch branches"),
+            SuggestionKind::Subcommand,
+        );
+        s.match_indices = vec![0, 1, 2]; // "che" matched
+        let theme = PopupTheme::default();
+        format_item(&mut buf, &s, 40, false, &theme);
+        let output = String::from_utf8_lossy(&buf);
+        // Should contain bold sequence (match_highlight_on default)
+        assert!(
+            output.contains("\x1b[1m"),
+            "matched chars should have bold highlight: {output}"
+        );
+    }
+
+    #[test]
+    fn test_no_indices_no_highlight() {
+        let mut buf = Vec::new();
+        let s = make("checkout", None, SuggestionKind::Subcommand);
+        // match_indices is empty (default)
+        let theme = PopupTheme::default();
+        format_item(&mut buf, &s, 40, false, &theme);
+        let output = String::from_utf8_lossy(&buf);
+        // Should NOT contain bold (no match highlighting)
+        assert!(
+            !output.contains("\x1b[1m"),
+            "no indices means no highlight: {output}"
+        );
+    }
+
+    #[test]
+    fn test_highlight_consecutive_single_span() {
+        let mut buf = Vec::new();
+        let mut s = make("checkout", None, SuggestionKind::Subcommand);
+        s.match_indices = vec![0, 1, 2]; // consecutive
+        let theme = PopupTheme::default();
+        format_item(&mut buf, &s, 40, false, &theme);
+        let output = String::from_utf8_lossy(&buf);
+        // Should have exactly one bold-on sequence for consecutive matches
+        let bold_count = output.matches("\x1b[1m").count();
+        assert_eq!(
+            bold_count, 1,
+            "consecutive matches should produce single span"
+        );
+    }
+
+    #[test]
+    fn test_highlight_on_selected_row() {
+        let mut buf = Vec::new();
+        let mut s = make("checkout", None, SuggestionKind::Subcommand);
+        s.match_indices = vec![0, 1, 2];
+        let theme = PopupTheme::default();
+        format_item(&mut buf, &s, 40, true, &theme);
+        let output = String::from_utf8_lossy(&buf);
+        // Should contain bold (highlight composes with selected reverse)
+        assert!(
+            output.contains("\x1b[1m"),
+            "selected row should still show highlight"
+        );
+    }
+
+    #[test]
+    fn test_highlight_filepath_basename_offset() {
+        let mut buf = Vec::new();
+        let mut s = make("src/main/App.java", None, SuggestionKind::FilePath);
+        // Indices for "App" in full path: chars 9, 10, 11
+        s.match_indices = vec![9, 10, 11];
+        let theme = PopupTheme::default();
+        format_item(&mut buf, &s, 40, false, &theme);
+        let output = String::from_utf8_lossy(&buf);
+        // Display shows "App.java", highlight should be on "App"
+        assert!(
+            output.contains("\x1b[1m"),
+            "basename highlight should work: {output}"
+        );
+    }
+
+    #[test]
+    fn test_highlight_indices_in_stripped_prefix_skipped() {
+        let mut buf = Vec::new();
+        let mut s = make("src/main/App.java", None, SuggestionKind::FilePath);
+        // Indices in the stripped prefix (before "App.java")
+        s.match_indices = vec![0, 1, 2]; // "src" — in prefix, should be skipped
+        let theme = PopupTheme::default();
+        format_item(&mut buf, &s, 40, false, &theme);
+        let output = String::from_utf8_lossy(&buf);
+        // No highlight — all indices are in the stripped prefix
+        assert!(
+            !output.contains("\x1b[1m"),
+            "indices in stripped prefix should not highlight: {output}"
+        );
+    }
+
+    #[test]
+    fn test_highlight_non_ascii_path_offset() {
+        let mut buf = Vec::new();
+        // "café/" is 5 chars but 6 bytes (é = 2 bytes in UTF-8)
+        let mut s = make("café/menu.txt", None, SuggestionKind::FilePath);
+        // "menu" starts at char index 5; match indices for "men" = 5, 6, 7
+        s.match_indices = vec![5, 6, 7];
+        let theme = PopupTheme::default();
+        format_item(&mut buf, &s, 40, false, &theme);
+        let output = String::from_utf8_lossy(&buf);
+        // Display shows "menu.txt", highlight should be on "men"
+        assert!(
+            output.contains("\x1b[1m"),
+            "non-ASCII path offset should work: {output}"
+        );
+    }
+
+    #[test]
+    fn test_highlight_indices_beyond_truncation_ignored() {
+        let mut buf = Vec::new();
+        let long_text = "a_very_long_command_name_that_will_be_truncated";
+        let mut s = make(long_text, None, SuggestionKind::Command);
+        // Index 40+ is beyond a width=20 popup's text area
+        s.match_indices = vec![42, 43, 44];
+        let theme = PopupTheme::default();
+        format_item(&mut buf, &s, 20, false, &theme);
+        let output = String::from_utf8_lossy(&buf);
+        // No highlight — all indices are beyond the truncation point
+        assert!(
+            !output.contains("\x1b[1m"),
+            "indices beyond truncation should not highlight: {output}"
+        );
+    }
+
+    #[test]
+    fn test_scrollbar_visible_when_items_exceed_max_visible() {
+        let mut buf = Vec::new();
+        let suggestions: Vec<Suggestion> = (0..15)
+            .map(|i| make(&format!("item{i}"), None, SuggestionKind::Command))
+            .collect();
+        let state = OverlayState::new();
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.contains('█') || output.contains('┆'),
+            "scrollbar should be visible with 15 items: {output}"
+        );
+    }
+
+    #[test]
+    fn test_no_scrollbar_when_items_fit() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions(); // 3 items
+        let state = OverlayState::new();
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        // No scrollbar thumb or track — but border │ chars are always present
+        // Count │ occurrences: should be exactly 2 per content row (left + right border) × 3 rows = 6
+        // Plus no scrollbar │ chars (which would be extra)
+        let pipe_count = output.matches('│').count();
+        assert_eq!(
+            pipe_count, 6,
+            "should have exactly 6 │ chars (3 rows × 2 borders), not scrollbar: {output}"
+        );
+        assert!(
+            !output.contains('█'),
+            "no scrollbar thumb when items fit: {output}"
+        );
+    }
+
+    #[test]
+    fn test_scrollbar_thumb_at_top_when_scroll_zero() {
+        let mut buf = Vec::new();
+        let suggestions: Vec<Suggestion> = (0..20)
+            .map(|i| make(&format!("item{i}"), None, SuggestionKind::Command))
+            .collect();
+        let state = OverlayState::new(); // scroll_offset = 0
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(output.contains('█'), "should have thumb indicator");
+        assert!(output.contains('┆'), "should have track indicator");
+    }
+
+    #[test]
+    fn test_scrollbar_thumb_at_bottom_when_scrolled_to_end() {
+        let mut buf = Vec::new();
+        let suggestions: Vec<Suggestion> = (0..20)
+            .map(|i| make(&format!("item{i}"), None, SuggestionKind::Command))
+            .collect();
+        let mut state = OverlayState::new();
+        state.scroll_offset = 10; // scrolled to bottom (20 - 10 max_visible)
+        state.selected = Some(19);
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(output.contains('█'), "should have thumb at bottom");
+    }
+
+    #[test]
+    fn test_scrollbar_item_text_width_reduced() {
+        let suggestions_few: Vec<Suggestion> = (0..3)
+            .map(|i| make(&format!("item{i}"), None, SuggestionKind::Command))
+            .collect();
+        let suggestions_many: Vec<Suggestion> = (0..15)
+            .map(|i| make(&format!("item{i}"), None, SuggestionKind::Command))
+            .collect();
+
+        let mut buf_no_scroll = Vec::new();
+        let state = OverlayState::new();
+        render_popup(
+            &mut buf_no_scroll,
+            &suggestions_few,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+
+        let mut buf_scroll = Vec::new();
+        render_popup(
+            &mut buf_scroll,
+            &suggestions_many,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+
+        let output = String::from_utf8_lossy(&buf_scroll);
+        assert!(
+            output.contains('┆') || output.contains('█'),
+            "scrollbar popup should have scrollbar chars"
+        );
+    }
+
+    #[test]
+    fn test_scrollbar_selected_row_uses_selected_style() {
+        let mut buf = Vec::new();
+        let suggestions: Vec<Suggestion> = (0..15)
+            .map(|i| make(&format!("item{i}"), None, SuggestionKind::Command))
+            .collect();
+        let mut state = OverlayState::new();
+        state.selected = Some(0);
+        let theme = PopupTheme {
+            selected_on: b"\x1b[7m".to_vec(),
+            ..bordered_theme()
+        };
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &theme,
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.contains("\x1b[7m"),
+            "selected row should have reverse video"
+        );
+    }
+
+    #[test]
+    fn test_loading_true_shows_indicator() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new();
+        let layout = render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::Loading { frame: 0 },
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.contains("Loading"),
+            "loading feedback should produce indicator label: {output}"
+        );
+        // Height: 3 content + 2 borders + 1 loading extra (loading displaces bottom border,
+        // which moves down 1 row, netting 1 extra row beyond layout.height) = 6
+        assert_eq!(
+            layout.height, 6,
+            "loading should increase height by 1 beyond base layout"
+        );
+    }
+
+    #[test]
+    fn test_feedback_loading_shows_spinner_frame() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new();
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &PopupTheme::default(),
+            0,
+            FeedbackKind::Loading { frame: 0 },
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.contains('⠋'),
+            "loading feedback should show spinner: {output}"
+        );
+        assert!(
+            output.contains("Loading"),
+            "loading feedback should include label: {output}"
+        );
+    }
+
+    #[test]
+    fn test_loading_label_uses_ellipsis_when_spinner_disabled() {
+        let mut buf = Vec::new();
+        let layout = PopupLayout {
+            start_row: 5,
+            start_col: 0,
+            width: 60,
+            height: 4,
+            scroll_deficit: 0,
+        };
+        let theme = PopupTheme {
+            spinner: false,
+            ..PopupTheme::default()
+        };
+        render_indicator_row(
+            &mut buf,
+            &layout,
+            &theme,
+            FeedbackKind::Loading { frame: 0 },
+            &PopupHints::default(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.contains('…'),
+            "spinner=false should fall back to ellipsis: {output}"
+        );
+        assert!(
+            !output.contains('⠋'),
+            "spinner=false must not render spinner glyph: {output}"
+        );
+        assert!(
+            output.contains("Loading"),
+            "loading feedback should include label: {output}"
+        );
+    }
+
+    #[test]
+    fn test_loading_label_uses_ellipsis_when_content_width_narrow() {
+        let mut buf = Vec::new();
+        let layout = PopupLayout {
+            start_row: 5,
+            start_col: 0,
+            width: 24,
+            height: 4,
+            scroll_deficit: 0,
+        };
+        render_indicator_row(
+            &mut buf,
+            &layout,
+            &PopupTheme::default(),
+            FeedbackKind::Loading { frame: 0 },
+            &PopupHints::default(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.contains('…'),
+            "narrow content_width should fall back to ellipsis: {output}"
+        );
+        assert!(
+            !output.contains('⠋'),
+            "narrow content_width must not render spinner glyph: {output}"
+        );
+    }
+
+    #[test]
+    fn test_feedback_empty_and_error_labels() {
+        let mut empty_buf = Vec::new();
+        let state = OverlayState::new();
+        render_popup(
+            &mut empty_buf,
+            &[],
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &PopupTheme::default(),
+            0,
+            FeedbackKind::Empty,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        assert!(String::from_utf8_lossy(&empty_buf).contains("(no matches)"));
+
+        let mut error_buf = Vec::new();
+        render_popup(
+            &mut error_buf,
+            &[],
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &PopupTheme::default(),
+            0,
+            FeedbackKind::Error {
+                provider: "git".into(),
+            },
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        assert!(String::from_utf8_lossy(&error_buf).contains("failed: git"));
+    }
+
+    #[test]
+    fn test_render_indicator_row_is_small() {
+        let mut buf = Vec::new();
+        let layout = PopupLayout {
+            start_row: 5,
+            start_col: 0,
+            width: 60,
+            height: 4,
+            scroll_deficit: 0,
+        };
+        render_indicator_row(
+            &mut buf,
+            &layout,
+            &PopupTheme::default(),
+            FeedbackKind::PartialError { providers: 1 },
+            &PopupHints::default(),
+        );
+        assert!(
+            buf.len() <= 200,
+            "indicator repaint too large: {}",
+            buf.len()
+        );
+        assert!(String::from_utf8_lossy(&buf).contains("1 provider failed"));
+    }
+
+    #[test]
+    fn test_feedback_label_clips_to_content_width() {
+        let (label, cols) = truncate_to_display_cols("  ! failed: very-long-provider-name", 18);
+
+        assert_eq!(cols, 18);
+        assert_eq!(label, "  ! failed: very-l");
+
+        let mut buf = Vec::new();
+        let layout = PopupLayout {
+            start_row: 5,
+            start_col: 0,
+            width: 20,
+            height: 4,
+            scroll_deficit: 0,
+        };
+        render_indicator_row(
+            &mut buf,
+            &layout,
+            &bordered_theme(),
+            FeedbackKind::Error {
+                provider: "very-long-provider-name".into(),
+            },
+            &PopupHints::default(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(!output.contains("provider-name"));
+    }
+
+    #[test]
+    fn test_loading_false_no_indicator() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new();
+        let layout = render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            !output.contains("..."),
+            "loading=false should NOT produce '...' indicator: {output}"
+        );
+        // Height: 3 content + 2 borders = 5
+        assert_eq!(layout.height, 5);
+    }
+
+    #[test]
+    fn test_border_characters_present() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions(); // 3 items
+        let state = OverlayState::new();
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(output.contains('╭'), "missing top-left corner: {output}");
+        assert!(output.contains('╮'), "missing top-right corner: {output}");
+        assert!(output.contains('╰'), "missing bottom-left corner: {output}");
+        assert!(
+            output.contains('╯'),
+            "missing bottom-right corner: {output}"
+        );
+        assert!(output.contains('─'), "missing horizontal border: {output}");
+        assert!(output.contains('│'), "missing vertical border: {output}");
+    }
+
+    // --- borders: false tests (production default) ---
+
+    #[test]
+    fn test_render_no_borders_no_border_chars() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new();
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &PopupTheme::default(), // borders: false
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(!output.contains('╭'), "no top-left corner without borders");
+        assert!(!output.contains('╮'), "no top-right corner without borders");
+        assert!(
+            !output.contains('╰'),
+            "no bottom-left corner without borders"
+        );
+        assert!(
+            !output.contains('╯'),
+            "no bottom-right corner without borders"
+        );
+        assert!(!output.contains('│'), "no vertical border without borders");
+    }
+
+    #[test]
+    fn test_render_no_borders_height() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions(); // 3 items
+        let state = OverlayState::new();
+        let layout = render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &PopupTheme::default(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        // 3 content rows, no border padding
+        assert_eq!(layout.height, 3, "borderless height = content rows only");
+    }
+
+    #[test]
+    fn test_layout_no_borders_width() {
+        // Use a suggestion wide enough to exceed min_width so border padding is visible
+        let suggestions = vec![make(
+            "a-sufficiently-long-suggestion-name",
+            None,
+            SuggestionKind::Subcommand,
+        )];
+        let layout = layout::compute_layout(
+            &suggestions,
+            0,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            false, // no borders
+            &PopupHints::default(),
+        );
+        let bordered = layout::compute_layout(
+            &suggestions,
+            0,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            true,
+            &PopupHints::default(),
+        );
+        assert_eq!(
+            bordered.width - layout.width,
+            2,
+            "bordered should be 2 wider (border padding), got borderless={} bordered={}",
+            layout.width,
+            bordered.width
+        );
+    }
+
+    #[test]
+    fn test_loading_no_borders_height() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new();
+        let layout = render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &PopupTheme::default(), // borders: false
+            0,
+            FeedbackKind::Loading { frame: 0 },
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        // 3 content + 1 loading row, no borders
+        assert_eq!(
+            layout.height, 4,
+            "borderless loading height = content + 1 loading row"
+        );
+    }
+
+    #[test]
+    fn test_loading_bordered_deficit_accounts_for_displaced_border() {
+        // With borders + loading near the bottom of the screen, the scroll
+        // deficit must account for the loading row that displaces the bottom
+        // border down by one row — but only by one row, not two: the loading
+        // row overwrites the original bottom border position and the border
+        // is redrawn directly below, for a net +1 row over the base popup
+        // height.
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions(); // 3 items
+        let state = OverlayState::new();
+        // cursor at row 8 in a 10-row terminal — tight fit
+        let layout = render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            8,
+            0,
+            10,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::Loading { frame: 0 },
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        // total_height_needed = 3 content + 2 borders + 1 loading_extra_deficit = 6
+        // space_below = 10 - 9 = 1, so new_deficit = 6 - 1 = 5.
+        // Equality (not `>=`) pins the exact value and guards against a
+        // regression in either direction — over-scrolling wastes a row,
+        // under-scrolling clips the bottom border.
+        assert_eq!(
+            layout.scroll_deficit, 5,
+            "scroll_deficit should be exactly 5 for bordered+loading near bottom"
+        );
+    }
+
+    // --- ANSI injection sanitization tests ---
+
+    #[test]
+    fn sanitize_strips_esc_from_text() {
+        assert_eq!(sanitize_display_text("fix\x1bissue"), "fixissue");
+    }
+
+    #[test]
+    fn sanitize_strips_csi_sequence() {
+        // CSI erase display: ESC [ 2 J
+        assert_eq!(sanitize_display_text("bad\x1b[2Jfile"), "bad[2Jfile");
+    }
+
+    #[test]
+    fn sanitize_strips_osc_sequence() {
+        // OSC set title: ESC ] 0 ; pwned BEL
+        assert_eq!(
+            sanitize_display_text("pre\x1b]0;pwned\x07post"),
+            "pre]0;pwnedpost"
+        );
+    }
+
+    #[test]
+    fn sanitize_preserves_normal_text() {
+        let normal = "hello-world_123 (foo)";
+        assert_eq!(sanitize_display_text(normal), normal);
+    }
+
+    #[test]
+    fn sanitize_preserves_unicode() {
+        let unicode = "\u{65E5}\u{672C}\u{8A9E}";
+        assert_eq!(sanitize_display_text(unicode), unicode);
+    }
+
+    #[test]
+    fn format_item_sanitizes_esc_in_text() {
+        let s = make("evil\x1b[2Jname", None, SuggestionKind::Command);
+        let mut buf = Vec::new();
+        format_item(&mut buf, &s, 40, false, &PopupTheme::default());
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            !output.contains('\x1b'),
+            "ESC byte should be stripped from rendered text, got: {output:?}"
+        );
+    }
+
+    #[test]
+    fn format_item_sanitizes_esc_in_description() {
+        let s = make(
+            "clean",
+            Some("desc\x1b[2J\x1b]0;pwned\x07end"),
+            SuggestionKind::Command,
+        );
+        let mut buf = Vec::new();
+        // Wide enough to include description
+        format_item(&mut buf, &s, 60, false, &PopupTheme::default());
+        let output = String::from_utf8_lossy(&buf);
+        // The injected ESC-based sequences should not appear intact.
+        // ESC is stripped, so "\x1b[2J" becomes "[2J" (harmless text).
+        assert!(
+            !output.contains("\x1b[2J"),
+            "CSI erase sequence should not survive sanitization, got: {output:?}"
+        );
+        assert!(
+            !output.contains("\x1b]0;"),
+            "OSC title sequence should not survive sanitization, got: {output:?}"
+        );
+        // BEL (\x07) should also be stripped
+        assert!(
+            !output.contains('\x07'),
+            "BEL byte should be stripped from description, got: {output:?}"
+        );
+    }
+
+    #[test]
+    fn write_highlighted_text_honors_match_indices_when_source_has_control_chars() {
+        // Regression test for a drift bug between `sanitize_display_text` and
+        // `match_indices`: the latter is computed upstream against the *raw*
+        // suggestion text (see `suggest::fuzzy::rank`), while rendering
+        // iterates over the sanitized string. If sanitization strips bytes,
+        // every index past the stripped position becomes off-by-N.
+        //
+        // Source: "ab\x1bcd" — an embedded ESC byte that
+        // `sanitize_display_text()` will strip. Sanitized: "abcd".
+        // The query "cd" should highlight 'c' and 'd', which are at char
+        // indices 3 and 4 in the raw text but 2 and 3 in the sanitized text.
+        let mut s = make("ab\x1bcd", None, SuggestionKind::Command);
+        s.match_indices = vec![3, 4]; // raw-coordinate indices for 'c' and 'd'
+        let theme = PopupTheme::default();
+        let mut buf = Vec::new();
+        format_item(&mut buf, &s, 40, false, &theme);
+        let output = String::from_utf8_lossy(&buf);
+
+        // Sanitizer must have stripped the ESC.
+        assert!(
+            !output.contains("ab\x1bcd"),
+            "raw ESC should have been stripped from rendered text: {output:?}"
+        );
+        // The highlight must land on 'c' and 'd' contiguously: the sequence
+        // `\x1b[1mcd` (match_highlight_on directly followed by "cd") appears
+        // only when both chars are inside the highlighted span.
+        assert!(
+            output.contains("\x1b[1mcd"),
+            "highlight should cover 'cd' (both matched chars) after sanitization, got: {output:?}"
+        );
+        // Negative: the buggy code would emit `c\x1b[1md` (highlight starting
+        // at 'd' only, because index 3 pointed at 'c' in the raw text but at
+        // 'd' in the sanitized text). Make sure we do NOT see that pattern.
+        assert!(
+            !output.contains("c\x1b[1md"),
+            "highlight must not start at 'd' alone — that would mean indices drifted: {output:?}"
+        );
+    }
+
+    #[test]
+    fn test_narrow_terminal_emits_zero_bytes() {
+        // When screen_cols < min_width, render_popup must not emit ANY bytes
+        // to the buffer — no sync, no scrolling, no cursor save/restore.
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new();
+        let layout = render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            10, // narrow: less than DEFAULT_MIN_POPUP_WIDTH (40)
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        assert!(
+            buf.is_empty(),
+            "narrow terminal should produce zero output, got {} bytes: {:?}",
+            buf.len(),
+            String::from_utf8_lossy(&buf)
+        );
+        assert_eq!(layout.width, 0);
+        assert_eq!(layout.height, 0);
+    }
+
+    #[test]
+    fn kind_icon_returns_documented_glyph_for_ask_ai() {
+        assert_eq!(kind_icon(SuggestionKind::AskAi, true), '\u{F169F}');
+    }
+
+    #[test]
+    fn kind_icon_fallback_returns_ascii_without_nerd_fonts() {
+        assert_eq!(kind_icon(SuggestionKind::Command, false), '>');
+        assert_eq!(kind_icon(SuggestionKind::Subcommand, false), '.');
+        assert_eq!(kind_icon(SuggestionKind::Flag, false), '-');
+        assert_eq!(kind_icon(SuggestionKind::FilePath, false), 'f');
+        assert_eq!(kind_icon(SuggestionKind::Directory, false), 'd');
+        assert_eq!(kind_icon(SuggestionKind::History, false), 'h');
+        assert_eq!(kind_icon(SuggestionKind::EnvVar, false), '$');
+        assert_eq!(kind_icon(SuggestionKind::ProviderValue, false), 'w');
+        assert_eq!(kind_icon(SuggestionKind::Llm, false), '*');
+        assert_eq!(kind_icon(SuggestionKind::AskAi, false), '?');
+    }
+
+    #[test]
+    fn border_radius_false_uses_square_corners() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new();
+        let theme = PopupTheme {
+            borders: true,
+            border_radius: false,
+            ..PopupTheme::default()
+        };
+        let _layout = render_popup_unframed(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            10,
+            24,
+            80,
+            10,
+            20,
+            60,
+            &theme,
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(output.contains('┌'), "square corners need ┌: {output}");
+        assert!(output.contains('┐'), "square corners need ┐: {output}");
+        assert!(output.contains('└'), "square corners need └: {output}");
+        assert!(output.contains('┘'), "square corners need ┘: {output}");
+        assert!(
+            !output.contains('╭'),
+            "square corners must not use ╭: {output}"
+        );
+        assert!(
+            !output.contains('╮'),
+            "square corners must not use ╮: {output}"
+        );
+        assert!(
+            !output.contains('╰'),
+            "square corners must not use ╰: {output}"
+        );
+        assert!(
+            !output.contains('╯'),
+            "square corners must not use ╯: {output}"
+        );
+    }
+
+    #[test]
+    fn border_radius_true_uses_rounded_corners() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new();
+        let theme = PopupTheme {
+            borders: true,
+            border_radius: true,
+            ..PopupTheme::default()
+        };
+        let _layout = render_popup_unframed(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            10,
+            24,
+            80,
+            10,
+            20,
+            60,
+            &theme,
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(output.contains('╭'), "rounded corners need ╭: {output}");
+        assert!(output.contains('╮'), "rounded corners need ╮: {output}");
+        assert!(output.contains('╰'), "rounded corners need ╰: {output}");
+        assert!(output.contains('╯'), "rounded corners need ╯: {output}");
+    }
+
+    #[test]
+    fn test_indicator_row_emits_background() {
+        let bg = b"\x1b[48;2;10;20;30m".to_vec();
+        let theme = PopupTheme {
+            borders: true,
+            background_on: bg.clone(),
+            ..PopupTheme::default()
+        };
+        let layout = PopupLayout {
+            start_row: 5,
+            start_col: 3,
+            width: 40,
+            height: 4,
+            scroll_deficit: 0,
+        };
+        let mut buf = Vec::new();
+        render_indicator_row(
+            &mut buf,
+            &layout,
+            &theme,
+            FeedbackKind::Loading { frame: 0 },
+            &PopupHints::default(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        let bg_str = String::from_utf8_lossy(&bg);
+        let count = output.matches(bg_str.as_ref()).count();
+        assert!(
+            count >= 4,
+            "bordered indicator row must emit bg at least 4 times, got {count}: {output:?}"
+        );
+    }
+
+    #[test]
+    fn test_indicator_row_borderless_emits_background() {
+        let bg = b"\x1b[48;2;10;20;30m".to_vec();
+        let theme = PopupTheme {
+            borders: false,
+            background_on: bg.clone(),
+            ..PopupTheme::default()
+        };
+        let layout = PopupLayout {
+            start_row: 5,
+            start_col: 3,
+            width: 40,
+            height: 3,
+            scroll_deficit: 0,
+        };
+        let mut buf = Vec::new();
+        render_indicator_row(
+            &mut buf,
+            &layout,
+            &theme,
+            FeedbackKind::Loading { frame: 0 },
+            &PopupHints::default(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        let bg_str = String::from_utf8_lossy(&bg);
+        let count = output.matches(bg_str.as_ref()).count();
+        assert!(
+            count >= 2,
+            "borderless indicator row must emit bg at least 2 times, got {count}: {output:?}"
+        );
+    }
+
+    #[test]
+    fn test_scrollbar_row_background_covers_gap() {
+        let bg = b"\x1b[48;2;10;20;30m".to_vec();
+        let theme = PopupTheme {
+            borders: true,
+            background_on: bg.clone(),
+            ..PopupTheme::default()
+        };
+        let suggestions: Vec<Suggestion> = (0..20)
+            .map(|i| make(&format!("item_{i:02}"), None, SuggestionKind::Subcommand))
+            .collect();
+        let state = OverlayState::new();
+        let mut buf = Vec::new();
+        render_popup_unframed(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            10,
+            20,
+            60,
+            &theme,
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        let bg_str = String::from_utf8_lossy(&bg);
+        // The gap-fill space before each scrollbar char must carry the bg sequence.
+        // With 10 visible rows and a scrollbar, expect at least 10 gap-fill emissions.
+        let count = output.matches(bg_str.as_ref()).count();
+        assert!(
+            count >= 10,
+            "scrollbar rows must emit bg for gap fill, expected >=10, got {count}"
+        );
+        // Verify scrollbar chars are present (sanity: scrollbar was actually drawn)
+        assert!(
+            output.contains('█') || output.contains('┆'),
+            "scrollbar chars must be present in output"
+        );
+    }
+
+    #[test]
+    fn test_no_scrollbar_gap_fill_covers_border_column() {
+        // When the popup has no scrollbar, the column between the item text
+        // and the right border must still be painted with the popup background.
+        // Otherwise a Nerd Font PUA icon rendering wider than unicode-width
+        // reports leaves an unpainted cell that shows the terminal's default
+        // (often dark) background as a stripe in the border column.
+        let bg = b"\x1b[48;2;10;20;30m".to_vec();
+        let theme = PopupTheme {
+            borders: true,
+            background_on: bg.clone(),
+            ..PopupTheme::default()
+        };
+        // 3 items < max_visible 10 → no scrollbar.
+        let suggestions: Vec<Suggestion> = (0..3)
+            .map(|i| make(&format!("item_{i:02}"), None, SuggestionKind::Subcommand))
+            .collect();
+        let state = OverlayState::new();
+        let mut buf = Vec::new();
+        render_popup_unframed(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            10,
+            20,
+            60,
+            &theme,
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        let bg_str = String::from_utf8_lossy(&bg);
+        // Sanity: no scrollbar was drawn.
+        assert!(
+            !output.contains('█') && !output.contains('┆'),
+            "no scrollbar chars expected for a short list"
+        );
+        // Each of the 3 content rows must emit a bg-painted gap-fill space
+        // immediately before the right border.
+        let gap_fill = format!("{bg_str} ");
+        let count = output.matches(&gap_fill).count();
+        assert!(
+            count >= 3,
+            "each content row must bg-fill the border-column gap, expected >=3, got {count}"
+        );
+    }
+
+    #[test]
+    fn bordered_index_hint_preserves_top_left_corner() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new();
+        let hints = PopupHints {
+            index: Some((1, 50)),
+            key_label: None,
+        };
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &hints,
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(output.contains("1/50"), "index hint must appear: {output}");
+        assert!(
+            output.contains('╭'),
+            "rounded corner must be preserved alongside the index hint: {output}"
+        );
+    }
+
+    #[test]
+    fn bordered_index_hint_preserves_square_corner() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new();
+        let hints = PopupHints {
+            index: Some((1, 50)),
+            key_label: None,
+        };
+        let theme = PopupTheme {
+            borders: true,
+            border_radius: false,
+            ..PopupTheme::default()
+        };
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &theme,
+            0,
+            FeedbackKind::None,
+            &hints,
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(output.contains("1/50"), "index hint must appear: {output}");
+        assert!(
+            output.contains('┌'),
+            "square corner must be preserved: {output}"
+        );
+    }
+
+    #[test]
+    fn bordered_key_hint_replaces_bottom_right() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new();
+        let hints = PopupHints {
+            index: None,
+            key_label: Some("<Tab> Accept".to_string()),
+        };
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &bordered_theme(),
+            0,
+            FeedbackKind::None,
+            &hints,
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.contains("<Tab> Accept"),
+            "key hint must appear: {output}"
+        );
+        assert!(
+            output.contains('╰'),
+            "bottom-left corner must remain: {output}"
+        );
+    }
+
+    #[test]
+    fn borderless_index_hint_adds_header_row() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new();
+        let hints = PopupHints {
+            index: Some((1, 50)),
+            key_label: None,
+        };
+        let layout = render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &PopupTheme::default(),
+            0,
+            FeedbackKind::None,
+            &hints,
+            &ghostty_profile(),
+        );
+        let visible = suggestions.len().min(DEFAULT_MAX_VISIBLE) as u16;
+        assert_eq!(
+            layout.height,
+            visible + 1,
+            "borderless index hint adds exactly one header row"
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(output.contains("1/50"), "index hint must render: {output}");
+    }
+
+    #[test]
+    fn borderless_key_hint_adds_footer_row() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new();
+        let hints = PopupHints {
+            index: None,
+            key_label: Some("HINTLABEL".to_string()),
+        };
+        let layout = render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &PopupTheme::default(),
+            0,
+            FeedbackKind::None,
+            &hints,
+            &ghostty_profile(),
+        );
+        let visible = suggestions.len().min(DEFAULT_MAX_VISIBLE) as u16;
+        assert_eq!(
+            layout.height,
+            visible + 1,
+            "borderless key hint adds exactly one footer row"
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.contains("HINTLABEL"),
+            "key hint must render: {output}"
+        );
+    }
+
+    #[test]
+    fn hints_disabled_no_extra_rows() {
+        let mut buf = Vec::new();
+        let suggestions = make_suggestions();
+        let state = OverlayState::new();
+        let layout = render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &PopupTheme::default(),
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let visible = suggestions.len().min(DEFAULT_MAX_VISIBLE) as u16;
+        assert_eq!(
+            layout.height, visible,
+            "no hints and no borders: height equals content rows only"
+        );
+    }
+
+    #[test]
+    fn test_gutter_emits_kind_icon_style() {
+        let mut buf = Vec::new();
+        let theme = PopupTheme {
+            kind_icon_on: b"\x1b[38;2;80;250;123m".to_vec(),
+            ..bordered_theme()
+        };
+        let s = make("checkout", None, SuggestionKind::Subcommand);
+        format_item(&mut buf, &s, 30, false, &theme);
+        let output = String::from_utf8_lossy(&buf);
+        let icon = kind_icon(SuggestionKind::Subcommand, true);
+        let styled_icon = format!("\x1b[38;2;80;250;123m {icon}");
+        assert!(
+            output.contains(&styled_icon),
+            "gutter icon should be preceded by the kind_icon style escape"
+        );
+        assert!(
+            output.contains("\x1b[0m"),
+            "gutter should reset after the styled icon"
+        );
+    }
+
+    #[test]
+    fn test_scrollbar_thumb_uses_scrollbar_style() {
+        let mut buf = Vec::new();
+        let suggestions: Vec<Suggestion> = (0..20)
+            .map(|i| make(&format!("item{i}"), None, SuggestionKind::Command))
+            .collect();
+        let state = OverlayState::new();
+        let theme = PopupTheme {
+            scrollbar_on: b"\x1b[38;2;255;0;0m".to_vec(),
+            ..bordered_theme()
+        };
+        render_popup(
+            &mut buf,
+            &suggestions,
+            &state,
+            5,
+            0,
+            24,
+            80,
+            DEFAULT_MAX_VISIBLE,
+            DEFAULT_MIN_POPUP_WIDTH,
+            DEFAULT_MAX_POPUP_WIDTH,
+            &theme,
+            0,
+            FeedbackKind::None,
+            &PopupHints::default(),
+            &ghostty_profile(),
+        );
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.contains("\x1b[38;2;255;0;0m\u{2588}"),
+            "scrollbar thumb should carry the scrollbar style"
+        );
+    }
+}

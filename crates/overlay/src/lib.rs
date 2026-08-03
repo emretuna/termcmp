@@ -1,0 +1,29 @@
+//! ANSI-based popup rendering for terminal autocomplete.
+//!
+//! Renders suggestion popups using cursor save/restore, synchronized output
+//! (DECSET 2026), and viewport scrolling to ensure popups always render below
+//! the cursor without destroying scrollback content.
+
+pub mod ansi;
+pub mod detail;
+pub mod frame;
+pub(crate) mod layout;
+mod render;
+pub mod sync_frame;
+pub mod types;
+pub(crate) mod util;
+
+pub use detail::{
+    clear_detail_box, compute_detail_layout, description_overflows_main_popup, render_detail_box,
+    wrap_description, DetailLayout, DetailPosition,
+};
+pub use frame::{ContentRow, PopupFrame, PopupRow, ScrollbarCell, SpanStyle, StyledSpan};
+pub use render::{
+    clear_popup, clear_popup_unframed, parse_style, popup_additional_scroll_deficit,
+    render_indicator_row, render_popup, render_popup_unframed, FeedbackKind, PopupTheme,
+};
+pub use sync_frame::with_overlay_update_frame;
+pub use types::{
+    OverlayState, PopupHints, PopupLayout, DEFAULT_MAX_POPUP_WIDTH, DEFAULT_MAX_VISIBLE,
+    DEFAULT_MIN_POPUP_WIDTH,
+};
