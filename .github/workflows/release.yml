@@ -66,6 +66,9 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Install zsh
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
       - run: cargo test --workspace
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo fmt --check

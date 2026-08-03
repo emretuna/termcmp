@@ -37,6 +37,9 @@ allow = [
     # CC0-1.0 is a public-domain dedication (FSF-free).
     # Required by `notify` (pulled in via pty).
     "CC0-1.0",
+    # Permissive data license for the Mozilla CA certificate bundle shipped
+    # by `webpki-roots` (pulled in via reqwest -> hyper-rustls).
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.93
 # Additional private exceptions can be added here per-crate if needed.
