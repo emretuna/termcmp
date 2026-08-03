@@ -90,9 +90,17 @@ pub struct TerminalState {
     pending_wrap: bool,
     display_dirty: bool,
     viewport_scroll_count: u16,
+    /// One-shot: set when `in_prompt` toggled this batch. Drained by the
+    /// proxy's stdout task to dismiss popups on command start/end.
+    in_prompt_changed: bool,
     cwd: Option<PathBuf>,
     shell_env: Option<HashMap<String, String>>,
     in_prompt: bool,
+    /// Sticky: set once the first prompt boundary marker (OSC 133;A /
+    /// 7771;A) has been seen. Until then `in_prompt` is unknown rather
+    /// than false, so popup gating must not suppress for shells without
+    /// integration.
+    prompt_tracking_active: bool,
     /// One-shot: set on OSC 133;A / 7771;A (prompt boundary), consumed by the
     /// proxy's stdout task to reset the keystroke buffer model for non-zsh
     /// shells. Prevents the model from retaining stale state (e.g. after
@@ -162,6 +170,8 @@ impl TerminalState {
             cwd: None,
             shell_env: None,
             in_prompt: false,
+            prompt_tracking_active: false,
+            in_prompt_changed: false,
             prompt_seen: false,
             command_buffer: None,
             buffer_cursor: 0,
@@ -223,6 +233,16 @@ impl TerminalState {
 
     pub fn shell_env(&self) -> Option<&HashMap<String, String>> {
         self.shell_env.as_ref()
+    }
+
+    /// Whether popup rendering must be suppressed right now: a TUI owns the
+    /// alternate screen, or shell integration is tracking prompt boundaries
+    /// and the shell is currently running a foreground command (inline TUIs
+    /// like omp that never enter the alt screen). Returns false when no
+    /// prompt boundary has ever been observed, so shells without
+    /// integration keep popups.
+    pub fn popup_suppressed(&self) -> bool {
+        self.in_alt_screen || (self.prompt_tracking_active && !self.in_prompt)
     }
 
     pub fn in_prompt(&self) -> bool {
@@ -591,7 +611,13 @@ impl TerminalState {
     }
 
     pub(crate) fn set_in_prompt(&mut self, in_prompt: bool) {
-        self.in_prompt = in_prompt;
+        if in_prompt {
+            self.prompt_tracking_active = true;
+        }
+        if self.in_prompt != in_prompt {
+            self.in_prompt = in_prompt;
+            self.in_prompt_changed = true;
+        }
     }
 
     pub(crate) fn set_cwd(&mut self, path: PathBuf) {
@@ -657,6 +683,16 @@ impl TerminalState {
     pub fn take_alt_screen_changed(&mut self) -> bool {
         let v = self.alt_screen_changed;
         self.alt_screen_changed = false;
+        v
+    }
+
+    /// One-shot: reports whether `in_prompt` toggled since the last drain,
+    /// then clears the flag. The proxy's stdout task uses this to dismiss a
+    /// popup when a foreground command starts or the prompt returns —
+    /// inline TUIs that never enter the alt screen.
+    pub fn take_in_prompt_changed(&mut self) -> bool {
+        let v = self.in_prompt_changed;
+        self.in_prompt_changed = false;
         v
     }
 

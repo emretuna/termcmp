@@ -1134,6 +1134,31 @@ mod tests {
     }
 
     #[test]
+    fn test_popup_suppressed_lifecycle_across_prompt_boundaries() {
+        let mut p = make_parser();
+        // No prompt boundary ever seen — suppression must stay off so
+        // shells without integration keep popups.
+        assert!(!p.state().popup_suppressed());
+        assert!(!p.state_mut().take_in_prompt_changed());
+
+        p.process_bytes(b"\x1b]133;A\x07"); // prompt drawn
+        assert!(!p.state().popup_suppressed());
+        assert!(p.state_mut().take_in_prompt_changed());
+        assert!(
+            !p.state_mut().take_in_prompt_changed(),
+            "one-shot must clear after drain"
+        );
+
+        p.process_bytes(b"\x1b]133;C\x07"); // command executing (inline TUI)
+        assert!(p.state().popup_suppressed());
+        assert!(p.state_mut().take_in_prompt_changed());
+
+        p.process_bytes(b"\x1b]7771;A\x07"); // prompt redrawn
+        assert!(!p.state().popup_suppressed());
+        assert!(p.state_mut().take_in_prompt_changed());
+    }
+
+    #[test]
     fn test_osc7771_clears_buffer_on_c() {
         let mut p = make_parser();
         p.process_bytes(b"\x1b]7770;3;git\x07");

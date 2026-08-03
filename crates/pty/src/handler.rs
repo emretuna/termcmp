@@ -1808,16 +1808,20 @@ impl InputHandler {
     }
 
     pub fn trigger(&mut self, parser: &Arc<Mutex<TerminalParser>>, stdout: &mut dyn Write) {
-        // Suppress popups while a TUI app owns the alternate screen (nvim,
-        // less, htop, tmux). The proxy drains `alt_screen_changed` to dismiss
-        // any already-visible popup on transition; this gate stops new ones.
+        // Suppress popups unless the shell is at a prompt on the main
+        // screen. Covers both classes: alt-screen TUIs (nvim, less, htop,
+        // tmux) set `in_alt_screen`, and inline full-screen apps that
+        // never emit DECSET 1049 (omp, opencode-like tools) run as a
+        // foreground command with `in_prompt == false`. The proxy drains
+        // the transition one-shots to dismiss a visible popup; this gate
+        // stops new ones.
         {
-            let in_alt = match parser.lock() {
-                Ok(p) => p.state().in_alt_screen(),
+            let suppressed = match parser.lock() {
+                Ok(p) => p.state().popup_suppressed(),
                 Err(_) => false,
             };
-            if in_alt {
-                tracing::debug!("suppressing popup: alt screen active");
+            if suppressed {
+                tracing::debug!("suppressing popup: not at prompt");
                 return;
             }
         }
@@ -2012,14 +2016,14 @@ impl InputHandler {
         parser: &Arc<Mutex<TerminalParser>>,
         stdout: &mut Vec<u8>,
     ) -> TriggerPrepared {
-        // Same alt-screen gate as trigger(): suppress popups while a TUI owns
-        // the alternate screen. The debounce loop calls this instead of trigger().
+        // Same suppression gate as trigger(): no popups outside the prompt.
+        // The debounce loop calls this instead of trigger().
         {
-            let in_alt = match parser.lock() {
-                Ok(p) => p.state().in_alt_screen(),
+            let suppressed = match parser.lock() {
+                Ok(p) => p.state().popup_suppressed(),
                 Err(_) => false,
             };
-            if in_alt {
+            if suppressed {
                 return TriggerPrepared::Painted;
             }
         }
@@ -2221,6 +2225,22 @@ impl InputHandler {
         fingerprint: TriggerFingerprint,
         _current_word: &str,
     ) {
+        // Suppression gate (mirrors trigger()): the gate in
+        // prepare_trigger_with_block ran before the debounce loop awaited
+        // the generator outside the lock, so a TUI or foreground command
+        // can have taken over since. Drop the results rather than merge +
+        // repaint over it; the transition drain already dismissed any
+        // visible popup.
+        {
+            let suppressed = match parser.lock() {
+                Ok(p) => p.state().popup_suppressed(),
+                Err(_) => false,
+            };
+            if suppressed {
+                tracing::debug!("suppressing block result: not at prompt");
+                return;
+            }
+        }
         let was_timeout = rx_on_timeout.is_some();
         if let Some(rx) = rx_on_timeout {
             self.dynamic_rx = Some(rx);
@@ -2538,6 +2558,26 @@ impl InputHandler {
             }
         }
 
+        // Suppress merges outside the prompt. The trigger-time gate
+        // (trigger()/prepare_trigger_with_block) can pass before a TUI
+        // enters or a command starts; results may land after the
+        // transition, and merging would repaint — or reopen
+        // (`visible = true`) — the popup over the TUI's output. Drop the
+        // receiver so no further results queue up; teardown_popup/dismiss
+        // has already aborted the generator task on the transition.
+        {
+            let suppressed = match parser.lock() {
+                Ok(p) => p.state().popup_suppressed(),
+                Err(_) => false,
+            };
+            if suppressed {
+                self.dynamic_rx = None;
+                self.dynamic_ctx = None;
+                self.dynamic_task = None;
+                return false;
+            }
+        }
+
         if messages.is_empty() {
             if disconnected {
                 self.dynamic_rx = None;
@@ -2695,6 +2735,20 @@ impl InputHandler {
         // skip this render rather than propagating the panic. The popup
         // will simply not update on this tick; the next render attempt is
         // driven by further PTY input.
+        // Suppress paints outside the prompt. This is the funnel for
+        // repaints that fire without their own gate (detail redraw, flash
+        // expiry, feedback indicator); the merge paths carry the same
+        // gate for their non-render state mutations.
+        {
+            let suppressed = match parser.lock() {
+                Ok(p) => p.state().popup_suppressed(),
+                Err(_) => false,
+            };
+            if suppressed {
+                tracing::debug!("suppressing render: not at prompt");
+                return;
+            }
+        }
         let (cursor_row, cursor_col, screen_rows, screen_cols) = match parser.lock() {
             Ok(p) => {
                 let state = p.state();
@@ -3023,8 +3077,15 @@ impl InputHandler {
         parser: &Arc<Mutex<TerminalParser>>,
         buf: &mut Vec<u8>,
     ) {
+        // Suppress repaints outside the prompt (detail-redraw and
+        // flash-expiry loops fire on timers, independent of the trigger
+        // gate). Checked under the same lock as the geometry read so the
+        // decision and the coordinates come from one snapshot.
         let (cursor_row, cursor_col, screen_rows, screen_cols) = match parser.lock() {
             Ok(p) => {
+                if p.state().popup_suppressed() {
+                    return;
+                }
                 let state = p.state();
                 let (cr, cc) = state.cursor_position();
                 let (sr, sc) = state.screen_dimensions();
@@ -4586,6 +4647,215 @@ mod tests {
         assert!(
             !handler.visible,
             "trigger() must act once the alt screen is gone"
+        );
+    }
+
+    #[test]
+    fn test_try_merge_dynamic_suppressed_while_alt_screen_active() {
+        // Regression: the trigger-time gate passes before the TUI enters the
+        // alt screen, then async generator results land while the TUI owns
+        // it. try_merge_dynamic must drop them instead of merging +
+        // repainting over the TUI.
+        let mut handler = make_visible_handler(vec![Suggestion {
+            text: "prior".to_string(),
+            ..Default::default()
+        }]);
+        let base_ctx = buffer::parse_command_context("", 0);
+        handler.dynamic_ctx = Some(DynamicCtxSnapshot::capture(&base_ctx));
+
+        let (tx, rx) = mpsc::channel::<DynamicResult>(1);
+        tx.try_send(DynamicResult::Loaded {
+            provider: ProviderTag::Async("git branches".into()),
+            suggestions: vec![Suggestion {
+                text: "main".to_string(),
+                kind: SuggestionKind::Subcommand,
+                source: SuggestionSource::Provider,
+                ..Default::default()
+            }],
+        })
+        .unwrap();
+        drop(tx);
+        handler.dynamic_rx = Some(rx);
+
+        let parser = Arc::new(Mutex::new(parser::TerminalParser::new(24, 80)));
+        parser.lock().unwrap().process_bytes(b"\x1b[?1049h");
+
+        let mut buf = Vec::new();
+        let merged = handler.try_merge_dynamic(&parser, &mut buf);
+
+        assert!(!merged, "no merge while a TUI owns the alt screen");
+        assert!(buf.is_empty(), "no render bytes over the TUI");
+        assert!(
+            handler.dynamic_rx.is_none(),
+            "receiver must be dropped so no further results queue up"
+        );
+        assert_eq!(
+            handler.suggestions.len(),
+            1,
+            "popup state must stay untouched"
+        );
+    }
+
+    #[test]
+    fn test_apply_block_result_suppressed_while_alt_screen_active() {
+        // Regression: prepare_trigger_with_block's gate ran before the
+        // debounce loop awaited the generator outside the lock; the TUI
+        // entered in between. apply_block_result must drop the results
+        // instead of merging and repainting.
+        let mut handler = make_handler();
+        let base_ctx = buffer::parse_command_context("", 0);
+        handler.dynamic_ctx = Some(DynamicCtxSnapshot::capture(&base_ctx));
+
+        let parser = Arc::new(Mutex::new(parser::TerminalParser::new(24, 80)));
+        parser.lock().unwrap().process_bytes(b"\x1b[?1049h");
+
+        let mut buf = Vec::new();
+        handler.apply_block_result(
+            &parser,
+            &mut buf,
+            Some(DynamicResult::Loaded {
+                provider: ProviderTag::Async("git branches".into()),
+                suggestions: vec![Suggestion {
+                    text: "main".to_string(),
+                    kind: SuggestionKind::Subcommand,
+                    source: SuggestionSource::Provider,
+                    ..Default::default()
+                }],
+            }),
+            None,
+            None,
+            vec![Suggestion {
+                text: "sync".to_string(),
+                ..Default::default()
+            }],
+            0,
+            0,
+            24,
+            80,
+            buffer_fingerprint("", 0, None),
+            "",
+        );
+
+        assert!(
+            !handler.visible,
+            "block result must not reopen the popup over a TUI"
+        );
+        assert!(buf.is_empty(), "no render bytes over the TUI");
+    }
+
+    #[test]
+    fn test_repaint_suppressed_while_alt_screen_active() {
+        // Regression: timer-driven repaints (flash expiry, detail redraw)
+        // fire independently of the trigger gate and must stay dark while a
+        // TUI owns the alt screen.
+        let mut handler = make_visible_handler(vec![Suggestion {
+            text: "prior".to_string(),
+            ..Default::default()
+        }]);
+        let parser = Arc::new(Mutex::new(parser::TerminalParser::new(24, 80)));
+
+        // Control: on the main screen the repaint produces bytes.
+        let mut before = Vec::new();
+        handler.render_for_flash_expiry(&parser, &mut before);
+        assert!(!before.is_empty(), "setup: repaint works off alt screen");
+
+        parser.lock().unwrap().process_bytes(b"\x1b[?1049h");
+        let mut after = Vec::new();
+        handler.render_for_flash_expiry(&parser, &mut after);
+        assert!(after.is_empty(), "timer repaint must not paint over a TUI");
+    }
+
+    #[test]
+    fn test_trigger_suppressed_while_command_running_inline_tui() {
+        // Regression: inline TUIs (omp) never enter the alt screen. While
+        // the foreground command runs (between OSC 133/7771 `C` and the
+        // next `A`), keystroke echo still feeds the command buffer model;
+        // trigger() must refuse to open a popup over the TUI.
+        let mut handler = make_handler();
+        handler.engine = Arc::new(
+            SuggestionEngine::new(ShellFamily::Other)
+                .unwrap()
+                .with_suggest_config(50, false, 0, false),
+        );
+        let parser = Arc::new(Mutex::new(parser::TerminalParser::new(24, 80)));
+        {
+            let mut p = parser.lock().unwrap();
+            p.process_bytes(b"\x1b]7771;A\x07"); // prompt seen — tracking active
+            p.process_bytes(b"\x1b]7771;C\x07"); // user launched an inline TUI
+            p.process_bytes(b"\x1b]7773;AWS_REGION%3Dus-east-1\x07");
+            p.state_mut()
+                .predict_command_buffer("echo $AWS".to_string(), 9);
+        }
+
+        let mut buf = Vec::new();
+        handler.trigger(&parser, &mut buf);
+        handler.commit_overlay_write(handler.overlay_write_ticket());
+        assert!(
+            handler.suggestions.is_empty(),
+            "no suggestions while a command runs"
+        );
+        assert!(!handler.visible, "popup must not open over an inline TUI");
+    }
+
+    #[test]
+    fn test_trigger_active_again_at_next_prompt_after_inline_tui() {
+        // Companion to test_trigger_suppressed_while_command_running_inline_tui:
+        // once the command exits and the shell redraws its prompt (7771;A),
+        // suppression lifts and the same input produces suggestions.
+        let mut handler = make_handler();
+        handler.engine = Arc::new(
+            SuggestionEngine::new(ShellFamily::Other)
+                .unwrap()
+                .with_suggest_config(50, false, 0, false),
+        );
+        let parser = Arc::new(Mutex::new(parser::TerminalParser::new(24, 80)));
+        {
+            let mut p = parser.lock().unwrap();
+            p.process_bytes(b"\x1b]7771;A\x07");
+            p.process_bytes(b"\x1b]7771;C\x07"); // inline TUI runs
+            p.process_bytes(b"\x1b]7771;A\x07"); // it exits, prompt returns
+            p.process_bytes(b"\x1b]7773;AWS_REGION%3Dus-east-1\x07");
+            p.state_mut()
+                .predict_command_buffer("echo $AWS".to_string(), 9);
+        }
+
+        let mut buf = Vec::new();
+        handler.trigger(&parser, &mut buf);
+        handler.commit_overlay_write(handler.overlay_write_ticket());
+        assert!(
+            handler.suggestions.iter().any(|s| s.text == "$AWS_REGION"),
+            "trigger must fire normally once back at the prompt, got {:?}",
+            handler
+                .suggestions
+                .iter()
+                .map(|s| &s.text)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_repaint_suppressed_while_command_running() {
+        // Regression: timer-driven repaints (flash expiry, detail redraw)
+        // fire independently of the trigger gate and must stay dark while
+        // a foreground command runs, even without an alt screen.
+        let mut handler = make_visible_handler(vec![Suggestion {
+            text: "prior".to_string(),
+            ..Default::default()
+        }]);
+        let parser = Arc::new(Mutex::new(parser::TerminalParser::new(24, 80)));
+        parser.lock().unwrap().process_bytes(b"\x1b]7771;A\x07");
+
+        // Control: while at the prompt the repaint produces bytes.
+        let mut before = Vec::new();
+        handler.render_for_flash_expiry(&parser, &mut before);
+        assert!(!before.is_empty(), "setup: repaint works at the prompt");
+
+        parser.lock().unwrap().process_bytes(b"\x1b]7771;C\x07");
+        let mut after = Vec::new();
+        handler.render_for_flash_expiry(&parser, &mut after);
+        assert!(
+            after.is_empty(),
+            "timer repaint must not paint while a command runs"
         );
     }
 

@@ -787,19 +787,25 @@ pub async fn run_proxy(shell: &OsStr, args: &[OsString], config: &TermcmpConfig)
                 }
             }
 
-            // Drain alt_screen_changed: if a TUI app just entered or exited
-            // the alternate screen, dismiss any visible popup. Subsequent
-            // trigger() calls are gated by state.in_alt_screen() inside
-            // trigger()/prepare_trigger_with_block() (see handler.rs).
+            // Popup-suppression transitions: dismiss any visible popup when
+            // the screen context changes — a TUI entering/leaving the
+            // alternate screen, or a prompt boundary (command start/end for
+            // inline TUIs that never emit DECSET 1049). Subsequent trigger()
+            // calls are gated by the alt-screen and in_prompt checks inside
+            // trigger()/prepare_trigger_with_block() (see handler.rs). Drain
+            // both one-shots unconditionally: short-circuiting would leave a
+            // stale flag that dismisses a later legitimate popup.
             {
-                let alt_changed = match parser_for_stdout.lock() {
-                    Ok(mut p) => p.state_mut().take_alt_screen_changed(),
-                    Err(e) => {
-                        tracing::warn!("parser mutex poisoned in stdout task (alt_screen): {e}");
-                        break;
+                let suppress_transition = match parser_for_stdout.lock() {
+                    Ok(mut p) => {
+                        let st = p.state_mut();
+                        let alt = st.take_alt_screen_changed();
+                        let prompt = st.take_in_prompt_changed();
+                        alt || prompt
                     }
+                    Err(_) => false,
                 };
-                if alt_changed {
+                if suppress_transition {
                     let mut cleanup = Vec::new();
                     let cleanup_ticket = {
                         let mut h = match handler_for_stdout.lock() {
