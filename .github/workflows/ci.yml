@@ -1,0 +1,183 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+  zsh-zle-smoke:
+    name: zsh/ZLE shell smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    needs: [check]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install zsh
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+      - name: Run zsh/ZLE smoke
+        run: ./scripts/check-zsh-zle-smoke.sh
+
+  fish-smoke:
+    name: fish shell smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    needs: [check]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install fish
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq fish
+          else
+            brew untap aws/tap 2>/dev/null || true
+            brew install fish
+          fi
+      - name: Run fish smoke
+        run: ./scripts/check-fish-smoke.sh
+
+  clippy:
+    name: Clippy
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+
+  # Dependency hygiene gate: licenses, bans (duplicate versions), advisories,
+  # and sources. Runs on every PR so duplicate-dep or license regressions
+  # can't merge silently (previously only ran on the scheduled audit workflow).
+  deny:
+    name: cargo-deny
+    # Docker container action — Linux only. cargo-deny analyzes Cargo.lock
+    # (platform-agnostic), so ubuntu-latest is the right home.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          # Resolve all optional features so duplicate-dep alerts hidden behind
+          # opt-in features still surface. The warn-vs-deny ladder for
+          # multiple-versions is governed by deny.toml, not by this flag.
+          arguments: --all-features
+
+  fmt:
+    name: Format
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  msrv:
+    name: MSRV (1.86)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.86"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+
+
+  binary-size-gate:
+    name: Binary size gate
+    needs: [check]
+    runs-on: macos-latest
+    env:
+      # Default per-phase delta budget. PRs carrying the
+      # `binary-size-allow-delta` label may override up to LABEL_OVERRIDE_BUDGET
+      # (see "Pick delta budget" step below).
+      PHASE_BUDGET: 2MB
+      LABEL_OVERRIDE_BUDGET: 5MB
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release
+      # Record the release binary size as a workflow artifact. `size.txt`
+      # contains a single integer (bytes) followed by a newline, matching
+      # the format of `benchmarks/binary-size-baseline.txt`. `wc -c` is
+      # used (not `du -b`) because BSD `du` on macOS-latest runners has
+      # no `-b` flag; `wc -c` is portable and reports raw bytes.
+      - name: Record release binary size
+        run: |
+          bytes="$(wc -c < target/release/termcmp | tr -d ' ')"
+          printf '%s\n' "$bytes" > size.txt
+          printf 'Recorded binary size: %s bytes (%.2f MB)\n' \
+            "$bytes" "$(awk -v b="$bytes" 'BEGIN { printf "%.2f", b / (1024*1024) }')"
+      - name: Upload binary size artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: termcmp-size
+          path: size.txt
+      # Absolute ceiling for the release binary; see scripts/check-binary-size.sh.
+      - name: Absolute ceiling (11MB)
+        run: scripts/check-binary-size.sh --absolute-max 11MB
+      # On PR builds, raise the delta budget from PHASE_BUDGET (2MB) to
+      # LABEL_OVERRIDE_BUDGET (5MB) when the PR carries the
+      # `binary-size-allow-delta` label. The label is the explicit
+      # acknowledgement that a PR is expected to grow the binary; without
+      # it the strict 2MB delta still applies. Pushes to master always
+      # use the strict budget — there is no PR context to read labels from.
+      - name: Pick delta budget
+        id: budget
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          LABEL_NAMES: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          budget="$PHASE_BUDGET"
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            if printf '%s' "$LABEL_NAMES" | grep -q '"binary-size-allow-delta"'; then
+              budget="$LABEL_OVERRIDE_BUDGET"
+              printf 'Label `binary-size-allow-delta` found; raising delta budget to %s.\n' "$budget"
+            fi
+          fi
+          printf 'Selected delta budget: %s\n' "$budget"
+          printf 'budget=%s\n' "$budget" >> "$GITHUB_OUTPUT"
+      - name: Per-phase delta budget
+        run: scripts/check-binary-size.sh --delta-max "${{ steps.budget.outputs.budget }}"
+

@@ -1,0 +1,25 @@
+[package]
+name = "parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[features]
+test-utils = []
+
+[dependencies]
+vte = "0.15"
+unicode-width = "0.2.2"
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+proptest = "1"
+
+[[bench]]
+name = "parser_bench"
+harness = false

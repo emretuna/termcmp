@@ -1,0 +1,29 @@
+[package]
+name = "suggest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+buffer = { path = "../buffer" }
+config = { path = "../config" }
+frizbee = "0.11"
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { version = "1", features = ["preserve_order"] }
+tracing = { workspace = true }
+dirs = "6"
+regex = "1"
+shlex = "2"
+tempfile = "3"
+
+[dev-dependencies]
+tempfile = "3"
+filetime = "0.2"
+tokio = { workspace = true, features = ["test-util"] }
+tracing-core = { workspace = true }
+tracing-subscriber = { workspace = true }
