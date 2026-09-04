@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install zsh
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+      - run: cargo test
+
+  shell-smoke:
+    name: Shell smoke (${{ matrix.shell }}, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+        shell: [zsh, fish]
+    runs-on: ${{ matrix.os }}
+    needs: [check]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install shells
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ${{ matrix.shell }}
+          else
+            if [[ "${{ matrix.shell }}" == "fish" ]]; then
+              brew untap aws/tap 2>/dev/null || true
+              brew install fish
+            fi
+          fi
+      - name: Run ${{ matrix.shell }} smoke
+        run: |
+          if [[ "${{ matrix.shell }}" == "zsh" ]]; then
+            ./scripts/check-zsh-zle-smoke.sh
+          else
+            ./scripts/check-fish-smoke.sh
+          fi
+      - name: Run ttyshim scrub test
+        if: runner.os == 'macos'
+        run: ./scripts/check-ttyshim-scrub.sh
+
+  clippy:
+    name: Clippy & Format
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo fmt --check

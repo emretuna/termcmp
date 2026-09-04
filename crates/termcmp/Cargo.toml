@@ -1,0 +1,51 @@
+[package]
+name = "termcmp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Terminal-native autocomplete engine using PTY proxying for macOS and Linux terminals"
+keywords = ["terminal", "autocomplete", "completion", "pty"]
+categories = ["command-line-utilities"]
+readme = "../../README.md"
+# Binary crate shipped exclusively via cargo-dist releases; keep out of crates.io.
+publish = false
+# Emits VERGEN_GIT_SHA / VERGEN_BUILD_TIMESTAMP for clap's `--version` string.
+build = "build.rs"
+
+[[bin]]
+name = "termcmp"
+path = "src/main.rs"
+
+# publish = false hides this crate from cargo-dist by default; opt back in
+# explicitly so Release builds continue to ship the binary.
+[package.metadata.dist]
+dist = true
+
+[dependencies]
+pty = { path = "../pty" }
+config = { path = "../config" }
+suggest = { path = "../suggest" }
+terminal = { path = "../terminal" }
+tokio = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+anyhow = { workspace = true }
+dirs = "6"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+toml = "1.1"
+libc = "0.2"
+overlay = { path = "../overlay" }
+toml_edit = { workspace = true }
+# Used in non-test code by `install::atomic_write` for tempfile + rename.
+tempfile = "3"
+
+[dev-dependencies]
+portable-pty = "0.9"
+# Enables the `TerminalProfile::for_*()` fixture constructors for tests only.
+terminal = { path = "../terminal", features = ["test-utils"] }
+# Enables `parser::test_utils::build_osc7772_envelope` for smoke tests.
+parser = { path = "../parser", features = ["test-utils"] }

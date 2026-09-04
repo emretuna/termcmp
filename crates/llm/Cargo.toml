@@ -1,0 +1,27 @@
+[package]
+name = "llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+serde_json = "1"
+anyhow = { workspace = true }
+tracing = { workspace = true }
+suggest = { path = "../suggest" }
+buffer = { path = "../buffer" }
+reqwest = { workspace = true }
+# Crypto provider for reqwest's `rustls-no-provider` feature. The default
+# `rustls` feature links aws-lc-rs, which drags in a C library with a CMake
+# build dependency; ring is the sanctioned alternative (see reqwest's
+# `rustls-no-provider` docs), builds without C tooling, and must be installed
+# at runtime — see `install_rustls_crypto_provider` in provider.rs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+regex = "1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
