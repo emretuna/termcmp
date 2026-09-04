@@ -1,4 +1,4 @@
-# termcmp
+[![termcmp](/assets/termcmp.png)](https://github.com/emretuna/termcmp)
 
 Terminal autocompletion via frizbee fuzzy matching. A PTY proxy that sits between your shell and terminal, providing inline command completions from multiple sources: shell-native completions (fish/zsh), command history, filesystem paths, and optional LLM-powered suggestions.
 
@@ -9,7 +9,7 @@ Terminal autocompletion via frizbee fuzzy matching. A PTY proxy that sits betwee
 brew install termcmp/tap/termcmp
 
 # Cargo
-cargo install termcmp
+cargo install https://github.com/emretuna/termcmp
 ```
 
 ## Quick Start
