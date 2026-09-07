@@ -198,9 +198,20 @@ impl Write for PtyWriter {
     }
 }
 
+/// Bound on consecutive `EIO`s from the outer tty before the fork_reader
+/// child gives up and exits. `EIO` means orphaned pgrp or dead tty — usually
+/// transient, but a dead tty EIOs forever. At 10 ms per retry this is ~6 s
+/// of continuous failure: generous for transient states, bounded for leaks.
+const MAX_CONSECUTIVE_EIO: u32 = 600;
+
 /// Fork a reader child that reads from the outer tty with SIGTTIN dance.
-/// Returns Some(pid) in parent, None in child (which never returns).
+/// Returns the child pid in the parent; the child itself never returns.
 /// The child writes bytes to the UnixStream connected to `stream_fd`.
+///
+/// The child exits on tty EOF/EBADF, when reparented (its proxy died), or
+/// after [`MAX_CONSECUTIVE_EIO`] straight `EIO`s — but NOT on its own when
+/// the proxy shuts down cleanly, so the proxy must `SIGTERM` the returned
+/// pid in teardown (see `run_proxy`).
 pub fn fork_reader(outer_fd: RawFd, stream_fd: RawFd) -> std::io::Result<Option<u32>> {
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -211,7 +222,9 @@ pub fn fork_reader(outer_fd: RawFd, stream_fd: RawFd) -> std::io::Result<Option<
         return Ok(Some(pid as u32));
     }
 
-    // Child: install SIGTTIN handler (empty), ignore SIGINT/SIGQUIT/SIGTSTP
+    // Child: install SIGTTIN handler (empty), ignore SIGINT/SIGQUIT/SIGTSTP.
+    // SIGTERM/SIGHUP keep default disposition so the proxy can terminate us
+    // in teardown (see `run_proxy`).
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = libc::SIG_IGN;
@@ -221,9 +234,18 @@ pub fn fork_reader(outer_fd: RawFd, stream_fd: RawFd) -> std::io::Result<Option<
         libc::signal(libc::SIGTSTP, libc::SIG_IGN);
     }
 
+    // Parent pid at fork: if it ever differs we were reparented (proxy died
+    // without signalling us) and must exit — otherwise we EIO-loop forever.
+    let proxy_ppid = unsafe { libc::getppid() };
+
     // SIGTTIN dance loop: read from outer_fd, write to stream_fd
     let mut buf = [0u8; 4096];
+    let mut eio_streak: u32 = 0;
     loop {
+        if unsafe { libc::getppid() } != proxy_ppid {
+            // Proxy gone (crash/SIGKILL) — tty EOF may never arrive.
+            unsafe { libc::_exit(0) };
+        }
         // Get current foreground pgrp of outer tty
         let mut pgid: libc::pid_t = 0;
         let ret = unsafe { libc::ioctl(outer_fd, libc::TIOCGPGRP as _, &mut pgid) };
@@ -252,7 +274,12 @@ pub fn fork_reader(outer_fd: RawFd, stream_fd: RawFd) -> std::io::Result<Option<
                 continue; // EINTR from SIGTTIN, retry
             }
             if err.raw_os_error() == Some(libc::EIO) {
-                // Orphaned pgrp or dead tty
+                // Orphaned pgrp or dead tty: transient, but bounded — a dead
+                // tty EIOs forever and must not spin the reader eternally.
+                eio_streak += 1;
+                if eio_streak >= MAX_CONSECUTIVE_EIO {
+                    unsafe { libc::_exit(0) };
+                }
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 continue;
             }
@@ -263,6 +290,9 @@ pub fn fork_reader(outer_fd: RawFd, stream_fd: RawFd) -> std::io::Result<Option<
         if n == 0 {
             unsafe { libc::_exit(0) };
         }
+        // Successful read breaks any transient EIO run — the budget counts
+        // *consecutive* failures only.
+        eio_streak = 0;
 
         // Write to stream_fd
         let mut written = 0;

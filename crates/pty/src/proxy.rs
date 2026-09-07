@@ -73,7 +73,7 @@ pub async fn run_proxy(
     args: &[OsString],
     config: &TermcmpConfig,
     reader_stream: std::os::unix::net::UnixStream,
-    _reader_pid: Option<u32>,
+    reader_pid: Option<u32>,
 ) -> Result<i32> {
     // Detect terminal capabilities
     let terminal_profile = terminal::TerminalProfile::detect();
@@ -1370,6 +1370,15 @@ pub async fn run_proxy(
     if let Some(h) = debounce_handle {
         h.abort();
     }
+    // Signal the fork_reader child: it otherwise exits only on tty EOF or
+    // EPIPE-on-write, so without this it outlives proxy shutdown (EIO-looping
+    // forever on a dead tty). Best-effort — it may already be gone (ESRCH).
+    // The reader does not ignore SIGTERM, so this terminates it.
+    if let Some(pid) = reader_pid {
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
     if let Some(h) = config_watcher_handle {
         h.shutdown();
     }
@@ -1421,8 +1430,11 @@ pub async fn run_proxy(
     // On signal-driven shutdown, the shell may be blocked on a read of the
     // inherited master PTY fd. A plain `wait()` would hang forever. Poll
     // `try_wait` with a bounded deadline, then escalate to `kill()` if the
-    // shell hasn't exited on its own.
-    let exit_code = if signal_shutdown {
+    // shell hasn't exited on its own. The same hang exists on the EOF-driven
+    // path: the reader can exit (EIO budget on a dead outer tty, stream EOF)
+    // while the inner shell still holds its pty open, so it never exits on
+    // its own either.
+    let exit_code = if signal_shutdown || !shell_dead {
         wait_with_timeout(&mut child, Duration::from_secs(2))
     } else {
         let status = child.wait().context("failed to wait for shell process")?;

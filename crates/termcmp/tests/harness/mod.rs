@@ -93,14 +93,18 @@ impl TermcmpProcess {
         // developer's ~/.config/termcmp/config.toml (e.g. Ask AI enabled),
         // which changes popup content and key handling, breaking assertions.
         let fake_config = std::env::temp_dir().join("termcmp-smoke-nonexistent/config.toml");
-        cmd.args([
-            "--log-level",
-            "error",
-            "--config",
-            fake_config.to_str().unwrap(),
-            "/bin/sh",
-            "--norc",
-        ]);
+        // Portable shell invocation: /bin/sh is dash on Linux (no --norc),
+        // so passing --norc unconditionally breaks shell startup there.
+        // Prefer /bin/bash with --norc --noprofile when present; otherwise
+        // fall back to plain /bin/sh with no extra args.
+        let (shell, extra_args): (&str, &[&str]) =
+            if std::path::Path::new("/bin/bash").exists() {
+                ("/bin/bash", &["--norc", "--noprofile"])
+            } else {
+                ("/bin/sh", &[])
+            };
+        cmd.args(["--log-level", "error", "--config", fake_config.to_str().unwrap(), shell]);
+        cmd.args(extra_args);
         // Pin the proxy's working directory. portable-pty defaults an unset
         // CommandBuilder cwd to $HOME, which on Linux CI is /root — dotfiles
         // only, so the filesystem-fallback popup finds zero candidates and
@@ -151,8 +155,28 @@ impl TermcmpProcess {
             }
         });
 
-        // Wait for shell to initialize (larger binary with embedded specs needs more time).
-        thread::sleep(Duration::from_millis(1500));
+        // Wait for shell readiness by polling for the first PTY output bytes
+        // instead of a fixed sleep. A fixed sleep races shell startup under
+        // CI load: an `exit` line sent before the shell's first read is lost
+        // and `wait_for_exit` burns its full 15s timeout (macOS
+        // `test_exit_code_zero` flake). Bounded at 10s so a hung child still
+        // fails fast; falls through regardless so a quiet-but-alive shell
+        // doesn't hard-fail here.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        {
+            let (lock, cvar) = &*output;
+            let mut data = lock.lock().unwrap();
+            while data.is_empty() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (guard, _) = cvar.wait_timeout(data, remaining).unwrap();
+                data = guard;
+            }
+        }
+        // Small settle so the shell reaches its prompt/read after first bytes.
+        thread::sleep(Duration::from_millis(200));
 
         TermcmpProcess {
             writer,
@@ -379,22 +403,17 @@ impl TermcmpProcess {
     }
 
     /// Send `exit <code>` and wait for the process to exit. Returns the exit code.
+    ///
+    /// The `exit` line can be lost if the inner shell hasn't reached its first
+    /// read yet (startup race under CI load). Resend it every 500ms while the
+    /// child is alive so one lost line doesn't cost a 15s timeout. Bounded at
+    /// 15s total so the suite can't balloon.
     pub fn exit_with_code(&mut self, code: i32) -> i32 {
-        self.send_line(&format!("exit {}", code));
-        self.wait_for_exit()
-    }
-
-    /// Return the PID of the termcmp process (if available).
-    #[allow(dead_code)]
-    pub fn child_pid(&self) -> Option<u32> {
-        self.pid
-    }
-
-    /// Wait for the child process to exit, polling every 50ms. Kills after 15s.
-    fn wait_for_exit(&mut self) -> i32 {
         let timeout = Duration::from_secs(15);
+        let retry_interval = Duration::from_millis(500);
         let start = Instant::now();
-
+        self.send_line(&format!("exit {}", code));
+        let mut last_send = Instant::now();
         loop {
             if let Some(status) = self.child.try_wait().expect("try_wait failed") {
                 return status.exit_code().try_into().unwrap_or(1);
@@ -403,8 +422,23 @@ impl TermcmpProcess {
                 self.child.kill().ok();
                 panic!("Process did not exit within {:?}", timeout);
             }
+            if last_send.elapsed() >= retry_interval {
+                // Best-effort resend: the PTY may be half-torn-down, so a
+                // failed write must not panic — the next poll observes exit.
+                let data = format!("exit {}\r", code);
+                if self.writer.write_all(data.as_bytes()).is_ok() {
+                    let _ = self.writer.flush();
+                }
+                last_send = Instant::now();
+            }
             thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Return the PID of the termcmp process (if available).
+    #[allow(dead_code)]
+    pub fn child_pid(&self) -> Option<u32> {
+        self.pid
     }
 }
 
