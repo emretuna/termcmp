@@ -1,0 +1,8 @@
+#!/bin/sh
+# Installed into .git/hooks/pre-push by cargo-husky (user-hooks feature) on
+# first test build. Delegates to the versioned gate script so hook logic
+# stays reviewable. cargo-husky copies this file verbatim; keep it a thin
+# wrapper — the real gate is scripts/pre-push-gate.sh.
+set -e
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+exec "$REPO_ROOT/scripts/pre-push-gate.sh"

@@ -33,6 +33,7 @@ trap 'rm -rf "$FISH_SCRIPT" "$GUARD_SCRIPT" "$GUARD_FAKE_BIN"' EXIT
 
 cat > "$FISH_SCRIPT" <<'FISH'
 source INTEGRATION_PLACEHOLDER
+set -gx TERMCMP_ACTIVE 1
 
 # Shadow commandline: _termcmp_report_buffer calls `commandline` (buffer)
 # and `commandline -C` (cursor). We return controlled values.

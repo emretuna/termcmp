@@ -45,7 +45,17 @@ tempfile = "3"
 
 [dev-dependencies]
 portable-pty = "0.9"
+# Self-installing git hooks (husky analog): every clone gets .git/hooks
+# installed on first test build from the committed .cargo-husky/hooks/
+# scripts — no manual `core.hooksPath` setup. default-features off so
+# cargo-husky skips its builtin `cargo test --all` hook; `user-hooks`
+# installs only our scripts.
+cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
 # Enables the `TerminalProfile::for_*()` fixture constructors for tests only.
 terminal = { path = "../terminal", features = ["test-utils"] }
 # Enables `parser::test_utils::build_osc7772_envelope` for smoke tests.
 parser = { path = "../parser", features = ["test-utils"] }
+
+# Pre-push gate body lives in .cargo-husky/hooks/pre-push and delegates to
+# scripts/pre-push-gate.sh (fmt, clippy -D warnings, full tests, shell
+# smokes). Mirrors .github/workflows/ci.yml.

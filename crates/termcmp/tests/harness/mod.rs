@@ -97,13 +97,18 @@ impl TermcmpProcess {
         // so passing --norc unconditionally breaks shell startup there.
         // Prefer /bin/bash with --norc --noprofile when present; otherwise
         // fall back to plain /bin/sh with no extra args.
-        let (shell, extra_args): (&str, &[&str]) =
-            if std::path::Path::new("/bin/bash").exists() {
-                ("/bin/bash", &["--norc", "--noprofile"])
-            } else {
-                ("/bin/sh", &[])
-            };
-        cmd.args(["--log-level", "error", "--config", fake_config.to_str().unwrap(), shell]);
+        let (shell, extra_args): (&str, &[&str]) = if std::path::Path::new("/bin/bash").exists() {
+            ("/bin/bash", &["--norc", "--noprofile"])
+        } else {
+            ("/bin/sh", &[])
+        };
+        cmd.args([
+            "--log-level",
+            "error",
+            "--config",
+            fake_config.to_str().unwrap(),
+            shell,
+        ]);
         cmd.args(extra_args);
         // Pin the proxy's working directory. portable-pty defaults an unset
         // CommandBuilder cwd to $HOME, which on Linux CI is /root — dotfiles
