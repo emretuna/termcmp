@@ -51,6 +51,10 @@ jobs:
   # tag push cannot ship.
   test:
     name: Test (release gate, ${{ matrix.os }})
+    env:
+      # Hooks are for dev machines: don't let cargo-husky rewrite
+      # .git/hooks in ephemeral CI checkouts on every test build.
+      CARGO_HUSKY_DONT_INSTALL_HOOKS: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -64,9 +68,13 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Install zsh
-        if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+      - name: Install test dependencies
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq zsh tmux
+          else
+            brew install tmux
+          fi
       - run: cargo test --workspace
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo fmt --check
