@@ -1206,6 +1206,10 @@ pub async fn run_proxy(
     // outer tty is never pointed at a dead pgrp between shell exit and our
     // own teardown.
     let mut shell_dead = false;
+    // Raw `waitpid` status of the shell, captured by the SIGCHLD arm when it
+    // reaps the shell before teardown's `child.wait()` runs. Without this,
+    // the later `wait()` hits ECHILD and a clean exit becomes exit 1.
+    let mut shell_status: Option<libc::c_int> = None;
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => {
@@ -1233,6 +1237,7 @@ pub async fn run_proxy(
                     } {
                         if pid == shell_pid {
                             shell_dead = true;
+                            shell_status = Some(status);
                         }
                     }
                 }
@@ -1434,14 +1439,44 @@ pub async fn run_proxy(
     // path: the reader can exit (EIO budget on a dead outer tty, stream EOF)
     // while the inner shell still holds its pty open, so it never exits on
     // its own either.
+    // The SIGCHLD arm above reaps with `waitpid(-1)` (it must also collect
+    // one-shot helpers like the alias harvest), so when it wins the reap
+    // race for the shell, `child.wait()` below would fail with ECHILD and
+    // turn a clean shell exit into an exit-1 teardown error. Prefer the
+    // stashed raw status; fall back to `wait()` only if the arm never ran.
     let exit_code = if signal_shutdown || !shell_dead {
-        wait_with_timeout(&mut child, Duration::from_secs(2))
+        match shell_status {
+            Some(raw) => decode_wait_status(raw),
+            None => wait_with_timeout(&mut child, Duration::from_secs(2)),
+        }
     } else {
-        let status = child.wait().context("failed to wait for shell process")?;
-        status.code().unwrap_or(1)
+        match shell_status {
+            Some(raw) => decode_wait_status(raw),
+            None => match child.wait() {
+                Ok(status) => status.code().unwrap_or(1),
+                Err(e) if e.raw_os_error() == Some(libc::ECHILD) => {
+                    tracing::warn!("shell reaped without stashed status: {e}");
+                    1
+                }
+                Err(e) => return Err(e).context("failed to wait for shell process"),
+            },
+        }
     };
 
     Ok(exit_code)
+}
+
+/// Decode a raw `waitpid` status into a process exit code.
+///
+/// Consumes the status stashed by the SIGCHLD arm when it reaps the shell
+/// before teardown runs. Normal exits propagate; signal deaths map to 1,
+/// matching the `status.code().unwrap_or(1)` convention on the `wait()` path.
+fn decode_wait_status(raw: libc::c_int) -> i32 {
+    if libc::WIFEXITED(raw) {
+        libc::WEXITSTATUS(raw)
+    } else {
+        1
+    }
 }
 
 /// Poll `try_wait` until `deadline`, then `kill()` and re-poll with a bounded
@@ -3416,6 +3451,63 @@ mod tests {
         assert_eq!(
             code, 7,
             "already-exited child must return its real exit code"
+        );
+    }
+    /// Reap `child` exactly like the SIGCHLD arm does (`waitpid` on the raw
+    /// pid, discarding via the arm's path) and return the raw status word.
+    /// The `Child` handle is consumed-but-never-waited afterwards, mirroring
+    /// the ECHILD state teardown must tolerate — so this helper takes it by
+    /// value and forgets it after reaping.
+    fn reap_raw(child: std::process::Child) -> libc::c_int {
+        let pid = child.id() as libc::pid_t;
+        std::mem::forget(child);
+        let mut status: libc::c_int = 0;
+        // `sleep 30` fixtures need SIGTERM first; callers kill before this.
+        let start = std::time::Instant::now();
+        loop {
+            let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if r == pid {
+                return status;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "reap_raw timed out waiting for pid {pid}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn decode_wait_status_propagates_exit_code() {
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .expect("spawn sh");
+        let raw = reap_raw(child);
+        assert_eq!(
+            decode_wait_status(raw),
+            7,
+            "stashed exit status must decode to the shell's real code"
+        );
+    }
+
+    #[test]
+    fn decode_wait_status_maps_signal_death_to_one() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as libc::pid_t;
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        let raw = reap_raw(child);
+        assert!(
+            libc::WIFSIGNALED(raw),
+            "fixture must die by signal to exercise the mapping"
+        );
+        assert_eq!(
+            decode_wait_status(raw),
+            1,
+            "signalled shell must map to 1 like status.code().unwrap_or(1)"
         );
     }
 

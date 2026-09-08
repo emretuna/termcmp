@@ -60,12 +60,41 @@ impl std::io::Write for TmuxWriter {
     }
 }
 
+/// Dump live tmux pane state for the `expect_output` timeout panic.
+/// Distinguishes the three stall modes CI-only failures fall into:
+/// pane dead on arrival (instant termcmp death, with its exit status),
+/// pane alive but silent (startup hang before first write), and
+/// pane loud but pipe empty (pipe-pane capture broken).
+fn tmux_pane_diag(session_name: &str) -> String {
+    let run = |args: &[&str]| {
+        std::process::Command::new("tmux")
+            .args(args)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|e| format!("<tmux failed: {e}>"))
+    };
+    let pane = run(&["capture-pane", "-t", session_name, "-p"]);
+    let state = run(&[
+        "display-message",
+        "-t",
+        session_name,
+        "-p",
+        "dead=#{pane_dead} dead_status=#{pane_dead_status} cmd=#{pane_current_command}",
+    ]);
+    format!("tmux pane [{session_name}] state: {state}\n pane content:\n{pane}")
+}
+
 pub struct TermcmpProcess {
     writer: Box<dyn Write + Send>,
     output: Arc<(Mutex<Vec<u8>>, Condvar)>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     pid: Option<u32>,
     _pty_process_guard: MutexGuard<'static, ()>,
+    /// Extra context appended to the `expect_output` timeout panic.
+    /// The tmux backend sets this to dump live pane state (`capture-pane`,
+    /// `pane_dead`, current command) so CI-only stalls are diagnosable from
+    /// the log; the PTY backend leaves it empty.
+    timeout_diag: Option<Arc<dyn Fn() -> String + Send + Sync>>,
 }
 // `mod harness` compiles per integration-test target; targets that only
 // drive `TmuxSession` (e.g. tmux_integration) don't call every method.
@@ -189,6 +218,7 @@ impl TermcmpProcess {
             child,
             pid,
             _pty_process_guard: pty_process_guard,
+            timeout_diag: None,
         }
     }
 
@@ -308,6 +338,10 @@ impl TermcmpProcess {
             child,
             pid: None,
             _pty_process_guard: pty_process_guard,
+            timeout_diag: Some(Arc::new({
+                let session = session_name.to_owned();
+                move || tmux_pane_diag(&session)
+            })),
         }
     }
 
@@ -343,12 +377,18 @@ impl TermcmpProcess {
             }
             let elapsed = start.elapsed();
             if elapsed >= timeout {
+                let diag = self
+                    .timeout_diag
+                    .as_ref()
+                    .map(|f| format!("\n{}", f()))
+                    .unwrap_or_default();
                 panic!(
-                    "Timed out after {:?} waiting for {:?} in output.\nOutput so far ({} bytes):\n{}",
+                    "Timed out after {:?} waiting for {:?} in output.\nOutput so far ({} bytes):\n{}{}",
                     timeout,
                     substr,
                     data.len(),
-                    String::from_utf8_lossy(&data[..data.len().min(2000)])
+                    String::from_utf8_lossy(&data[..data.len().min(2000)]),
+                    diag,
                 );
             }
             let remaining = timeout - elapsed;
