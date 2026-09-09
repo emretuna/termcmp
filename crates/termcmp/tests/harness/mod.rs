@@ -540,6 +540,16 @@ impl TmuxSession {
             nanos
         );
         // Create tmux session with termcmp
+        // NOTE: `-e GHOSTTY_RESOURCES_DIR=/tmp` is load-bearing. Panes
+        // inherit the tmux *server* env (from whichever client started it),
+        // not this client's `.env()` overrides — so bare CI servers leak no
+        // terminal markers, detection yields Unknown, and the proxy falls
+        // back to a plain shell (every popup test stalls). Worse, tmux
+        // unconditionally rewrites TERM_PROGRAM=tmux in pane environments,
+        // so `-e TERM_PROGRAM=...` can never work; GHOSTTY_RESOURCES_DIR
+        // passes through untouched and still maps to Ghostty in-tmux (any
+        // existing dir satisfies the detection check).
+        // `new-session -e` needs tmux >= 3.2 (CI installs current tmux).
         let output = std::process::Command::new("tmux")
             .args([
                 "new-session",
@@ -550,6 +560,8 @@ impl TmuxSession {
                 "80",
                 "-y",
                 "24",
+                "-e",
+                "GHOSTTY_RESOURCES_DIR=/tmp",
                 env!("CARGO_BIN_EXE_termcmp"),
                 "--log-level",
                 "error",
