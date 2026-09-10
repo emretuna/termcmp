@@ -583,9 +583,27 @@ impl TmuxSession {
         }
 
         // Keep dead panes around so tests can query #{pane_dead_status}.
-        let _ = std::process::Command::new("tmux")
-            .args(["set-option", "-t", &session_name, "remain-on-exit", "on"])
-            .status();
+        // Assert success: without remain-on-exit a dead pane destroys its
+        // session, and every later query fails — surfacing as a confusing
+        // `pane_exit_status() == None` instead of the real setup error.
+        // Target the window explicitly (`session:1`): remain-on-exit is a
+        // window option and bare session targets resolve inconsistently
+        // across tmux versions.
+        let remain = std::process::Command::new("tmux")
+            .args([
+                "set-option",
+                "-t",
+                &format!("{session_name}:1"),
+                "remain-on-exit",
+                "on",
+            ])
+            .output()
+            .expect("failed to set remain-on-exit");
+        assert!(
+            remain.status.success(),
+            "tmux set-option remain-on-exit failed: {}",
+            String::from_utf8_lossy(&remain.stderr)
+        );
 
         // Create a TermcmpProcess that connects to the tmux session
         // We'll use tmux's pipe-pane to capture output
@@ -689,10 +707,12 @@ impl TmuxSession {
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
 
-            match gone.as_deref() {
-                // Pane dead, or session/pane query failed entirely (gone).
-                Ok("1") | Err(_) => return true,
-                _ => {}
+            // Only an explicit dead flag means closed. A failed query
+            // (server hiccup, session briefly unresolvable) is NOT
+            // evidence of death — treating it as closed produced phantom
+            // `pane_exit_status() == None` failures downstream.
+            if let Ok("1") = gone.as_deref() {
+                return true;
             }
 
             std::thread::sleep(Duration::from_millis(100));
