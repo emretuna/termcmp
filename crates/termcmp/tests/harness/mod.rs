@@ -586,17 +586,10 @@ impl TmuxSession {
         // Assert success: without remain-on-exit a dead pane destroys its
         // session, and every later query fails — surfacing as a confusing
         // `pane_exit_status() == None` instead of the real setup error.
-        // Target the window explicitly (`session:1`): remain-on-exit is a
-        // window option and bare session targets resolve inconsistently
-        // across tmux versions.
+        // (Target the session, not `session:N`: window indexes depend on
+        // base-index, but a session target resolves to its active window.)
         let remain = std::process::Command::new("tmux")
-            .args([
-                "set-option",
-                "-t",
-                &format!("{session_name}:1"),
-                "remain-on-exit",
-                "on",
-            ])
+            .args(["set-option", "-t", &session_name, "remain-on-exit", "on"])
             .output()
             .expect("failed to set remain-on-exit");
         assert!(
