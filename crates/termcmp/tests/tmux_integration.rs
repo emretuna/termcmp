@@ -273,7 +273,7 @@ fn test_osc_7773_forwarded() {
 /// Test exit propagation - exiting shell should close pane with correct status
 #[test]
 fn test_exit_propagation_zero() {
-    let mut tmux = TmuxSession::spawn();
+    let mut tmux = TmuxSession::spawn_exit_capture();
     tmux.expect_output("$");
 
     // Exit with status 0
@@ -291,7 +291,7 @@ fn test_exit_propagation_zero() {
 /// Test exit propagation with non-zero status
 #[test]
 fn test_exit_propagation_nonzero() {
-    let mut tmux = TmuxSession::spawn();
+    let mut tmux = TmuxSession::spawn_exit_capture();
     tmux.expect_output("$");
 
     // Exit with status 42

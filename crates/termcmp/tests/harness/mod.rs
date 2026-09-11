@@ -1,5 +1,6 @@
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -509,6 +510,21 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// Unique token for session names and marker files: PID + thread + nanos.
+/// Parallel tests share a tmux server; names must never collide.
+#[allow(dead_code)]
+fn unique_suffix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    let thread_id = format!("{:?}", std::thread::current().id());
+    let thread_num = thread_id
+        .trim_start_matches("ThreadId(")
+        .trim_end_matches(")");
+    format!("{}-t{}-{}", std::process::id(), thread_num, nanos)
+}
+
 /// A tmux session running termcmp for integration testing.
 ///
 /// Creates a tmux session with termcmp running inside it, allowing us to
@@ -517,29 +533,70 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 pub struct TmuxSession {
     session_name: String,
     termcmp: TermcmpProcess,
+    /// Path to the exit-code marker written by the wrapper shell (see
+    /// `spawn_exit_capture`). `None` for plain `spawn`, where the pane's
+    /// direct child is termcmp itself.
+    exit_marker: Option<PathBuf>,
 }
 
 #[allow(dead_code)]
 impl TmuxSession {
-    /// Spawn a tmux session with termcmp running inside it.
+    /// Spawn a tmux session with termcmp as the pane's DIRECT child.
+    ///
+    /// Every topology/foreground/OSC test depends on termcmp being the pane
+    /// process (pane_current_command == "termcmp", job control mirroring,
+    /// etc.). Do not wrap termcmp here.
     pub fn spawn() -> Self {
-        // Use process ID + thread ID + nanoseconds for unique session names across parallel tests
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos();
-        let thread_id = format!("{:?}", std::thread::current().id());
-        // Extract numeric part from thread id like "ThreadId(1)"
-        let thread_num = thread_id
-            .trim_start_matches("ThreadId(")
-            .trim_end_matches(")");
-        let session_name = format!(
-            "termcmp-test-{}-t{}-{}",
-            std::process::id(),
-            thread_num,
-            nanos
+        let pane_cmd: Vec<String> = vec![
+            env!("CARGO_BIN_EXE_termcmp").to_string(),
+            "--log-level".to_string(),
+            "error".to_string(),
+            "/bin/bash".to_string(),
+            "--norc".to_string(),
+        ];
+        Self::spawn_internal(pane_cmd, None)
+    }
+
+    /// Spawn a tmux session whose pane runs termcmp under a wrapper shell.
+    ///
+    /// The wrapper records termcmp's exit code to a marker file before it
+    /// exits itself:
+    ///
+    /// ```text
+    /// sh -c 'CARGO_BIN_EXE_termcmp --log-level error /bin/bash --norc
+    ///        rc=$?; echo $rc > MARKER; exit $rc'
+    /// ```
+    ///
+    /// This is the exit-propagation oracle: tmux's `#{pane_dead_status}` is
+    /// dropped on Linux in a pty-EOF-vs-SIGCHLD race even for a clean
+    /// `exit 42` (~43-57% of runs, tmux 3.3a AND 3.4), while `pane_dead=1`
+    /// and a marker file written before shell exit are both deterministic.
+    /// Only the two exit-propagation tests use this; all other tests keep
+    /// the direct-child `spawn()` so the pane topology is unperturbed.
+    pub fn spawn_exit_capture() -> Self {
+        let suffix = unique_suffix();
+        let marker = std::env::temp_dir().join(format!("termcmp-exit-{suffix}"));
+        let _ = std::fs::remove_file(&marker);
+
+        let bin = env!("CARGO_BIN_EXE_termcmp");
+        // Single-quote both paths: neither contains a single quote, so this
+        // is exact. `rc=$?` captures termcmp's exit BEFORE `echo` so the
+        // marker holds termcmp's code, not echo's.
+        let script = format!(
+            "'{bin}' --log-level error /bin/bash --norc; rc=$?; echo $rc > '{}'; exit $rc",
+            marker.display()
         );
-        // Create tmux session with termcmp
+        let pane_cmd: Vec<String> = vec!["sh".to_string(), "-c".to_string(), script];
+
+        Self::spawn_internal(pane_cmd, Some(marker))
+    }
+
+    /// Shared construction: create the tmux session with `pane_cmd` as the
+    /// pane command, set `remain-on-exit on`, attach pipe-pane, record the
+    /// optional exit marker.
+    fn spawn_internal(pane_cmd: Vec<String>, exit_marker: Option<PathBuf>) -> Self {
+        let session_name = format!("termcmp-test-{}", unique_suffix());
+        // Create tmux session with the pane command
         // NOTE: `-e GHOSTTY_RESOURCES_DIR=/tmp` is load-bearing. Panes
         // inherit the tmux *server* env (from whichever client started it),
         // not this client's `.env()` overrides — so bare CI servers leak no
@@ -562,12 +619,8 @@ impl TmuxSession {
                 "24",
                 "-e",
                 "GHOSTTY_RESOURCES_DIR=/tmp",
-                env!("CARGO_BIN_EXE_termcmp"),
-                "--log-level",
-                "error",
-                "/bin/bash",
-                "--norc",
             ])
+            .args(&pane_cmd)
             .env("TERM_PROGRAM", "ghostty")
             .env("PS1", "$ ")
             .output()
@@ -582,12 +635,12 @@ impl TmuxSession {
             );
         }
 
-        // Keep dead panes around so tests can query #{pane_dead_status}.
-        // Assert success: without remain-on-exit a dead pane destroys its
-        // session, and every later query fails — surfacing as a confusing
-        // `pane_exit_status() == None` instead of the real setup error.
-        // (Target the session, not `session:N`: window indexes depend on
-        // base-index, but a session target resolves to its active window.)
+        // Keep dead panes around so tests can query #{pane_dead}. Assert
+        // success: without remain-on-exit a dead pane destroys its session,
+        // and every later query fails — surfacing as a confusing failure
+        // instead of the real setup error. (Target the session, not
+        // `session:N`: window indexes depend on base-index, but a session
+        // target resolves to its active window.)
         let remain = std::process::Command::new("tmux")
             .args(["set-option", "-t", &session_name, "remain-on-exit", "on"])
             .output()
@@ -605,6 +658,7 @@ impl TmuxSession {
         TmuxSession {
             session_name,
             termcmp,
+            exit_marker,
         }
     }
 
@@ -713,93 +767,35 @@ impl TmuxSession {
         false
     }
 
-    /// Get the pane exit status. Requires `remain-on-exit on` (set at spawn)
-    /// so the dead pane stays queryable; returns None while the pane lives.
+    /// Get the pane exit status.
     ///
-    /// Retries briefly instead of single-shotting: right after pane death
-    /// tmux is still transitioning pane state, and an immediate query can
-    /// fail (or report pre-death state) even though `wait_for_pane_close`
-    /// just observed `pane_dead=1`. A single failed query must not
-    /// masquerade as "no status". Only a successful `pane_dead=0` report
-    /// (truly alive) or the retry budget yields None.
+    /// For `spawn_exit_capture` sessions this reads the code from the
+    /// wrapper-written marker file — deterministic and cross-platform.
+    /// tmux's own `#{pane_dead_status}` is deliberately NOT used: Linux
+    /// drops it in a pty-EOF-vs-SIGCHLD race even for a clean `exit 42`
+    /// (~43-57% of runs on tmux 3.3a and 3.4), so it is not a usable
+    /// oracle for exit propagation.
     pub fn pane_exit_status(&self) -> Option<i32> {
-        let query = |format: &str| {
-            std::process::Command::new("tmux")
-                .args(["display-message", "-t", &self.session_name, "-p", format])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        };
-        let start = std::time::Instant::now();
+        let marker = self.exit_marker.as_ref()?;
+        // The wrapper writes the marker before it exits, and
+        // `wait_for_pane_close` observes `pane_dead=1` only after that exit
+        // completes (`echo` fopen/write/close precedes `exit $rc`). The file
+        // is therefore already populated here; the retry loop is defensive
+        // against tmpfs flush/lookup ordering.
         let budget = Duration::from_secs(3);
-        // Last-seen (dead, status, signal) for the give-up diagnostic. Single
-        // tuple assigned on every path (no dead initializer for unused_assignments).
-        let mut last: (Option<String>, Option<String>, Option<String>);
-        // The pane is static once dead — dump its content exactly once, not on
-        // every 50ms poll, or the CI log floods with ~60 identical dumps.
-        let mut dumped = false;
+        let start = std::time::Instant::now();
         loop {
-            match query("#{pane_dead}").as_deref() {
-                Some("1") => match query("#{pane_dead_status}").as_deref() {
-                    Some(s) if !s.is_empty() => {
-                        let parsed: Option<i32> = s.parse().ok();
-                        if parsed.is_none() {
-                            eprintln!(
-                                "pane_exit_status: unparseable dead_status for {}: {:?}",
-                                self.session_name, s
-                            );
-                        }
-                        return parsed;
-                    }
-                    other => {
-                        let dead_signal = query("#{pane_dead_signal}");
-                        last = (
-                            Some("1".to_string()),
-                            other.map(str::to_string),
-                            dead_signal.clone(),
-                        );
-                        // Signal death detected — tmux's #{pane_dead_signal} names
-                        // the exact killer even when it has default disposition
-                        // (SIGKILL/SIGSEGV/SIGABRT), which a product-side handler
-                        // can never catch. Dump pane content once for any
-                        // proxy-side panic/backtrace rendered before death.
-                        if !dumped {
-                            dumped = true;
-                            eprintln!(
-                                "pane_exit_status: signal death for {}: dead_signal={:?}",
-                                self.session_name, dead_signal
-                            );
-                            if let Some(pane_id) = query("#{pane_id}") {
-                                let args = if pane_id.is_empty() {
-                                    vec!["-t", self.session_name.as_str()]
-                                } else {
-                                    vec!["-t", pane_id.as_str()]
-                                };
-                                if let Ok(output) = std::process::Command::new("tmux")
-                                    .args(["capture-pane"])
-                                    .args(&args)
-                                    .args(["-p", "-S", "-100"])
-                                    .output()
-                                {
-                                    let stderr = String::from_utf8_lossy(&output.stdout);
-                                    eprintln!(
-                                        "=== Pane content (last 100 lines) for {} ===\n{}",
-                                        self.session_name, stderr
-                                    );
-                                }
-                            }
-                        }
-                    }
-                },
-                other => {
-                    last = (other.map(str::to_string), None, None);
+            if let Ok(content) = std::fs::read_to_string(marker) {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.parse::<i32>().ok();
                 }
             }
             if start.elapsed() >= budget {
                 eprintln!(
-                    "pane_exit_status: giving up on {}: last dead={:?} status={:?} signal={:?}",
-                    self.session_name, last.0, last.1, last.2
+                    "pane_exit_status: marker {} never populated for {}",
+                    marker.display(),
+                    self.session_name
                 );
                 return None;
             }
