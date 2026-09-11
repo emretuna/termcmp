@@ -243,6 +243,16 @@ fn run_proxy(
 
     tracing::info!(shell = %Path::new(&shell).display(), "starting termcmp proxy");
 
+    // Ignore SIGPIPE: during teardown the reader/supervisor may write to a peer
+    // that has already closed, which on the default disposition would kill the
+    // proxy with a signal. Daemons ignore SIGPIPE and surface EPIPE on the
+    // existing Result paths instead.
+    // SAFETY: setting signal disposition is a process-global effect but is
+    // idempotent and performed before any fork/threads that could race it.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
     // Fork reader BEFORE tokio runtime (fork-after-threads is UB)
     // Create UnixStream pair for reader→supervisor communication
     let (reader_stream, supervisor_stream) =
