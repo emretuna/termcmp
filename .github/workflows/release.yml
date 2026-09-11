@@ -278,22 +278,19 @@ jobs:
           set -e
           shopt -s nullglob
           found=0
-          for f in /tmp/artifacts/*.tar.gz /tmp/artifacts/*.tar.xz; do
-            # cargo-dist emits a `source.tar.gz` global artifact (the repo tree,
-            # no compiled binary). It is not a packaged app and must not be
-            # smoke-tested: smoking it fails with "no executable termcmp
-            # in archive" and (set -e) aborts the step before the real binary
-            # tarballs are ever checked. Skip it; `found` stays gated on real
-            # binaries so an all-source artifact set still fails closed below.
-            if [[ "$(basename "$f")" == "source.tar.gz" ]]; then
-              echo "skip: source tarball $(basename "$f") (not a packaged binary)"
-              continue
-            fi
+          # Only macOS (apple-darwin) artifacts are smoke-tested here; the
+          # Linux job handles ELF tarballs against a Linux runner. Scoping
+          # the glob is load-bearing: without it, the Linux aarch64 ELF is
+          # fed to this script, its file(1) output ("ELF ... ARM aarch64 ...")
+          # matches the arm64:*aarch64* execute branch below, and macOS tries
+          # to exec the ELF (exit 126). `source.tar.gz` (no binary) never
+          # matches this glob, so it needs no explicit skip.
+          for f in /tmp/artifacts/*apple*.tar.gz /tmp/artifacts/*apple*.tar.xz; do
             found=1
             ./scripts/check-release-artifact-smoke.sh "$f"
           done
           if [[ "$found" == "0" ]]; then
-            echo "FAIL: no .tar.gz/.tar.xz artifacts to smoke" >&2
+            echo "FAIL: no macOS .tar.gz/.tar.xz artifacts to smoke" >&2
             exit 1
           fi
 
