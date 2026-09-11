@@ -1409,10 +1409,15 @@ pub async fn run_proxy(
     // raises SIGTTOU whose default action stops us mid-shutdown. Ignore
     // SIGTTOU/SIGTTIN for the duration of teardown (the POSIX-sanctioned
     // pattern), join the original pgrp, and hand the tty back.
+    // Also ignore SIGTERM: tmux sends it to the pane process group when the
+    // shell exits, but we need to complete teardown and propagate the shell's
+    // exit status before dying.
     unsafe {
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
         libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
     }
+
     if let Some(orig) = initial_outer_fg {
         unsafe {
             libc::setpgid(0, orig); // best-effort; ignore failure
