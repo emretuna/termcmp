@@ -243,14 +243,50 @@ fn run_proxy(
 
     tracing::info!(shell = %Path::new(&shell).display(), "starting termcmp proxy");
 
-    // Ignore SIGPIPE: during teardown the reader/supervisor may write to a peer
-    // that has already closed, which on the default disposition would kill the
-    // proxy with a signal. Daemons ignore SIGPIPE and surface EPIPE on the
-    // existing Result paths instead.
+    // Ignore SIGPIPE: during teardown the reader/supervisor may write to a closed peer
+    // socket, which on the default disposition would kill the proxy with a signal.
+    // Daemons ignore SIGPIPE and surface EPIPE on the existing Result paths instead.
     // SAFETY: setting signal disposition is a process-global effect but is
     // idempotent and performed before any fork/threads that could race it.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
+    // Install signal handlers that log which signal killed us before exiting.
+    // This helps diagnose test failures where the proxy dies by signal on Linux.
+    // SAFETY: signal handlers are process-global but we only install once at startup.
+    unsafe extern "C" fn signal_handler(sig: libc::c_int) {
+        let sig_name = match sig {
+            libc::SIGHUP => "SIGHUP",
+            libc::SIGINT => "SIGINT",
+            libc::SIGQUIT => "SIGQUIT",
+            libc::SIGTERM => "SIGTERM",
+            libc::SIGUSR1 => "SIGUSR1",
+            libc::SIGUSR2 => "SIGUSR2",
+            libc::SIGALRM => "SIGALRM",
+            libc::SIGCHLD => "SIGCHLD",
+            libc::SIGCONT => "SIGCONT",
+            libc::SIGSTOP => "SIGSTOP",
+            libc::SIGTSTP => "SIGTSTP",
+            libc::SIGTTIN => "SIGTTIN",
+            libc::SIGTTOU => "SIGTTOU",
+            _ => "UNKNOWN",
+        };
+        eprintln!("[SIGNAL] termcmp killed by signal {} ({})", sig, sig_name);
+        libc::_exit(128 + sig);
+    }
+    unsafe {
+        for sig in [
+            libc::SIGHUP,
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGTERM,
+            libc::SIGUSR1,
+            libc::SIGUSR2,
+            libc::SIGALRM,
+        ] {
+            libc::signal(sig, signal_handler as *const () as libc::sighandler_t);
+        }
     }
 
     // Fork reader BEFORE tokio runtime (fork-after-threads is UB)
