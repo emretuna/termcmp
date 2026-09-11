@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 buffer = { path = "../buffer" }
 config = { path = "../config" }
-frizbee = "0.12"
+frizbee = "0.13"
 tokio = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
