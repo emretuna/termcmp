@@ -751,6 +751,19 @@ impl TmuxSession {
                     }
                     other => {
                         last = (Some("1".to_string()), other.map(str::to_string));
+                        // Signal death detected — dump pane stderr for diagnostics
+                        if let Some(pane_id) = query("#{pane_id}") {
+                            if let Ok(output) = std::process::Command::new("tmux")
+                                .args(["capture-pane", "-t", &pane_id, "-p", "-S", "-100"])
+                                .output()
+                            {
+                                let stderr = String::from_utf8_lossy(&output.stdout);
+                                eprintln!(
+                                    "=== Pane stderr (last 100 lines) for {} ===\n{}",
+                                    self.session_name, stderr
+                                );
+                            }
+                        }
                     }
                 },
                 other => {
