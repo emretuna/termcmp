@@ -715,33 +715,56 @@ impl TmuxSession {
 
     /// Get the pane exit status. Requires `remain-on-exit on` (set at spawn)
     /// so the dead pane stays queryable; returns None while the pane lives.
+    ///
+    /// Retries briefly instead of single-shotting: right after pane death
+    /// tmux is still transitioning pane state, and an immediate query can
+    /// fail (or report pre-death state) even though `wait_for_pane_close`
+    /// just observed `pane_dead=1`. A single failed query must not
+    /// masquerade as "no status". Only a successful `pane_dead=0` report
+    /// (truly alive) or the retry budget yields None.
     pub fn pane_exit_status(&self) -> Option<i32> {
-        let alive = std::process::Command::new("tmux")
-            .args([
-                "display-message",
-                "-t",
-                &self.session_name,
-                "-p",
-                "#{pane_dead}",
-            ])
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-        match alive.as_deref() {
-            Some("1") => {
-                let status = std::process::Command::new("tmux")
-                    .args([
-                        "display-message",
-                        "-t",
-                        &self.session_name,
-                        "-p",
-                        "#{pane_dead_status}",
-                    ])
-                    .output()
-                    .expect("failed to query pane_dead_status");
-                String::from_utf8_lossy(&status.stdout).trim().parse().ok()
+        let query = |format: &str| {
+            std::process::Command::new("tmux")
+                .args(["display-message", "-t", &self.session_name, "-p", format])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        };
+        let start = std::time::Instant::now();
+        let budget = Duration::from_secs(3);
+        // Last-seen (dead, status) for the give-up diagnostic. Single tuple
+        // assigned on every path (no dead initializer for unused_assignments).
+        let mut last: (Option<String>, Option<String>);
+        loop {
+            match query("#{pane_dead}").as_deref() {
+                Some("1") => match query("#{pane_dead_status}").as_deref() {
+                    Some(s) if !s.is_empty() => {
+                        let parsed: Option<i32> = s.parse().ok();
+                        if parsed.is_none() {
+                            eprintln!(
+                                "pane_exit_status: unparseable dead_status for {}: {:?}",
+                                self.session_name, s
+                            );
+                        }
+                        return parsed;
+                    }
+                    other => {
+                        last = (Some("1".to_string()), other.map(str::to_string));
+                    }
+                },
+                other => {
+                    last = (other.map(str::to_string), None);
+                }
             }
-            _ => None,
+            if start.elapsed() >= budget {
+                eprintln!(
+                    "pane_exit_status: giving up on {}: last dead={:?} status={:?}",
+                    self.session_name, last.0, last.1
+                );
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
