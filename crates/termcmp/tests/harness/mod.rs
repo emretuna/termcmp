@@ -79,7 +79,7 @@ fn tmux_pane_diag(session_name: &str) -> String {
         "-t",
         session_name,
         "-p",
-        "dead=#{pane_dead} dead_status=#{pane_dead_status} cmd=#{pane_current_command}",
+        "dead=#{pane_dead} dead_status=#{pane_dead_status} dead_signal=#{pane_dead_signal} cmd=#{pane_current_command}",
     ]);
     format!("tmux pane [{session_name}] state: {state}\n pane content:\n{pane}")
 }
@@ -733,9 +733,12 @@ impl TmuxSession {
         };
         let start = std::time::Instant::now();
         let budget = Duration::from_secs(3);
-        // Last-seen (dead, status) for the give-up diagnostic. Single tuple
-        // assigned on every path (no dead initializer for unused_assignments).
-        let mut last: (Option<String>, Option<String>);
+        // Last-seen (dead, status, signal) for the give-up diagnostic. Single
+        // tuple assigned on every path (no dead initializer for unused_assignments).
+        let mut last: (Option<String>, Option<String>, Option<String>);
+        // The pane is static once dead — dump its content exactly once, not on
+        // every 50ms poll, or the CI log floods with ~60 identical dumps.
+        let mut dumped = false;
         loop {
             match query("#{pane_dead}").as_deref() {
                 Some("1") => match query("#{pane_dead_status}").as_deref() {
@@ -750,30 +753,53 @@ impl TmuxSession {
                         return parsed;
                     }
                     other => {
-                        last = (Some("1".to_string()), other.map(str::to_string));
-                        // Signal death detected — dump pane stderr for diagnostics
-                        if let Some(pane_id) = query("#{pane_id}") {
-                            if let Ok(output) = std::process::Command::new("tmux")
-                                .args(["capture-pane", "-t", &pane_id, "-p", "-S", "-100"])
-                                .output()
-                            {
-                                let stderr = String::from_utf8_lossy(&output.stdout);
-                                eprintln!(
-                                    "=== Pane stderr (last 100 lines) for {} ===\n{}",
-                                    self.session_name, stderr
-                                );
+                        let dead_signal = query("#{pane_dead_signal}");
+                        last = (
+                            Some("1".to_string()),
+                            other.map(str::to_string),
+                            dead_signal.clone(),
+                        );
+                        // Signal death detected — tmux's #{pane_dead_signal} names
+                        // the exact killer even when it has default disposition
+                        // (SIGKILL/SIGSEGV/SIGABRT), which a product-side handler
+                        // can never catch. Dump pane content once for any
+                        // proxy-side panic/backtrace rendered before death.
+                        if !dumped {
+                            dumped = true;
+                            eprintln!(
+                                "pane_exit_status: signal death for {}: dead_signal={:?}",
+                                self.session_name, dead_signal
+                            );
+                            if let Some(pane_id) = query("#{pane_id}") {
+                                let args = if pane_id.is_empty() {
+                                    vec!["-t", self.session_name.as_str()]
+                                } else {
+                                    vec!["-t", pane_id.as_str()]
+                                };
+                                if let Ok(output) = std::process::Command::new("tmux")
+                                    .args(["capture-pane"])
+                                    .args(&args)
+                                    .args(["-p", "-S", "-100"])
+                                    .output()
+                                {
+                                    let stderr = String::from_utf8_lossy(&output.stdout);
+                                    eprintln!(
+                                        "=== Pane content (last 100 lines) for {} ===\n{}",
+                                        self.session_name, stderr
+                                    );
+                                }
                             }
                         }
                     }
                 },
                 other => {
-                    last = (other.map(str::to_string), None);
+                    last = (other.map(str::to_string), None, None);
                 }
             }
             if start.elapsed() >= budget {
                 eprintln!(
-                    "pane_exit_status: giving up on {}: last dead={:?} status={:?}",
-                    self.session_name, last.0, last.1
+                    "pane_exit_status: giving up on {}: last dead={:?} status={:?} signal={:?}",
+                    self.session_name, last.0, last.1, last.2
                 );
                 return None;
             }
