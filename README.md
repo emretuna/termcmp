@@ -6,7 +6,7 @@ Terminal autocompletion via frizbee fuzzy matching. A PTY proxy that sits betwee
 
 ```sh
 # Homebrew (macOS)
-brew install termcmp/tap/termcmp
+brew install EmreTuna/tap/termcmp
 
 # Cargo
 cargo install https://github.com/emretuna/termcmp
