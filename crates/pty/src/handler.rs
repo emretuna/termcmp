@@ -260,8 +260,13 @@ fn macos_proc_name(pid: libc::pid_t) -> Option<String> {
 /// the alt screen, but some Bun/Ink/omp apps don't, so `in_prompt` is the
 /// primary gate. The `blocklist` is checked against the foreground process
 /// name to suppress Go TUI apps that don't use alt screen.
-fn popup_eligible(in_prompt: bool, in_alt_screen: bool, blocklist: &[&str]) -> bool {
-    if !in_prompt || in_alt_screen {
+fn popup_eligible(
+    in_prompt: bool,
+    in_alt_screen: bool,
+    in_secure_input: bool,
+    blocklist: &[&str],
+) -> bool {
+    if !in_prompt || in_alt_screen || in_secure_input {
         return false;
     }
     // Check if foreground process is in blocklist
@@ -1948,18 +1953,23 @@ impl InputHandler {
     }
     pub fn trigger(&mut self, parser: &Arc<Mutex<TerminalParser>>, stdout: &mut dyn Write) {
         {
-            let (in_alt, at_prompt) = match parser.lock() {
-                Ok(p) => (p.state().in_alt_screen(), p.state().in_prompt()),
-                Err(_) => (false, false),
+            let (in_alt, at_prompt, in_secure) = match parser.lock() {
+                Ok(p) => (
+                    p.state().in_alt_screen(),
+                    p.state().in_prompt(),
+                    p.state().in_secure_input(),
+                ),
+                Err(_) => (false, false, false),
             };
             // Prompt markers are authoritative; alternate-screen remains a
             // defense-in-depth check for applications that leave it enabled.
             let blocklist = self.effective_tui_blocklist();
-            if !popup_eligible(at_prompt, in_alt, &blocklist) {
+            if !popup_eligible(at_prompt, in_alt, in_secure, &blocklist) {
                 tracing::debug!(
-                    "suppressing popup: in_alt_screen={}, in_prompt={}",
+                    "suppressing popup: in_alt_screen={}, in_prompt={}, in_secure_input={}",
                     in_alt,
-                    at_prompt
+                    at_prompt,
+                    in_secure
                 );
                 return;
             }
@@ -2135,12 +2145,16 @@ impl InputHandler {
         // Same eligibility gate as trigger(): suppress popups when not at prompt or in alt screen.
         // The debounce loop calls this instead of trigger(), so it must enforce the same rules.
         {
-            let (in_alt, at_prompt) = match parser.lock() {
-                Ok(p) => (p.state().in_alt_screen(), p.state().in_prompt()),
-                Err(_) => (false, false),
+            let (in_alt, at_prompt, in_secure) = match parser.lock() {
+                Ok(p) => (
+                    p.state().in_alt_screen(),
+                    p.state().in_prompt(),
+                    p.state().in_secure_input(),
+                ),
+                Err(_) => (false, false, false),
             };
             let blocklist = self.effective_tui_blocklist();
-            if !popup_eligible(at_prompt, in_alt, &blocklist) {
+            if !popup_eligible(at_prompt, in_alt, in_secure, &blocklist) {
                 return TriggerPrepared::Painted;
             }
         }
@@ -2314,12 +2328,16 @@ impl InputHandler {
         // Gate: only apply results when popup is still eligible (at prompt, not in alt screen).
         // This prevents late async results from rendering after command execution starts.
         {
-            let (in_alt, at_prompt) = match parser.lock() {
-                Ok(p) => (p.state().in_alt_screen(), p.state().in_prompt()),
+            let (in_alt, at_prompt, in_secure) = match parser.lock() {
+                Ok(p) => (
+                    p.state().in_alt_screen(),
+                    p.state().in_prompt(),
+                    p.state().in_secure_input(),
+                ),
                 Err(_) => return,
             };
             let blocklist = self.effective_tui_blocklist();
-            if !popup_eligible(at_prompt, in_alt, &blocklist) {
+            if !popup_eligible(at_prompt, in_alt, in_secure, &blocklist) {
                 // Drop all pending results — they're stale now.
                 self.dynamic_rx = None;
                 self.dynamic_task = None;
@@ -2610,12 +2628,16 @@ impl InputHandler {
         // Gate: only merge results when popup is still eligible (at prompt, not in alt screen).
         // This prevents late async results from rendering after command execution starts.
         {
-            let (in_alt, at_prompt) = match parser.lock() {
-                Ok(p) => (p.state().in_alt_screen(), p.state().in_prompt()),
+            let (in_alt, at_prompt, in_secure) = match parser.lock() {
+                Ok(p) => (
+                    p.state().in_alt_screen(),
+                    p.state().in_prompt(),
+                    p.state().in_secure_input(),
+                ),
                 Err(_) => return false,
             };
             let blocklist = self.effective_tui_blocklist();
-            if !popup_eligible(at_prompt, in_alt, &blocklist) {
+            if !popup_eligible(at_prompt, in_alt, in_secure, &blocklist) {
                 // Drop all pending results — they're stale now.
                 self.dynamic_rx = None;
                 self.dynamic_task = None;
@@ -4695,6 +4717,41 @@ mod tests {
             !handler.visible,
             "trigger() must act once the alt screen is gone"
         );
+    }
+    #[test]
+    fn test_trigger_suppressed_while_secure_input_active() {
+        // A password reader disabled echo on the inner slave. trigger()
+        // must not render a popup over it — it early-returns before
+        // touching any state, same shape as the alt-screen gate.
+        let mut handler = make_visible_handler(vec![Suggestion {
+            text: "prior".to_string(),
+            ..Default::default()
+        }]);
+        let parser = Arc::new(Mutex::new(parser::TerminalParser::new(24, 80)));
+        parser.lock().unwrap().process_bytes(b"\x1b]133;A\x07"); // in_prompt = true
+        parser.lock().unwrap().state_mut().set_secure_input(true);
+        assert!(
+            parser.lock().unwrap().state().in_secure_input(),
+            "setup: secure input must be active"
+        );
+
+        let mut buf = Vec::new();
+        handler.trigger(&parser, &mut buf);
+        assert!(
+            handler.visible,
+            "popup must stay untouched while echo is disabled"
+        );
+        assert!(buf.is_empty(), "no render bytes while secure input active");
+
+        let mut prepared = Vec::new();
+        assert!(
+            matches!(
+                handler.prepare_trigger_with_block(&parser, &mut prepared),
+                TriggerPrepared::Painted
+            ),
+            "prepare path must take the same early return under secure input"
+        );
+        assert!(prepared.is_empty());
     }
 
     #[test]
@@ -9821,11 +9878,11 @@ mod tests {
         assert!(!blocklist.contains(&"zsh"), "zsh should not be blocked");
         // popup_eligible with empty vs default: zsh is allowed
         assert!(
-            popup_eligible(true, false, &[]),
+            popup_eligible(true, false, false, &[]),
             "empty blocklist must allow zsh at prompt"
         );
         assert!(
-            popup_eligible(true, false, DEFAULT_TUI_BLOCKLIST),
+            popup_eligible(true, false, false, DEFAULT_TUI_BLOCKLIST),
             "zsh at prompt with default blocklist must be allowed (foreground is not omp)"
         );
         // effective blocklist for fresh handler also allows zsh
@@ -9839,16 +9896,20 @@ mod tests {
         let empty: &[&str] = &[];
         // Empty blocklist must allow any process, and popup_eligible must allow when at prompt
         assert!(
-            popup_eligible(true, false, empty),
+            popup_eligible(true, false, false, empty),
             "empty blocklist must allow at prompt"
         );
         assert!(
-            !popup_eligible(false, false, empty),
+            !popup_eligible(false, false, false, empty),
             "not at prompt must still suppress even with empty blocklist"
         );
         assert!(
-            !popup_eligible(true, true, empty),
+            !popup_eligible(true, true, false, empty),
             "alt screen must suppress even with empty blocklist"
+        );
+        assert!(
+            !popup_eligible(true, false, true, empty),
+            "secure input must suppress even with empty blocklist"
         );
         // InputHandler with empty custom blocklist: effective is just default, but if we
         // consider truly empty (helper), it allows all
@@ -9860,7 +9921,7 @@ mod tests {
             "effective with empty custom still has defaults"
         );
         // Truly empty via direct call
-        assert!(popup_eligible(true, false, &[]));
+        assert!(popup_eligible(true, false, false, &[]));
     }
     #[tokio::test]
     async fn test_trigger_skips_async_providers_for_zoxide_context() {

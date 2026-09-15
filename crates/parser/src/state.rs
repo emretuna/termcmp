@@ -106,6 +106,13 @@ pub struct TerminalState {
     /// Set sites: `set_command_buffer`. Clear sites: `clear_command_buffer`,
     /// `mark_display_dirty`.
     buffer_pending_display: bool,
+    /// True while the inner PTY has terminal echo disabled (password prompt:
+    /// `sudo`/`su`/`passwd`/SSH passphrase/`read -s`/`stty -echo`). Suppresses
+    /// popup rendering and dismisses any visible popup on entry.
+    in_secure_input: bool,
+    /// One-shot: set when `in_secure_input` toggled this batch. Drained by the
+    /// proxy's stdout task to dismiss popups on secure-input entry.
+    secure_input_changed: bool,
     /// True while a TUI app (nvim, less, tmux) owns the alternate screen via
     /// DECSET 1049/47/1047. Suppresses popup rendering and dismisses any
     /// visible popup on transition.
@@ -168,6 +175,8 @@ impl TerminalState {
             buffer_cursor: 0,
             buffer_dirty: false,
             buffer_pending_display: false,
+            in_secure_input: false,
+            secure_input_changed: false,
             in_alt_screen: false,
             alt_screen_changed: false,
             prompt_changed: false,
@@ -628,7 +637,7 @@ impl TerminalState {
     /// describe events on the (now-cleared) buffer, so they are dropped here —
     /// otherwise a pending consumer would act on a stale event for a buffer that
     /// no longer exists. Mirrors `set_command_buffer`, which raises both flags.
-    pub(crate) fn clear_command_buffer(&mut self) {
+    pub fn clear_command_buffer(&mut self) {
         self.command_buffer = None;
         self.buffer_cursor = 0;
         self.buffer_dirty = false;
@@ -661,6 +670,28 @@ impl TerminalState {
     pub fn take_alt_screen_changed(&mut self) -> bool {
         let v = self.alt_screen_changed;
         self.alt_screen_changed = false;
+        v
+    }
+
+    /// True while the inner PTY has terminal echo disabled (password prompt).
+    /// The proxy suppresses popup triggers while this is set.
+    pub fn in_secure_input(&self) -> bool {
+        self.in_secure_input
+    }
+
+    pub fn set_secure_input(&mut self, enabled: bool) {
+        if self.in_secure_input != enabled {
+            self.in_secure_input = enabled;
+            self.secure_input_changed = true;
+        }
+    }
+
+    /// One-shot: reports whether the secure-input state toggled since the last
+    /// drain, then clears the flag. The proxy's stdout task uses this to
+    /// dismiss any visible popup when a password prompt starts.
+    pub fn take_secure_input_changed(&mut self) -> bool {
+        let v = self.secure_input_changed;
+        self.secure_input_changed = false;
         v
     }
 
@@ -1129,6 +1160,26 @@ mod tests {
         state.clear_command_buffer();
         assert!(!state.take_buffer_dirty());
         assert!(!state.buffer_pending_display());
+    }
+    #[test]
+    fn secure_input_changed_fires_once_per_toggle() {
+        let mut state = TerminalState::new(24, 80);
+        assert!(!state.in_secure_input());
+        assert!(!state.take_secure_input_changed());
+
+        state.set_secure_input(true);
+        assert!(state.in_secure_input());
+        assert!(state.take_secure_input_changed());
+        assert!(!state.take_secure_input_changed());
+
+        // Re-setting the same value is a no-op transition: no one-shot.
+        state.set_secure_input(true);
+        assert!(!state.take_secure_input_changed());
+
+        state.set_secure_input(false);
+        assert!(!state.in_secure_input());
+        assert!(state.take_secure_input_changed());
+        assert!(!state.take_secure_input_changed());
     }
 
     #[test]

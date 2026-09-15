@@ -60,6 +60,20 @@ fn detect_shell_kind(shell: &OsStr) -> ShellKind {
         _ => ShellKind::Other,
     }
 }
+/// Reports whether the inner PTY currently has terminal echo enabled.
+///
+/// Password readers (`sudo`, `su`, `passwd`, SSH passphrases, `read -s`,
+/// `stty -echo`) disable `ECHO` on the slave; polling the master's termios
+/// detects them uniformly without process-name or prompt-text heuristics.
+/// Fails open (`true`) on any `tcgetattr` error so a transient failure
+/// preserves current popup behavior.
+fn inner_echo_enabled(fd: std::os::fd::RawFd) -> bool {
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
+        return true;
+    }
+    (termios.c_lflag & libc::ECHO) != 0
+}
 
 /// Run the PTY proxy event loop. This is the main entry point for the proxy.
 ///
@@ -388,6 +402,7 @@ pub async fn run_proxy(
 
     let parser_for_stdin = Arc::clone(&parser);
     let handler_for_stdin = Arc::clone(&handler);
+    let inner_fd_stdin = inner_master_fd;
     let stdin_handle = tokio::task::spawn_blocking(move || {
         let mut reader_stream = reader_stream;
         let mut buf = [0u8; 4096];
@@ -403,16 +418,21 @@ pub async fn run_proxy(
                 }
                 Err(_) => break,
             };
-
-            // When a TUI app owns the alt screen (nvim, btop, etc.),
-            // forward stdin bytes verbatim — no parsing, no interception.
-            // Kitty CSI u sequences must reach the app unmodified;
-            // re-encoding them as legacy bytes corrupts TUI input.
+            // When a TUI app owns the alt screen (nvim, btop, etc.), or the
+            // inner PTY has echo disabled (password prompt: sudo/su/passwd/SSH
+            // passphrase/`read -s`/`stty -echo`), forward stdin bytes verbatim —
+            // no parsing, no interception. Kitty CSI u sequences must reach the
+            // app unmodified; re-encoding them as legacy bytes corrupts TUI
+            // input. Echo is polled directly (not via the parser flag Task B
+            // publishes) so keystrokes in the race window between echo-off
+            // onset and Task B's flag update are still forwarded byte-for-byte.
             let in_alt = match parser_for_stdin.lock() {
                 Ok(p) => p.state().in_alt_screen(),
                 Err(_) => false,
             };
-            if in_alt {
+            // Fail open: a transient `tcgetattr` error keeps the parsed path.
+            let in_secure = !inner_echo_enabled(inner_fd_stdin);
+            if in_alt || in_secure {
                 let mut raw = key_parser.drain_pending();
                 raw.extend_from_slice(&buf[..n]);
                 if !raw.is_empty() {
@@ -421,7 +441,7 @@ pub async fn run_proxy(
                             if write_pty_or_shutdown(
                                 w.as_mut(),
                                 &raw,
-                                "forward raw input in alt screen",
+                                "forward raw input in alt screen or secure input",
                             )
                             .is_err()
                             {
@@ -727,6 +747,7 @@ pub async fn run_proxy(
     let parser_for_stdout = Arc::clone(&parser);
     let handler_for_stdout = Arc::clone(&handler);
     let debounce_notify_b = Arc::clone(&debounce_notify);
+    let inner_fd_stdout = inner_master_fd;
     let stdout_handle = tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 8192];
         let mut pending_trigger = PendingTrigger::new();
@@ -758,6 +779,27 @@ pub async fn run_proxy(
                     state.take_viewport_scroll_count(),
                 )
             };
+            // Publish kernel echo state: password readers disable ECHO on the
+            // inner slave. Poll once per iteration (one cheap `tcgetattr`,
+            // same order as the per-keystroke ISIG check in Task A) and
+            // publish into parser state; the secure-input drain below
+            // dismisses popups on entry. Fail open: a transient error keeps
+            // the current flag (current behavior).
+            {
+                let echo_on = inner_echo_enabled(inner_fd_stdout);
+                match parser_for_stdout.lock() {
+                    Ok(mut p) => {
+                        let state = p.state_mut();
+                        if state.in_secure_input() == echo_on {
+                            state.set_secure_input(!echo_on);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("parser mutex poisoned in stdout task (secure_input): {e}");
+                        break;
+                    }
+                }
+            }
 
             // Lock ordering: take the parser lock to enqueue Ours, drop
             // it BEFORE acquiring stdout. Task A holds parser briefly to
@@ -923,6 +965,66 @@ pub async fn run_proxy(
                             write_overlay_if_current(&handler_for_stdout, cleanup_ticket, &cleanup)
                         {
                             tracing::debug!("Task B alt-screen cleanup write failed: {e}");
+                            break;
+                        }
+                    }
+                }
+            }
+            // Drain secure_input_changed: if a password reader just disabled
+            // echo on the inner slave, dismiss any visible popup, invalidate
+            // in-flight async generations, reset the keystroke input model,
+            // and clear the parser command buffer so no password bytes linger
+            // in buffer models. Subsequent trigger() calls are gated by
+            // state.in_secure_input() inside trigger() (see handler.rs).
+            // On exit (echo restored) only the state update matters; the next
+            // prompt marker resyncs normally.
+            {
+                let (secure_changed, in_secure) = match parser_for_stdout.lock() {
+                    Ok(mut p) => {
+                        let state = p.state_mut();
+                        let changed = state.take_secure_input_changed();
+                        (changed, state.in_secure_input())
+                    }
+                    Err(e) => {
+                        tracing::warn!("parser mutex poisoned in stdout task (secure_input): {e}");
+                        break;
+                    }
+                };
+                if secure_changed && in_secure {
+                    {
+                        match parser_for_stdout.lock() {
+                            Ok(mut p) => p.state_mut().clear_command_buffer(),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "parser mutex poisoned in stdout task (secure_input clear): {e}"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    let mut cleanup = Vec::new();
+                    let cleanup_ticket = {
+                        let mut h = match handler_for_stdout.lock() {
+                            Ok(h) => h,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "handler mutex poisoned in stdout task (secure_input): {e}"
+                                );
+                                break;
+                            }
+                        };
+                        // dismiss() no-ops when no popup is visible, so it is
+                        // safe even when echo was toggled without a popup.
+                        h.dismiss(&mut cleanup);
+                        h.invalidate_inflight_generations();
+                        h.reset_input_model();
+                        h.overlay_write_ticket()
+                    };
+                    if !cleanup.is_empty() {
+                        if let Err(e) =
+                            write_overlay_if_current(&handler_for_stdout, cleanup_ticket, &cleanup)
+                        {
+                            tracing::debug!("Task B secure-input cleanup write failed: {e}");
                             break;
                         }
                     }

@@ -527,3 +527,39 @@ fn test_popup_renders_for_osc_with_inline_display_byte() {
     proc.send_line("");
     proc.exit_with_code(0);
 }
+
+/// While the inner PTY has echo disabled (`stty -echo`), termcmp must never
+/// render a popup and must forward keystrokes verbatim — Tab/Esc/manual
+/// trigger included. Never calls `advance_display` while echo is off (it
+/// assumes kernel ECHO). Each phase parks the shell in `read` behind
+/// `stty -echo` so probe bytes land in the reader, not the command line.
+#[test]
+fn test_secure_input_suppresses_popup_and_forwards_verbatim() {
+    let mut proc = TermcmpProcess::spawn();
+    proc.send_line("echo secure_smoke_ready_marker");
+    proc.expect_output("secure_smoke_ready_marker");
+
+    // At-prompt state: shell integrations normally emit OSC 133;A, but the
+    // secure gate must suppress regardless.
+    proc.send_line("printf '\\033]133;A\\007'");
+    thread::sleep(Duration::from_millis(200));
+
+    // Phase 1: intercept-probe. Park the shell in `read` with echo off,
+    // then send the keys termcmp would normally consume (Tab, Esc, manual
+    // trigger 0x1F) plus Enter to terminate `read`. No popup may render.
+    proc.send_line("stty -echo; read probe; stty echo");
+    thread::sleep(Duration::from_millis(1000));
+    let mark = proc.output_len();
+    proc.write_raw(b"\x09\x1b\x1f\r");
+    assert!(
+        !proc.wait_for_bytes_after(POPUP_RENDER_MARKER, mark, Duration::from_secs(5)),
+        "popup rendered while inner PTY echo was disabled"
+    );
+    // `read probe` consumed the probe line; the shell ran `stty echo` and
+    // is back at a prompt. Phase 2: verbatim check with printable bytes.
+    proc.send_line("stty -echo; read got; stty echo; echo GOT_IS:$got");
+    thread::sleep(Duration::from_millis(1000));
+    proc.write_raw(b"p@ssw0rd\r");
+    proc.expect_output("GOT_IS:p@ssw0rd");
+    proc.exit_with_code(0);
+}
