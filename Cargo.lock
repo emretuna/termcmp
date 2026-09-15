@@ -135,7 +135,7 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "buffer"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "bumpalo"
@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1021,7 +1021,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "llm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "buffer",
@@ -1166,7 +1166,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "overlay"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "config",
@@ -1211,7 +1211,7 @@ dependencies = [
 
 [[package]]
 name = "parser"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "criterion",
@@ -1330,7 +1330,7 @@ dependencies = [
 
 [[package]]
 name = "pty"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "buffer",
@@ -1886,7 +1886,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "suggest"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "buffer",
@@ -1962,7 +1962,7 @@ dependencies = [
 
 [[package]]
 name = "termcmp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cargo-husky",
@@ -1986,7 +1986,7 @@ dependencies = [
 
 [[package]]
 name = "terminal"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "thiserror"
