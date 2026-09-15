@@ -60,19 +60,24 @@ fn detect_shell_kind(shell: &OsStr) -> ShellKind {
         _ => ShellKind::Other,
     }
 }
-/// Reports whether the inner PTY currently has terminal echo enabled.
-///
+/// Reports whether the inner PTY is in secure input (password prompt).
 /// Password readers (`sudo`, `su`, `passwd`, SSH passphrases, `read -s`,
-/// `stty -echo`) disable `ECHO` on the slave; polling the master's termios
-/// detects them uniformly without process-name or prompt-text heuristics.
-/// Fails open (`true`) on any `tcgetattr` error so a transient failure
-/// preserves current popup behavior.
-fn inner_echo_enabled(fd: std::os::fd::RawFd) -> bool {
+/// `stty -echo` + reader) disable `ECHO` while keeping `ICANON` on: the
+/// reader needs line-buffered canonical input, just without echoing it.
+/// Interactive line editors (readline/ZLE) instead take the slave fully out
+/// of canonical mode (`ECHO` off *and* `ICANON` off) at every prompt for
+/// their own redisplay, so kernel `ECHO` alone cannot be the password
+/// signal — it is persistently off at bash/zsh prompts and would pin
+/// secure-input true forever. Polling the master's termios detects the
+/// `!ECHO && ICANON` combination uniformly without process-name or
+/// prompt-text heuristics. Fails closed (`false`) on any `tcgetattr` error
+/// so a transient failure preserves current popup behavior.
+fn inner_secure_input(fd: std::os::fd::RawFd) -> bool {
     let mut termios: libc::termios = unsafe { std::mem::zeroed() };
     if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
-        return true;
+        return false;
     }
-    (termios.c_lflag & libc::ECHO) != 0
+    (termios.c_lflag & libc::ECHO) == 0 && (termios.c_lflag & libc::ICANON) != 0
 }
 
 /// Run the PTY proxy event loop. This is the main entry point for the proxy.
@@ -419,19 +424,20 @@ pub async fn run_proxy(
                 Err(_) => break,
             };
             // When a TUI app owns the alt screen (nvim, btop, etc.), or the
-            // inner PTY has echo disabled (password prompt: sudo/su/passwd/SSH
-            // passphrase/`read -s`/`stty -echo`), forward stdin bytes verbatim —
-            // no parsing, no interception. Kitty CSI u sequences must reach the
-            // app unmodified; re-encoding them as legacy bytes corrupts TUI
-            // input. Echo is polled directly (not via the parser flag Task B
-            // publishes) so keystrokes in the race window between echo-off
-            // onset and Task B's flag update are still forwarded byte-for-byte.
+            // inner PTY is in secure input (password prompt: sudo/su/passwd/SSH
+            // passphrase/`read -s`/`stty -echo` + reader), forward stdin bytes
+            // verbatim — no parsing, no interception. Kitty CSI u sequences
+            // must reach the app unmodified; re-encoding them as legacy bytes
+            // corrupts TUI input. Secure input is polled directly (not via the
+            // parser flag Task B publishes) so keystrokes in the race window
+            // between echo-off onset and Task B's flag update are still
+            // forwarded byte-for-byte.
             let in_alt = match parser_for_stdin.lock() {
                 Ok(p) => p.state().in_alt_screen(),
                 Err(_) => false,
             };
-            // Fail open: a transient `tcgetattr` error keeps the parsed path.
-            let in_secure = !inner_echo_enabled(inner_fd_stdin);
+            // Fail closed: a transient `tcgetattr` error keeps the parsed path.
+            let in_secure = inner_secure_input(inner_fd_stdin);
             if in_alt || in_secure {
                 let mut raw = key_parser.drain_pending();
                 raw.extend_from_slice(&buf[..n]);
@@ -779,19 +785,19 @@ pub async fn run_proxy(
                     state.take_viewport_scroll_count(),
                 )
             };
-            // Publish kernel echo state: password readers disable ECHO on the
-            // inner slave. Poll once per iteration (one cheap `tcgetattr`,
-            // same order as the per-keystroke ISIG check in Task A) and
-            // publish into parser state; the secure-input drain below
-            // dismisses popups on entry. Fail open: a transient error keeps
-            // the current flag (current behavior).
+            // Publish kernel secure-input state: password readers disable ECHO
+            // while keeping ICANON on. Poll once per iteration (one cheap
+            // `tcgetattr`, same order as the per-keystroke ISIG check in
+            // Task A) and publish into parser state; the secure-input drain
+            // below dismisses popups on entry. Fail closed: a transient error
+            // reports not-secure, preserving current popup behavior.
             {
-                let echo_on = inner_echo_enabled(inner_fd_stdout);
+                let in_secure = inner_secure_input(inner_fd_stdout);
                 match parser_for_stdout.lock() {
                     Ok(mut p) => {
                         let state = p.state_mut();
-                        if state.in_secure_input() == echo_on {
-                            state.set_secure_input(!echo_on);
+                        if state.in_secure_input() != in_secure {
+                            state.set_secure_input(in_secure);
                         }
                     }
                     Err(e) => {
@@ -970,14 +976,14 @@ pub async fn run_proxy(
                     }
                 }
             }
-            // Drain secure_input_changed: if a password reader just disabled
-            // echo on the inner slave, dismiss any visible popup, invalidate
-            // in-flight async generations, reset the keystroke input model,
-            // and clear the parser command buffer so no password bytes linger
-            // in buffer models. Subsequent trigger() calls are gated by
-            // state.in_secure_input() inside trigger() (see handler.rs).
-            // On exit (echo restored) only the state update matters; the next
-            // prompt marker resyncs normally.
+            // Drain secure_input_changed: if a password reader just entered
+            // the echo-off + canonical state on the inner slave, dismiss any
+            // visible popup, invalidate in-flight async generations, reset the
+            // keystroke input model, and clear the parser command buffer so no
+            // password bytes linger in buffer models. Subsequent trigger()
+            // calls are gated by state.in_secure_input() inside trigger()
+            // (see handler.rs). On exit (echo restored) only the state update
+            // matters; the next prompt marker resyncs normally.
             {
                 let (secure_changed, in_secure) = match parser_for_stdout.lock() {
                     Ok(mut p) => {
