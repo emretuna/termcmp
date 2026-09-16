@@ -563,3 +563,34 @@ fn test_secure_input_suppresses_popup_and_forwards_verbatim() {
     proc.expect_output("GOT_IS:p@ssw0rd");
     proc.exit_with_code(0);
 }
+
+/// While a foreground command runs with NO prompt-end marker visible to the
+/// proxy (the sudo /dev/tty path: fish emits OSC 133;C only via its preexec
+/// hook inside line editing, never for the running command), keystrokes must
+/// still reach the child byte-for-byte instead of being parsed as prompt
+/// input. Reproduces the `password` → `pswr` loss: fish echo follows the
+/// secure bypass, so intercepted bytes surface as doubled echo.
+#[test]
+fn test_foreground_command_input_forwards_verbatim() {
+    let mut proc = TermcmpProcess::spawn();
+    proc.send_line("echo fg_smoke_ready_marker");
+    proc.expect_output("fg_smoke_ready_marker");
+
+    // Park the shell in a foreground `read` with echo off. No OSC 133;C is
+    // emitted for this transition in the harness shell, mirroring the sudo
+    // tty path where the proxy never sees a prompt-end marker either.
+    proc.send_line("stty -echo; read got; stty echo; echo GOT_IS:$got");
+    thread::sleep(Duration::from_millis(1000));
+
+    let mark = proc.output_len();
+    proc.write_raw(b"password\r");
+    proc.expect_output("GOT_IS:password");
+
+    // The verbatim path emits no popup render between the keystrokes and the
+    // result: any interception would have re-emitted bytes as fish echo.
+    assert!(
+        !proc.wait_for_bytes_after(POPUP_RENDER_MARKER, mark, Duration::from_secs(1)),
+        "popup rendered while a foreground command held the terminal"
+    );
+    proc.exit_with_code(0);
+}

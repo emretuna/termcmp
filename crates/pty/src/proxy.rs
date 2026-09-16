@@ -432,13 +432,21 @@ pub async fn run_proxy(
             // parser flag Task B publishes) so keystrokes in the race window
             // between echo-off onset and Task B's flag update are still
             // forwarded byte-for-byte.
-            let in_alt = match parser_for_stdin.lock() {
-                Ok(p) => p.state().in_alt_screen(),
-                Err(_) => false,
+            let (in_alt, at_prompt) = match parser_for_stdin.lock() {
+                Ok(p) => (p.state().in_alt_screen(), p.state().in_prompt()),
+                Err(_) => (false, false),
             };
             // Fail closed: a transient `tcgetattr` error keeps the parsed path.
             let in_secure = inner_secure_input(inner_fd_stdin);
-            if in_alt || in_secure {
+            // Not at a prompt (command running, password reader on /dev/tty,
+            // TUI without alt-screen): keystrokes belong to the foreground
+            // program, never to the completion pipeline. Forward verbatim —
+            // except single signal bytes (Ctrl-C / Ctrl-\ / Ctrl-Z), which
+            // keep the existing ISIG-synthesis path so SIGINT/SIGQUIT/SIGTSTP
+            // still reach the foreground job (job-control tests suspend and
+            // interrupt `sleep` this way). Everything else bypasses parsing.
+            let is_signal_byte = n == 1 && matches!(buf[0], 0x03 | 0x1C | 0x1A);
+            if in_alt || in_secure || (!at_prompt && !is_signal_byte) {
                 let mut raw = key_parser.drain_pending();
                 raw.extend_from_slice(&buf[..n]);
                 if !raw.is_empty() {
@@ -1043,14 +1051,35 @@ pub async fn run_proxy(
             // screen (e.g., Bun apps like omp). Subsequent trigger() calls are
             // gated by state.in_prompt() inside trigger() (see handler.rs).
             {
-                let prompt_changed = match parser_for_stdout.lock() {
-                    Ok(mut p) => p.state_mut().take_prompt_changed(),
+                let (prompt_changed, left_prompt) = match parser_for_stdout.lock() {
+                    Ok(mut p) => {
+                        let state = p.state_mut();
+                        let changed = state.take_prompt_changed();
+                        // Was this a prompt→command transition (not command→prompt)?
+                        (changed, changed && !state.in_prompt())
+                    }
                     Err(e) => {
                         tracing::warn!("parser mutex poisoned in stdout task (prompt): {e}");
                         break;
                     }
                 };
                 if prompt_changed {
+                    // On command start the line editor is gone: drop any stale
+                    // command buffer / keystroke model so later keystrokes
+                    // (sudo's /dev/tty password path emits no termios signal
+                    // and no secure-input transition) are never parsed as
+                    // prompt input. The next OSC 133;A / 7771;A resyncs.
+                    if left_prompt {
+                        match parser_for_stdout.lock() {
+                            Ok(mut p) => p.state_mut().clear_command_buffer(),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "parser mutex poisoned in stdout task (prompt exit clear): {e}"
+                                );
+                                break;
+                            }
+                        }
+                    }
                     let mut cleanup = Vec::new();
                     let cleanup_ticket = {
                         let mut h = match handler_for_stdout.lock() {
@@ -1072,6 +1101,9 @@ pub async fn run_proxy(
                         // This prevents a late async result from rendering over
                         // command output or stale prompt content.
                         h.invalidate_inflight_generations();
+                        if left_prompt {
+                            h.reset_input_model();
+                        }
                         h.overlay_write_ticket()
                     };
                     if !cleanup.is_empty() {
