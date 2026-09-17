@@ -81,4 +81,6 @@ Herdr and the tmux plugin workmux inspect running agents and their status by obs
 - **Don't flood the stream.** Spurious rendering churn or marker traffic can make status detection noisy or wrong. Emit only what is necessary.
 - **Leave their data alone.** Don't consume, strip, or rewrite escape sequences or markers that those tools need to do their job.
 
+Tradeoff, enforced by `[experimental] session_isolation`: the default (`true`) gives the inner shell its own session and controlling terminal, which is what makes `/dev/tty` password readers (sudo/ssh/git/pinentry) work — but it also means the outer tty's foreground process group can no longer be pointed at inner jobs, so `pane_current_command`-style observation goes dark. Set `session_isolation = false` to restore foreground-group mirroring and the observation those tools rely on, accepting broken `/dev/tty` password input.
+
 Implication for contributors: before adding output or markers, ask "will herdr or workmux misread this as an agent state change?" If it might, redesign the signaling.

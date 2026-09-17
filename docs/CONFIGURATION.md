@@ -338,10 +338,12 @@ Opt-in features that are not yet considered stable.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `multi_terminal` | bool | `false` | Enable unsupported/unknown terminals. All 10 supported terminals (Ghostty, Otty, Kitty, WezTerm, Alacritty, Rio, iTerm2, Terminal.app, Zed, VSCode) work without this flag. Set to `true` only if you want to try Termcmp on an unlisted terminal. |
+| `session_isolation` | bool | `true` | Give the inner shell its own session and controlling terminal, so `/dev/tty` password prompts (sudo/ssh/git/pinentry) see the inner PTY. Set to `false` to restore foreground-process-group mirroring for tmux/herdr agent tracking, at the cost of broken `/dev/tty` password input. Requires restart. |
 
 ```toml
 [experimental]
 multi_terminal = true
+session_isolation = false
 ```
 
 Termcmp auto-detects the terminal via `TERM_PROGRAM` and terminal-specific env vars (`KITTY_WINDOW_ID`, `WEZTERM_UNIX_SOCKET`, `ALACRITTY_SOCKET`, `ZED_TERM`, `VSCODE_IPC_HOOK_CLI`), then selects the appropriate rendering strategy:

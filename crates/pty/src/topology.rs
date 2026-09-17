@@ -5,6 +5,13 @@
 //! `pane_current_command`, herdr `foreground_process_group_id`) see the
 //! actual foreground command instead of `termcmp`.
 //!
+//! Active only with `[experimental] session_isolation = false`. The default
+//! gives the inner shell its own session and controlling terminal (so
+//! `/dev/tty` password readers reach the inner PTY), which makes the outer
+//! tty's fg pgrp unmirrorable: `TIOCSPGRP` targeting an inner pgrp fails
+//! `EINVAL`. `ForegroundMirror` is therefore never constructed under
+//! isolation.
+//!
 //! Implementation note: we enumerate processes via `sysctl(KERN_PROC_ALL)`
 //! with explicit, clang-verified byte offsets rather than libproc's
 //! `proc_listchildpids`/`proc_pidinfo`. The libproc calls can block for

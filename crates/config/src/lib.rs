@@ -50,10 +50,30 @@ pub struct TermcmpConfig {
     pub ai: AiConfig,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExperimentalConfig {
     pub multi_terminal: bool,
+    /// Give the inner shell its own session with the inner PTY slave as its
+    /// controlling terminal. `/dev/tty` readers (sudo, ssh, git, pinentry)
+    /// then reach the inner PTY instead of the outer tty that the proxy's
+    /// reader is concurrently draining. Set `false` to restore the legacy
+    /// single-session topology, which is required for foreground pgrp
+    /// mirroring onto the outer tty (tmux `pane_current_command`, herdr
+    /// `foreground_process_group_id`, workmux). Read once at startup —
+    /// changing it requires a restart.
+    pub session_isolation: bool,
+}
+
+impl Default for ExperimentalConfig {
+    fn default() -> Self {
+        Self {
+            multi_terminal: false,
+            // Isolation is the default: without it `/dev/tty` password
+            // prompts are split between the app and the proxy's reader.
+            session_isolation: true,
+        }
+    }
 }
 
 /// Per-feature thinking/reasoning toggle. Maps to wire-format fields:
@@ -817,6 +837,7 @@ pub fn all_field_paths() -> Vec<&'static str> {
         "theme.transparency",
         // [experimental]
         "experimental.multi_terminal",
+        "experimental.session_isolation",
         // [ai.completion]
         "ai.completion.enabled",
         "ai.completion.provider",
@@ -1959,6 +1980,20 @@ multi_terminal = true
 "#;
         let config: TermcmpConfig = toml::from_str(toml_str).unwrap();
         assert!(config.experimental.multi_terminal);
+    }
+
+    #[test]
+    fn test_experimental_session_isolation_default_and_override() {
+        assert!(
+            TermcmpConfig::default().experimental.session_isolation,
+            "session isolation must default on — /dev/tty password readers depend on it"
+        );
+        let toml_str = r#"
+[experimental]
+session_isolation = false
+"#;
+        let config: TermcmpConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.experimental.session_isolation);
     }
 
     #[test]

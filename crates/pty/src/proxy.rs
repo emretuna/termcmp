@@ -174,14 +174,25 @@ pub async fn run_proxy(
     // Open inner PTY pair manually (no portable_pty spawn_command)
     let (master_fd, slave_fd) = open_pty_pair().context("failed to open PTY pair")?;
     let outer_fd = std::os::fd::AsRawFd::as_raw_fd(&std::io::stdin());
+    // Topology is fixed at spawn (see `spawn_shell_with_pty`) and everything
+    // below that depends on it reads this. Read once — the flag requires a
+    // restart, so the config watcher must not change it mid-run.
+    let isolated = config.experimental.session_isolation;
     // Foreground pgrp that owned the outer tty before we started (the user's
     // shell). We mirror child pgrps while running and MUST restore this on
     // exit — otherwise our termios restore happens as a background pgrp and
-    // the kernel SIGTTOU-stops us mid-teardown.
-    let initial_outer_fg = crate::topology::ForegroundMirror::initial_fg(outer_fd);
+    // the kernel SIGTTOU-stops us mid-teardown. Under isolation the inner
+    // shell has its own session, so the outer tty's fg pgrp is never ours to
+    // move (and `TIOCSPGRP` onto an inner pgrp fails EINVAL) — no mirror, no
+    // restore, and nothing to restore to.
+    let initial_outer_fg = if isolated {
+        None
+    } else {
+        crate::topology::ForegroundMirror::initial_fg(outer_fd)
+    };
 
-    // Spawn shell in same session with dup2 to inner slave
-    let mut child = spawn_shell_with_pty(shell, args, slave_fd.as_raw_fd())?;
+    // Spawn shell with dup2 to inner slave (own session under isolation)
+    let mut child = spawn_shell_with_pty(shell, args, slave_fd.as_raw_fd(), isolated)?;
     let shell_pid = child.id() as libc::pid_t;
 
     drop(slave_fd); // Parent must not hold slave
@@ -282,7 +293,11 @@ pub async fn run_proxy(
             )
             .with_match_mode(config.suggest.match_mode)
             .with_source_order(suggest::SourceOrder::from_names(&config.suggest.order))
-            .with_delay_ms(config.trigger.delay_ms);
+            .with_delay_ms(config.trigger.delay_ms)
+            // The blocklist needs the tty whose fg pgrp is the running
+            // command. Under isolation that is the inner master; fd 0's fg
+            // pgrp is the proxy itself.
+            .with_inner_tty_fd(inner_master_fd);
 
         let (async_providers, ask_ai) = build_providers(config, shell_kind);
         for provider in async_providers {
@@ -662,13 +677,23 @@ pub async fn run_proxy(
                     }
                     crate::handler::KeyOutcome::Forward(forward) => {
                         if !forward.is_empty() {
-                            // ISIG synthesis: check if we should intercept signal chars
+                            // ISIG synthesis: check if we should intercept signal chars.
+                            //
+                            // Only in the legacy topology. Under isolation the
+                            // inner slave IS the shell's controlling terminal,
+                            // so the kernel's own line discipline synthesises
+                            // INTR/QUIT/SUSP for the inner foreground pgrp and
+                            // the bytes must be forwarded verbatim. Doing it
+                            // here instead would send the signal to
+                            // `tcgetpgrp(outer_fd)` — which under isolation is
+                            // the proxy's *own* group (a self-signal) — and
+                            // would corrupt the byte stream for the reader.
                             let inner_master_fd = inner_master_fd;
 
                             let mut termios: libc::termios = unsafe { std::mem::zeroed() };
-                            let has_isig =
-                                unsafe { libc::tcgetattr(inner_master_fd, &mut termios) } == 0
-                                    && (termios.c_lflag & libc::ISIG) != 0;
+                            let has_isig = !isolated
+                                && unsafe { libc::tcgetattr(inner_master_fd, &mut termios) } == 0
+                                && (termios.c_lflag & libc::ISIG) != 0;
 
                             if has_isig {
                                 // Filter out signal characters and send signals
@@ -1275,21 +1300,29 @@ pub async fn run_proxy(
 
     // Drop the sender we cloned from — we only need the ones in the tasks
     drop(shutdown_tx);
-    // Foreground mirror: mirrors the shell's fg pgrp onto the outer tty
+    // Foreground mirror: mirrors the shell's fg pgrp onto the outer tty.
+    // Legacy topology only — under isolation the shell owns its own session,
+    // so the outer tty's fg pgrp cannot be pointed at inner jobs
+    // (TIOCSPGRP on an inner pgrp returns EINVAL) and there is nothing to
+    // mirror. Multiplexer/agent observation is consequently legacy-only.
     let shell_pgid = child.id() as libc::pid_t;
-    let mirror = crate::topology::ForegroundMirror::new(outer_fd, shell_pgid);
-    // Initial mirror: point outer tty at shell's pgrp
-    // The ForegroundMirror points the outer tty's fg pgrp at inner jobs, which
-    // makes THIS process background relative to its own controlling terminal.
-    // xnu rejects tty-modifying ioctls (TIOCSPGRP et al.) from background
-    // callers unless SIGTTOU is ignored or blocked (bsd/kern/tty.c ttioctl):
-    // without this, every mirror update after the initial one fails with EIO,
-    // freezing the outer fg pgrp on the inner shell and breaking multiplexer
-    // agent detection (herdr/tmux/workmux) and SIGWINCH routing.
-    unsafe {
-        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+    let mirror = (!isolated).then(|| crate::topology::ForegroundMirror::new(outer_fd, shell_pgid));
+    if let Some(m) = &mirror {
+        // Initial mirror: point outer tty at shell's pgrp.
+        // The ForegroundMirror points the outer tty's fg pgrp at inner jobs,
+        // which makes THIS process background relative to its own controlling
+        // terminal. xnu rejects tty-modifying ioctls (TIOCSPGRP et al.) from
+        // background callers unless SIGTTOU is ignored or blocked
+        // (bsd/kern/tty.c ttioctl): without this, every mirror update after
+        // the initial one fails with EIO, freezing the outer fg pgrp on the
+        // inner shell and breaking multiplexer agent detection
+        // (herdr/tmux/workmux) and SIGWINCH routing. Under isolation we never
+        // move the outer fg pgrp, so the default disposition stays.
+        unsafe {
+            libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        }
+        m.mirror(Some(shell_pgid));
     }
-    mirror.mirror(Some(shell_pgid));
 
     // Task C: Signal handling
 
@@ -1353,16 +1386,20 @@ pub async fn run_proxy(
                 // resolving then returns the shell's own (dead) pgrp and we'd
                 // point the outer tty at nothing.
                 if !shell_dead {
-                    if let Some(target) = mirror.resolve_fg_target() {
-                        mirror.mirror(Some(target));
+                    if let Some(m) = &mirror {
+                        if let Some(target) = m.resolve_fg_target() {
+                            m.mirror(Some(target));
+                        }
                     }
                 }
             }
             _ = mirror_tick.tick() => {
                 // Periodic mirror update (same dead-shell guard)
                 if !shell_dead {
-                    if let Some(target) = mirror.resolve_fg_target() {
-                        mirror.mirror(Some(target));
+                    if let Some(m) = &mirror {
+                        if let Some(target) = m.resolve_fg_target() {
+                            m.mirror(Some(target));
+                        }
                     }
                 }
                 // Reconcile inner PTY size with the outer tty. SIGWINCH is
@@ -1424,10 +1461,15 @@ pub async fn run_proxy(
                         if let Err(e) = master.resize(size.rows, size.cols) {
                             tracing::warn!("failed to resize PTY: {}", e);
                         }
-                        // Also forward SIGWINCH to the foreground pgrp on outer tty
-                        if let Some(fg) = mirror.current_fg() {
-                            if fg > 0 {
-                                unsafe { libc::kill(-fg, libc::SIGWINCH) };
+                        // Also forward SIGWINCH to the foreground pgrp on outer tty.
+                        // Legacy only: under isolation `master.resize()` already
+                        // makes the kernel signal the inner tty's foreground
+                        // pgrp, and `mirror` is None there anyway.
+                        if let Some(m) = &mirror {
+                            if let Some(fg) = m.current_fg() {
+                                if fg > 0 {
+                                    unsafe { libc::kill(-fg, libc::SIGWINCH) };
+                                }
                             }
                         }
                         // Update parser's screen dimensions

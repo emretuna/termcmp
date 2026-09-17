@@ -1,9 +1,15 @@
 // ttyshim: makes a session-less PTY slave look foreground-owned to the
-// calling shell. termcmp's single-session design keeps the inner PTY slave
-// out of any session, so the kernel answers tcgetpgrp(0) with ENOTTY and
-// fish 4.x exits at startup ("No TTY for interactive shell"). Interposing
-// tcgetpgrp/tcsetpgrp on fd 0 lets fish see itself as foreground owner;
-// every other descriptor keeps real kernel semantics.
+// calling shell. In the legacy topology ([experimental] session_isolation =
+// false) the inner PTY slave stays out of any session, so the kernel answers
+// tcgetpgrp(0) with ENOTTY and fish 4.x exits at startup ("No TTY for
+// interactive shell"). Interposing tcgetpgrp/tcsetpgrp on fd 0 lets fish see
+// itself as foreground owner; every other descriptor keeps real kernel
+// semantics.
+//
+// Injected only on that path (crates/pty/src/spawn.rs): under the default
+// isolated topology the slave IS a real controlling terminal, tcgetpgrp(0)
+// succeeds, and an interposer that lies about the foreground group would be
+// wrong under real job control.
 //
 // Interposition uses the __DATA,__interpose section (the only mechanism
 // that reliably overrides libSystem syscall wrappers via DYLD_INSERT).
@@ -27,8 +33,9 @@ static int my_tcgetpgrp(int fd) {
 }
 
 static int my_tcsetpgrp(int fd, pid_t pgrp) {
-    // The session-less slave cannot take a fg pgrp; report success so the
-    // shell proceeds. Real job control is driven by termcmp's mirror.
+    // The legacy session-less slave cannot take a fg pgrp; report success so
+    // the shell proceeds. Real job control there is driven by termcmp's
+    // ForegroundMirror.
     if (fd == STDIN_FILENO) return 0;
     return orig_tcsetpgrp(fd, pgrp);
 }

@@ -563,3 +563,38 @@ fn test_secure_input_suppresses_popup_and_forwards_verbatim() {
     proc.expect_output("GOT_IS:p@ssw0rd");
     proc.exit_with_code(0);
 }
+
+/// A password reader that opens `/dev/tty` (sudo, ssh, git, pinentry) must get
+/// every byte the user types. Under the legacy single-session topology the
+/// inner shell has no controlling terminal, so `/dev/tty` resolves to the
+/// *outer* tty — the same tty the proxy's `fork_reader` is draining — and the
+/// two readers split the input (measured: 8 typed chars arrived as 4).
+/// Session isolation gives the inner shell its own session with the inner PTY
+/// slave as its controlling terminal, so `/dev/tty` is the inner slave and the
+/// proxy's forwarding path is the only reader.
+#[test]
+fn test_password_prompt_via_dev_tty_is_passthrough() {
+    let mut proc = TermcmpProcess::spawn();
+    proc.send_line("echo pw_ready_marker");
+    proc.expect_output("pw_ready_marker");
+
+    // in_prompt=true so the no-popup assertion below actually exercises the
+    // eligibility gate rather than passing because no prompt was reported.
+    proc.send_line("printf '\\033]133;A\\007'");
+    thread::sleep(Duration::from_millis(200));
+
+    // sudo/ssh style reader: opens /dev/tty explicitly, echo off. The shell
+    // stays parked in `read` until we type the password line.
+    proc.send_line(
+        "stty -echo < /dev/tty; read -r pw < /dev/tty; stty echo < /dev/tty; echo GOT_PW:$pw",
+    );
+    thread::sleep(Duration::from_millis(1000));
+    let mark = proc.output_len();
+    proc.write_raw(b"p@ssw0rd-42\r");
+    proc.expect_output("GOT_PW:p@ssw0rd-42"); // exact byte round-trip
+    assert!(
+        !proc.wait_for_bytes_after(POPUP_RENDER_MARKER, mark, Duration::from_secs(1)),
+        "popup rendered over a /dev/tty password prompt"
+    );
+    proc.exit_with_code(0);
+}

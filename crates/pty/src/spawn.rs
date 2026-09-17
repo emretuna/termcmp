@@ -6,12 +6,24 @@ use std::os::unix::process::CommandExt;
 use anyhow::{Context, Result};
 
 /// Spawn the shell with stdio dup2'd to the inner PTY slave.
-/// The shell stays in the same session (no setsid), gets its own pgrp via setpgid,
-/// and inherits the outer tty as its ctty.
+///
+/// Two topologies:
+///
+/// - `session_isolation == true` (default): the shell gets its **own session**
+///   (`setsid`) with the inner PTY slave as its controlling terminal
+///   (`TIOCSCTTY`). `/dev/tty` for the shell and every child resolves to the
+///   inner slave, so tty readers (sudo/ssh/git/pinentry) no longer contend with
+///   the proxy's `fork_reader` for the outer tty. Job control inside the
+///   session is real: the kernel delivers INTR/QUIT/SUSP from the inner line
+///   discipline.
+/// - `session_isolation == false` (legacy): the shell stays in the proxy's
+///   session (no setsid), gets its own pgrp via setpgid, and inherits the
+///   outer tty as its ctty — the topology `ForegroundMirror` requires.
 pub fn spawn_shell_with_pty(
     shell: &OsStr,
     args: &[OsString],
     slave_fd: RawFd,
+    session_isolation: bool,
 ) -> Result<std::process::Child> {
     let mut cmd = std::process::Command::new(shell);
     cmd.args(args);
@@ -36,15 +48,19 @@ pub fn spawn_shell_with_pty(
         cmd.env(key, value);
     }
     // fish 4.x hard-exits at startup when tcgetpgrp(0) fails ENOTTY ("No
-    // TTY for interactive shell"). The single-session design leaves the
-    // inner PTY slave session-less, so the kernel can never answer. Inject
+    // TTY for interactive shell"). In the legacy single-session design the
+    // inner PTY slave is session-less, so the kernel can never answer. Inject
     // a tiny dylib that interposes tcgetpgrp/tcsetpgrp on fd 0 so fish sees
     // itself as foreground owner; every other shell is untouched.
+    //
+    // Only for the legacy path: under isolation the slave IS a real
+    // controlling terminal, so tcgetpgrp(0) succeeds — and an interposer that
+    // lies about the foreground group would be wrong under real job control.
     //
     // This must run AFTER the env-inherit loop above: cmd.env() here would
     // otherwise be overwritten by the inherited parent DYLD_INSERT_LIBRARIES,
     // silently discarding the merged injection.
-    if is_fish(shell) {
+    if !session_isolation && is_fish(shell) {
         if let Some(dylib) = ensure_ttyshim() {
             let mut inserted = std::env::var("DYLD_INSERT_LIBRARIES").unwrap_or_default();
             if !inserted.is_empty() {
@@ -60,7 +76,8 @@ pub fn spawn_shell_with_pty(
     // Set cwd
     cmd.current_dir(std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")));
 
-    // Pre-exec: dup2 slave to 0/1/2, setpgid(0,0). NO setsid.
+    // Pre-exec: dup2 slave to 0/1/2, then either a new session with the
+    // slave as ctty (isolation) or setpgid in the parent session (legacy).
     unsafe {
         cmd.pre_exec(move || {
             // dup2 slave_fd to stdin/stdout/stderr
@@ -76,8 +93,21 @@ pub fn spawn_shell_with_pty(
                 libc::close(slave_fd);
             }
 
-            // Make shell its own pgrp leader (stays in same session)
-            if libc::setpgid(0, 0) < 0 {
+            if session_isolation {
+                // Own session + the inner slave as controlling terminal:
+                // /dev/tty for the shell and every child resolves to the inner
+                // PTY, so tty readers (sudo/ssh/git/pinentry) no longer
+                // contend with the proxy's reader for the outer tty. Also
+                // makes job control real inside the session.
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            } else if libc::setpgid(0, 0) < 0 {
+                // Legacy: own pgrp, same session, outer tty stays the ctty —
+                // the topology ForegroundMirror mirrors onto.
                 return Err(std::io::Error::last_os_error());
             }
 

@@ -9,14 +9,14 @@ use std::time::Duration;
 
 /// Probe whether the pane's shell runs with job control (`$-` contains `m`).
 ///
-/// The proxy spawns the inner shell in its own session-less pgrp setup, so
-/// the inner PTY slave is never the shell's controlling terminal. Only
-/// kernels/shells that tolerate tcsetpgrp on a non-ctty slave keep monitor
-/// mode (macOS + bash 3.2); Linux bash 5.x prints "no job control in this
-/// shell" and can never move real process groups. Tests asserting suspend /
-/// bg / fg reporting or tmux-visible foreground jobs skip there instead of
-/// failing on platform-impossible behavior. Self-updating: if the product
-/// ever gains real Linux job control, these tests re-enable automatically.
+/// Under the default (isolated) topology the proxy gives the inner shell its
+/// own session with the inner PTY slave as its controlling terminal, so every
+/// shell can claim the tty and enable monitor mode — bash 5.x on Linux
+/// included. (In the legacy topology the slave was never the shell's ctty:
+/// macOS + bash 3.2 tolerated tcsetpgrp anyway, Linux bash 5.x reported "no
+/// job control in this shell".) Tests asserting suspend/bg/fg reporting stay
+/// guarded so that a regression to a ctty-less topology skips instead of
+/// failing platform-impossibly.
 fn shell_has_job_control(tmux: &mut TmuxSession) -> bool {
     tmux.send_line("echo TERMCMP_JC_FLAGS=$-");
     tmux.expect_output("TERMCMP_JC_FLAGS=");
@@ -32,9 +32,14 @@ fn shell_has_job_control(tmux: &mut TmuxSession) -> bool {
 }
 
 /// Test that tmux `pane_current_command` shows the shell, not termcmp
+///
+/// Legacy topology (`session_isolation = false`): the outer tty's foreground
+/// pgrp is mirrored onto inner jobs, which is what tmux reads. Under the
+/// default isolated topology that mirror cannot run (TIOCSPGRP onto an inner
+/// pgrp is EINVAL), so this observation is legacy-only by design.
 #[test]
 fn test_tmux_pane_current_command_shows_shell() {
-    let tmux = TmuxSession::spawn();
+    let tmux = TmuxSession::spawn_legacy();
 
     // Wait for termcmp to start and shell to initialize
     tmux.expect_output("$");
@@ -58,9 +63,12 @@ fn test_tmux_pane_current_command_shows_shell() {
 }
 
 /// Test that tmux `pane_current_command` updates when a foreground job runs
+///
+/// Legacy topology — same foreground-group mirroring requirement as
+/// `test_tmux_pane_current_command_shows_shell`.
 #[test]
 fn test_tmux_pane_current_command_updates_with_foreground_job() {
-    let mut tmux = TmuxSession::spawn();
+    let mut tmux = TmuxSession::spawn_legacy();
     tmux.expect_output("$");
     if !shell_has_job_control(&mut tmux) {
         eprintln!(

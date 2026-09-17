@@ -130,6 +130,11 @@ unsafe fn spawn_harness(fish: &OsString) -> Result<Harness, String> {
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_pty_proxy_child"));
     cmd.env("PTY_PROXY_CHILD_FISH", fish)
+        // Both tests in this file exist to cover the legacy (mirroring)
+        // topology: `session_isolation = false` keeps the inner shell in this
+        // process's session, which is the only topology where the outer tty's
+        // fg pgrp can be pointed at inner jobs.
+        .env("PTY_PROXY_CHILD_SESSION_ISOLATION", "0")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());

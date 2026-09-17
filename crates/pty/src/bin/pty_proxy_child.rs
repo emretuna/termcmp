@@ -15,6 +15,10 @@
 //!
 //! Environment:
 //! - `PTY_PROXY_CHILD_FISH`: path of the shell to run (required).
+//! - `PTY_PROXY_CHILD_SESSION_ISOLATION`: `0` restores the legacy
+//!   single-session topology (inner shell shares this process's session, so
+//!   `ForegroundMirror` can point the outer tty at inner jobs). Anything else
+//!   — including unset — keeps the default isolated topology.
 
 use config::TermcmpConfig;
 use std::ffi::OsStr;
@@ -47,6 +51,9 @@ fn main() {
     // The test tty has no recognizable TERM profile; keep the proxy loop
     // running instead of falling back to a plain shell.
     config.experimental.multi_terminal = true;
+    if std::env::var("PTY_PROXY_CHILD_SESSION_ISOLATION").as_deref() == Ok("0") {
+        config.experimental.session_isolation = false;
+    }
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime in proxy child");
     let code = rt

@@ -199,13 +199,17 @@ enum MergeFreshness {
 /// process name heuristic suppresses the popup when it matches this list.
 const DEFAULT_TUI_BLOCKLIST: &[&str] = &["omp", "pi", "agent", "btm", "bottom", "ytop", "gtop"];
 
-fn foreground_process_name() -> Option<String> {
-    // The proxy is background relative to its own controlling tty: the
-    // ForegroundMirror points the outer tty (stdin) at the inner shell's fg
-    // job, so `tcgetpgrp(0)` returns the foreground job's process group. A
-    // process group ID equals its leader's PID, so reading that PID's command
-    // name yields the interactive program currently holding the prompt.
-    let fg_pgid = unsafe { libc::tcgetpgrp(0) };
+/// Foreground command name on `fd`'s tty.
+///
+/// `fd == None` means fd 0 — the outer tty. That is correct only in the legacy
+/// topology, where the `ForegroundMirror` points the outer tty at the inner
+/// shell's fg job, so `tcgetpgrp(0)` returns the foreground job's process
+/// group. Under session isolation the outer tty's fg pgrp is the proxy
+/// itself, so callers pass the inner PTY master instead: its fg pgrp is the
+/// running command. A process group ID equals its leader's PID, so reading
+/// that PID's command name yields the interactive program holding the prompt.
+fn foreground_process_name(fd: Option<std::os::fd::RawFd>) -> Option<String> {
+    let fg_pgid = unsafe { libc::tcgetpgrp(fd.unwrap_or(0)) };
     if fg_pgid <= 0 {
         return None;
     }
@@ -259,18 +263,20 @@ fn macos_proc_name(pid: libc::pid_t) -> Option<String> {
 /// The alternate-screen check is defense in depth: a well-behaved TUI enters
 /// the alt screen, but some Bun/Ink/omp apps don't, so `in_prompt` is the
 /// primary gate. The `blocklist` is checked against the foreground process
-/// name to suppress Go TUI apps that don't use alt screen.
+/// name on `fg_tty_fd`'s tty (fd 0 when `None`) to suppress Go TUI apps that
+/// don't use alt screen.
 fn popup_eligible(
     in_prompt: bool,
     in_alt_screen: bool,
     in_secure_input: bool,
     blocklist: &[&str],
+    fg_tty_fd: Option<std::os::fd::RawFd>,
 ) -> bool {
     if !in_prompt || in_alt_screen || in_secure_input {
         return false;
     }
     // Check if foreground process is in blocklist
-    if let Some(proc_name) = foreground_process_name() {
+    if let Some(proc_name) = foreground_process_name(fg_tty_fd) {
         if blocklist.iter().any(|&blocked| proc_name == blocked) {
             return false;
         }
@@ -672,6 +678,12 @@ pub struct InputHandler {
     small_terminal_max_visible: usize,
     /// Compact-mode policy. From `config.popup.compact_mode` (default Auto).
     compact_mode: config::CompactMode,
+    /// Tty fd whose foreground process group names the running command for
+    /// the blocklist check. `None` → fd 0 (the outer tty), correct only in
+    /// the legacy topology. Under session isolation the proxy passes the
+    /// inner PTY master, whose fg pgrp is the running command while fd 0's
+    /// fg pgrp is the proxy itself.
+    inner_tty_fd: Option<std::os::fd::RawFd>,
 }
 
 impl InputHandler {
@@ -731,7 +743,16 @@ impl InputHandler {
             ask_ai_provider: None,
             mode_flash: None,
             tui_process_blocklist: Vec::new(),
+            inner_tty_fd: None,
         })
+    }
+
+    /// Configure which tty's foreground pgrp names the running command:
+    /// `None` (default) uses fd 0, the outer tty — correct only in the legacy
+    /// topology; under session isolation pass the inner PTY master.
+    pub fn with_inner_tty_fd(mut self, fd: std::os::fd::RawFd) -> Self {
+        self.inner_tty_fd = Some(fd);
+        self
     }
 
     /// Configure process-name blocklist that suppresses popup even when at
@@ -1964,7 +1985,7 @@ impl InputHandler {
             // Prompt markers are authoritative; alternate-screen remains a
             // defense-in-depth check for applications that leave it enabled.
             let blocklist = self.effective_tui_blocklist();
-            if !popup_eligible(at_prompt, in_alt, in_secure, &blocklist) {
+            if !popup_eligible(at_prompt, in_alt, in_secure, &blocklist, self.inner_tty_fd) {
                 tracing::debug!(
                     "suppressing popup: in_alt_screen={}, in_prompt={}, in_secure_input={}",
                     in_alt,
@@ -2154,7 +2175,7 @@ impl InputHandler {
                 Err(_) => (false, false, false),
             };
             let blocklist = self.effective_tui_blocklist();
-            if !popup_eligible(at_prompt, in_alt, in_secure, &blocklist) {
+            if !popup_eligible(at_prompt, in_alt, in_secure, &blocklist, self.inner_tty_fd) {
                 return TriggerPrepared::Painted;
             }
         }
@@ -2337,7 +2358,7 @@ impl InputHandler {
                 Err(_) => return,
             };
             let blocklist = self.effective_tui_blocklist();
-            if !popup_eligible(at_prompt, in_alt, in_secure, &blocklist) {
+            if !popup_eligible(at_prompt, in_alt, in_secure, &blocklist, self.inner_tty_fd) {
                 // Drop all pending results — they're stale now.
                 self.dynamic_rx = None;
                 self.dynamic_task = None;
@@ -2637,7 +2658,7 @@ impl InputHandler {
                 Err(_) => return false,
             };
             let blocklist = self.effective_tui_blocklist();
-            if !popup_eligible(at_prompt, in_alt, in_secure, &blocklist) {
+            if !popup_eligible(at_prompt, in_alt, in_secure, &blocklist, self.inner_tty_fd) {
                 // Drop all pending results — they're stale now.
                 self.dynamic_rx = None;
                 self.dynamic_task = None;
@@ -4868,6 +4889,7 @@ mod tests {
             ask_ai_provider: None,
             mode_flash: None,
             tui_process_blocklist: Vec::new(),
+            inner_tty_fd: None,
         }
     }
 
@@ -9878,11 +9900,11 @@ mod tests {
         assert!(!blocklist.contains(&"zsh"), "zsh should not be blocked");
         // popup_eligible with empty vs default: zsh is allowed
         assert!(
-            popup_eligible(true, false, false, &[]),
+            popup_eligible(true, false, false, &[], None),
             "empty blocklist must allow zsh at prompt"
         );
         assert!(
-            popup_eligible(true, false, false, DEFAULT_TUI_BLOCKLIST),
+            popup_eligible(true, false, false, DEFAULT_TUI_BLOCKLIST, None),
             "zsh at prompt with default blocklist must be allowed (foreground is not omp)"
         );
         // effective blocklist for fresh handler also allows zsh
@@ -9896,19 +9918,19 @@ mod tests {
         let empty: &[&str] = &[];
         // Empty blocklist must allow any process, and popup_eligible must allow when at prompt
         assert!(
-            popup_eligible(true, false, false, empty),
+            popup_eligible(true, false, false, empty, None),
             "empty blocklist must allow at prompt"
         );
         assert!(
-            !popup_eligible(false, false, false, empty),
+            !popup_eligible(false, false, false, empty, None),
             "not at prompt must still suppress even with empty blocklist"
         );
         assert!(
-            !popup_eligible(true, true, false, empty),
+            !popup_eligible(true, true, false, empty, None),
             "alt screen must suppress even with empty blocklist"
         );
         assert!(
-            !popup_eligible(true, false, true, empty),
+            !popup_eligible(true, false, true, empty, None),
             "secure input must suppress even with empty blocklist"
         );
         // InputHandler with empty custom blocklist: effective is just default, but if we
@@ -9921,7 +9943,7 @@ mod tests {
             "effective with empty custom still has defaults"
         );
         // Truly empty via direct call
-        assert!(popup_eligible(true, false, false, &[]));
+        assert!(popup_eligible(true, false, false, &[], None));
     }
     #[tokio::test]
     async fn test_trigger_skips_async_providers_for_zoxide_context() {

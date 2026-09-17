@@ -557,6 +557,34 @@ impl TmuxSession {
         Self::spawn_internal(pane_cmd, None)
     }
 
+    /// Spawn a tmux session in the **legacy** topology: a config file with
+    /// `[experimental] session_isolation = false` is passed via `--config`,
+    /// so the inner shell stays in the proxy's session and the outer tty's
+    /// foreground pgrp can be mirrored onto inner jobs.
+    ///
+    /// Only the tests that observe foreground-group mirroring
+    /// (`pane_current_command` tracking) may use this; the default topology
+    /// isolates the shell session so `/dev/tty` password prompts work, at the
+    /// cost of that observation. The config file is left in place (same
+    /// convention as the exit markers) — deleting it would race the pane's
+    /// startup config load.
+    pub fn spawn_legacy() -> Self {
+        let config_path =
+            std::env::temp_dir().join(format!("termcmp-legacy-config-{}", unique_suffix()));
+        std::fs::write(&config_path, "[experimental]\nsession_isolation = false\n")
+            .expect("write legacy topology config");
+        let pane_cmd: Vec<String> = vec![
+            env!("CARGO_BIN_EXE_termcmp").to_string(),
+            "--log-level".to_string(),
+            "error".to_string(),
+            "--config".to_string(),
+            config_path.to_string_lossy().into_owned(),
+            "/bin/bash".to_string(),
+            "--norc".to_string(),
+        ];
+        Self::spawn_internal(pane_cmd, None)
+    }
+
     /// Spawn a tmux session whose pane runs termcmp under a wrapper shell.
     ///
     /// The wrapper records termcmp's exit code to a marker file before it
