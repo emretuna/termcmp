@@ -492,6 +492,48 @@ mod tests {
             "reload should propagate tab_accepts_top = true into the handler"
         );
     }
+    /// Poll the handler until `want` lands, re-issuing the save every 400ms.
+    ///
+    /// A single "sleep, then write once" is not enough on a loaded runner:
+    /// `notify`'s OS-level watch (inotify on Linux, FSEvents on macOS) may not
+    /// be armed by the time the write lands, so no event is ever delivered and
+    /// polling can only observe the untouched default. Re-writing keeps
+    /// producing fresh events until the watcher is demonstrably listening,
+    /// while still asserting the invariant under test — that the event-kind
+    /// filter and file-name match accept this save path. The 400ms cadence
+    /// stays clear of the watcher's own 200ms debounce so saves are never
+    /// coalesced into a no-op, and the whole wait is bounded at 8s.
+    async fn await_reload_with_rewrites<F>(
+        handler: &Arc<Mutex<InputHandler>>,
+        want: u64,
+        mut save: F,
+    ) -> u64
+    where
+        F: FnMut(u64),
+    {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut next_save = Instant::now();
+        let mut observed = handler.lock().unwrap().render_block_ms();
+        while observed != want && Instant::now() < deadline {
+            if Instant::now() >= next_save {
+                save(want);
+                next_save = Instant::now() + Duration::from_millis(400);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            observed = handler.lock().unwrap().render_block_ms();
+        }
+        observed
+    }
+    /// A re-savable writer of `render_block_ms` for the file at `path`. The
+    /// closure takes the value to write, so the same helper can both arm the
+    /// watcher (re-saving the value already on disk) and drive the change
+    /// under test.
+    fn write_render_block_ms(path: PathBuf) -> impl FnMut(u64) + 'static {
+        move |value| {
+            std::fs::write(&path, format!("[popup]\nrender_block_ms = {value}\n"))
+                .expect("rewrite config");
+        }
+    }
 
     /// Drives the full hot-reload seam end-to-end: an on-disk config.toml,
     /// the real `notify::RecommendedWatcher` (kind filter + 200ms debounce +
@@ -502,8 +544,10 @@ mod tests {
     /// single-field reload never reaches `update_config` in production —
     /// this test catches that regression.
     ///
-    /// Timeout is 5s to tolerate slow CI; the notify backend on macOS is
-    /// fsevents and typically delivers events within ~100ms.
+    /// The watcher is first *armed* — the seed value is re-saved until the
+    /// handler reflects it — because on a loaded runner `notify` may not have
+    /// armed its OS subscription when a one-shot write lands, which loses the
+    /// event forever (observed as the default sticking on busy runners).
     #[test]
     fn render_block_ms_propagates_through_file_watcher() {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -535,32 +579,29 @@ mod tests {
             )
             .expect("watcher spawns");
 
-            // The 200ms debounce treats events as "recent" if last_reload
-            // was within the window. Wait past it before the meaningful
-            // write to guarantee this edit is not coalesced with a startup
-            // event (notify sometimes emits a creation/touch event during
-            // watcher registration).
+            // Arm the watch: re-save the value already on disk (90) and wait
+            // for it to land. `spawn_config_watcher` applies nothing at
+            // startup, so 90 arriving proves the OS watcher is subscribed and
+            // delivering events; only then is the target write meaningful.
+            let mut save = write_render_block_ms(config_path.clone());
+            let armed = await_reload_with_rewrites(&handler, 90, &mut save).await;
+            assert_eq!(armed, 90, "watcher never delivered the arming reload");
+
+            // Clear the watcher's 200ms debounce so the target save is not
+            // coalesced with the arming reload.
             tokio::time::sleep(Duration::from_millis(300)).await;
 
-            // Trigger the reload: rewrite with the target value.
-            std::fs::write(&config_path, "[popup]\nrender_block_ms = 150\n")
-                .expect("rewrite config");
-
-            // Poll the handler for up to 5s for the new value to land.
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut observed = handler.lock().unwrap().render_block_ms();
-            while observed != 150 && Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                observed = handler.lock().unwrap().render_block_ms();
-            }
+            // Trigger the reload: rewrite with the target value, repeating the
+            // save until the watcher observes it.
+            let observed = await_reload_with_rewrites(&handler, 150, &mut save).await;
 
             watcher_handle.shutdown();
 
             assert_eq!(
                 observed, 150,
-                "watcher did not propagate render_block_ms within 5s; \
-                 the notify event-kind filter or file_name match likely \
-                 dropped the Modify event"
+                "watcher did not propagate render_block_ms within 8s of \
+                 repeated saves; the notify event-kind filter or file_name \
+                 match likely dropped the Modify event"
             );
         });
     }
@@ -599,28 +640,34 @@ mod tests {
             )
             .expect("watcher spawns");
 
+            // Arm the watch before exercising the rename path (see the sibling
+            // test), so a plain save gets the subscription live first and the
+            // rename below cannot race an un-armed watcher.
+            let mut arm = write_render_block_ms(config_path.clone());
+            let armed = await_reload_with_rewrites(&handler, 90, &mut arm).await;
+            assert_eq!(armed, 90, "watcher never delivered the arming reload");
+
             tokio::time::sleep(Duration::from_millis(300)).await;
 
+            let tmp_path = dir.path().join("config.toml.tmp");
             // Atomic rename save: write a sibling temp file, then rename over
             // config.toml — the exact pattern editors and atomic_write use.
-            let tmp_path = dir.path().join("config.toml.tmp");
-            std::fs::write(&tmp_path, "[popup]\nrender_block_ms = 150\n").expect("write temp");
-            std::fs::rename(&tmp_path, &config_path).expect("atomic rename");
-
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut observed = handler.lock().unwrap().render_block_ms();
-            while observed != 150 && Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                observed = handler.lock().unwrap().render_block_ms();
-            }
+            // Repeated until the watcher observes the target value.
+            let observed = await_reload_with_rewrites(&handler, 150, |value| {
+                std::fs::write(&tmp_path, format!("[popup]\nrender_block_ms = {value}\n"))
+                    .expect("write temp");
+                std::fs::rename(&tmp_path, &config_path).expect("atomic rename");
+            })
+            .await;
 
             watcher_handle.shutdown();
 
             assert_eq!(
                 observed, 150,
-                "watcher did not propagate an atomic-rename save within 5s; \
-                 the event-kind filter likely ignores RenamedTo/Create events \
-                 that editors emit when saving via write-temp-then-rename"
+                "watcher did not propagate an atomic-rename save within 8s of \
+                 repeated saves; the event-kind filter likely ignores \
+                 RenamedTo/Create events that editors emit when saving via \
+                 write-temp-then-rename"
             );
         });
     }
