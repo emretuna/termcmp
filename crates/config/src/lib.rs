@@ -46,8 +46,16 @@ pub struct TermcmpConfig {
     pub suggest: SuggestConfig,
     pub keybindings: KeybindingsConfig,
     pub theme: ThemeConfig,
+    pub providers: TermcmpProviders,
     pub experimental: ExperimentalConfig,
     pub ai: AiConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TermcmpProviders {
+    /// Provider `name`s (from `providers/*.toml`) to activate. Empty = disabled.
+    pub enabled: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -537,8 +545,8 @@ pub struct SuggestConfig {
     pub providers: ProvidersConfig,
     /// Source-group ordering for the popup. Each name maps to a completion
     /// source; all items from an earlier-listed source appear before all
-    /// items from a later one. Recognised names: `commands`, `filesystem`,
-    /// `zoxide`, `history`, `ai`, `env`, `shell`, `ssh`.
+    /// items from a later one. Recognised names: `actions`, `commands`,
+    /// `filesystem`, `zoxide`, `history`, `ai`, `env`, `shell`, `ssh`.
     ///
     /// **Hot-reload:** Yes — the config watcher swaps the order into the
     /// engine's live config via `SuggestionEngine::set_config` on file change.
@@ -553,6 +561,7 @@ impl Default for SuggestConfig {
             match_mode: MatchMode::default(),
             providers: ProvidersConfig::default(),
             order: vec![
+                "actions".into(),
                 "ai".into(),
                 "history".into(),
                 "shell".into(),
@@ -626,6 +635,33 @@ struct ThemeFile {
     pub index_hints: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_hints: Option<String>,
+}
+
+/// One named shell command inside a provider file.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ProviderCommand {
+    /// Popup label; also the fuzzy-match haystack. Shown verbatim as the row text.
+    pub name: String,
+    /// Shell command injected into the PTY when this action is accepted.
+    pub command: String,
+}
+
+/// Provider File schema — `~/.config/termcmp/providers/<any>.toml`.
+///
+/// A provider is a bundle of terminal-multiplexer actions (herdr, tmux, …).
+/// Enabled by listing [`ProviderFile::name`] in `[providers].enabled`; the
+/// filename itself is irrelevant (hot-reload and dedup key off `name`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ProviderFile {
+    /// Identity + display name. Must be non-empty; matched against `[providers].enabled`.
+    pub name: String,
+    /// Single Nerd Font glyph. Empty → caller resolves to `'!'`.
+    pub nerd_icon: String,
+    /// Single ASCII glyph (used when `popup.nerd_icons` is false). Empty → `'!'`.
+    pub fallback_icon: String,
+    pub commands: Vec<ProviderCommand>,
 }
 
 /// User-facing theme config — a name selector, deserialized from `config.toml`.
@@ -768,6 +804,88 @@ fn built_in_theme(name: &str) -> Option<ResolvedTheme> {
     Some(apply_overrides(&theme, ResolvedTheme::default()))
 }
 
+/// Scan `<base_dir>/providers/*.toml`, parse each, and return only those whose
+/// `name` appears in `enabled`.
+///
+/// Deterministic (sorted by file name); a duplicate `name` across files keeps
+/// the first file and warns on the rest. Malformed files, files with an empty
+/// `name`, and commands with an empty `name`/`command` are skipped with a
+/// `tracing::warn!`. Enabled names with no matching file are logged at debug.
+pub fn load_enabled_providers(base_dir: Option<&Path>, enabled: &[String]) -> Vec<ProviderFile> {
+    let Some(base_dir) = base_dir else {
+        return Vec::new();
+    };
+    let dir = base_dir.join("providers");
+    if !dir.is_dir() {
+        return Vec::new();
+    }
+
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        tracing::warn!("failed to read provider dir {}", dir.display());
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        .collect();
+    paths.sort_by_key(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+
+    let mut loaded: Vec<ProviderFile> = Vec::new();
+    for path in paths {
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            tracing::warn!("failed to read provider file {}", path.display());
+            continue;
+        };
+        let mut file = match toml::from_str::<ProviderFile>(&contents) {
+            Ok(file) => file,
+            Err(e) => {
+                tracing::warn!("failed to parse provider file {}: {e}", path.display());
+                continue;
+            }
+        };
+        if file.name.trim().is_empty() {
+            tracing::warn!(
+                "provider file {} has an empty name, ignoring",
+                path.display()
+            );
+            continue;
+        }
+        if loaded.iter().any(|seen| seen.name == file.name) {
+            tracing::warn!(
+                "provider name {:?} duplicated by {}, ignoring",
+                file.name,
+                path.display()
+            );
+            continue;
+        }
+        if !enabled.iter().any(|name| name == &file.name) {
+            continue;
+        }
+        file.commands.retain(|command| {
+            let ok = !command.name.trim().is_empty() && !command.command.trim().is_empty();
+            if !ok {
+                tracing::warn!(
+                    "provider {:?}: command with empty name or command, ignoring",
+                    file.name
+                );
+            }
+            ok
+        });
+        loaded.push(file);
+    }
+
+    for wanted in enabled {
+        if !loaded.iter().any(|provider| provider.name == *wanted) {
+            tracing::debug!("no provider file matches enabled provider {wanted:?}");
+        }
+    }
+    loaded
+}
+
 const MAX_VISIBLE_DEFAULT: usize = 10;
 const MAX_VISIBLE_UPPER: usize = 50;
 const MAX_RESULTS_UPPER: usize = 10_000;
@@ -832,6 +950,8 @@ pub fn all_field_paths() -> Vec<&'static str> {
         "keybindings.navigate_down",
         "keybindings.trigger",
         "keybindings.toggle_match_mode",
+        // [providers]
+        "providers.enabled",
         // [theme] — 2 fields
         "theme.name",
         "theme.transparency",
@@ -920,6 +1040,7 @@ impl TermcmpConfig {
         // suggest.order: drop unknown names, deduplicate, warn on both.
         {
             const VALID_ORDER_NAMES: &[&str] = &[
+                "actions",
                 "commands",
                 "filesystem",
                 "zoxide",
@@ -1362,6 +1483,7 @@ match_mode = "substring"
         assert_eq!(
             TermcmpConfig::default().suggest.order,
             vec![
+                "actions".to_string(),
                 "ai".to_string(),
                 "history".to_string(),
                 "shell".to_string(),
@@ -1372,6 +1494,17 @@ match_mode = "substring"
                 "ssh".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn normalize_keeps_every_default_order_name() {
+        // `normalize` drops names outside `VALID_ORDER_NAMES`; a default entry
+        // missing from that list would be silently stripped (and warned about)
+        // on every load, so the two lists must stay in sync.
+        let default_order = SuggestConfig::default().order;
+        let mut cfg = TermcmpConfig::default();
+        cfg.normalize();
+        assert_eq!(cfg.suggest.order, default_order);
     }
 
     #[test]
@@ -2388,11 +2521,168 @@ mod docs_drift_tests {
             "[suggest.providers]",
             "[keybindings]",
             "[theme]",
+            "[providers]",
             "[ai]",
             "[experimental]",
         ];
         for s in sections {
             assert!(doc.contains(s), "CONFIGURATION.md missing section {}", s);
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_loader_tests {
+    use super::*;
+
+    fn providers_dir(base: &Path) -> PathBuf {
+        let dir = base.join("providers");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn enabled(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    const HERDR: &str = r#"
+name = "herdr"
+nerd_icon = ""
+fallback_icon = "!"
+
+[[commands]]
+name = "New vertical split"
+command = "herdr pane split --vertical"
+
+[[commands]]
+name = "Close pane"
+command = "herdr pane close"
+"#;
+
+    #[test]
+    fn returns_only_providers_enabled_by_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = providers_dir(tmp.path());
+        std::fs::write(dir.join("herdr.toml"), HERDR).unwrap();
+        std::fs::write(
+            dir.join("other.toml"),
+            "name = \"other\"\n[[commands]]\nname = \"x\"\ncommand = \"y\"\n",
+        )
+        .unwrap();
+
+        let loaded = load_enabled_providers(Some(tmp.path()), &enabled(&["herdr"]));
+        assert_eq!(loaded.len(), 1, "only the enabled provider loads");
+        assert_eq!(loaded[0].name, "herdr");
+        // Raw icon strings are preserved; the caller resolves empty → '!'.
+        assert_eq!(loaded[0].nerd_icon, "");
+        assert_eq!(loaded[0].fallback_icon, "!");
+        assert_eq!(loaded[0].commands.len(), 2);
+        assert_eq!(loaded[0].commands[0].name, "New vertical split");
+        assert_eq!(loaded[0].commands[1].command, "herdr pane close");
+    }
+
+    #[test]
+    fn empty_enabled_list_loads_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = providers_dir(tmp.path());
+        std::fs::write(dir.join("herdr.toml"), HERDR).unwrap();
+        assert!(load_enabled_providers(Some(tmp.path()), &[]).is_empty());
+    }
+
+    #[test]
+    fn drops_commands_with_blank_name_or_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = providers_dir(tmp.path());
+        std::fs::write(
+            dir.join("herdr.toml"),
+            r#"
+name = "herdr"
+
+[[commands]]
+name = "   "
+command = "echo hi"
+
+[[commands]]
+name = "Real"
+command = "   "
+
+[[commands]]
+name = "Kept"
+command = "echo kept"
+"#,
+        )
+        .unwrap();
+
+        let loaded = load_enabled_providers(Some(tmp.path()), &enabled(&["herdr"]));
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0]
+                .commands
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Kept"]
+        );
+    }
+
+    #[test]
+    fn skips_malformed_and_unnamed_files_without_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = providers_dir(tmp.path());
+        std::fs::write(dir.join("broken.toml"), "name = \"broken\"\ncommands = [").unwrap();
+        std::fs::write(
+            dir.join("blank.toml"),
+            "name = \"\"\n[[commands]]\nname = \"x\"\ncommand = \"y\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("notes.md"), "not a provider").unwrap();
+        std::fs::write(dir.join("herdr.toml"), HERDR).unwrap();
+
+        let loaded = load_enabled_providers(
+            Some(tmp.path()),
+            &enabled(&["herdr", "broken", "blank", "ghost"]),
+        );
+        assert_eq!(
+            loaded.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["herdr"],
+            "malformed/unnamed files and missing names must not load"
+        );
+    }
+
+    #[test]
+    fn duplicate_name_keeps_first_file_in_filename_order() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = providers_dir(tmp.path());
+        std::fs::write(
+            dir.join("a_first.toml"),
+            "name = \"dup\"\n[[commands]]\nname = \"first\"\ncommand = \"one\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b_second.toml"),
+            "name = \"dup\"\n[[commands]]\nname = \"second\"\ncommand = \"two\"\n",
+        )
+        .unwrap();
+
+        let loaded = load_enabled_providers(Some(tmp.path()), &enabled(&["dup"]));
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].commands[0].name, "first");
+    }
+
+    #[test]
+    fn missing_or_absent_dir_yields_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(load_enabled_providers(Some(tmp.path()), &enabled(&["herdr"])).is_empty());
+        assert!(load_enabled_providers(None, &enabled(&["herdr"])).is_empty());
+    }
+
+    #[test]
+    fn config_deserializes_providers_section() {
+        let config: TermcmpConfig = toml::from_str("[providers]\nenabled = [\"herdr\"]\n").unwrap();
+        assert_eq!(config.providers.enabled, vec!["herdr".to_string()]);
+        assert_eq!(
+            TermcmpConfig::default().providers.enabled,
+            Vec::<String>::new()
+        );
     }
 }

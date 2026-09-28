@@ -49,7 +49,7 @@ const DEFAULT_CONFIG_TOML: &str = "\
 # max_results = 50
 # max_history_results = 5
 # match_mode = \"fuzzy\"  # \"fuzzy\" = subsequence (gco -> git checkout); \"substring\" = contiguous (cl -> clone, not calendar)
-# order = [\"ai\", \"history\", \"shell\", \"filesystem\", \"zoxide\", \"commands\", \"env\", \"ssh\"]  # Source-group ordering in the popup; earlier-listed sources appear first
+# order = [\"actions\", \"ai\", \"history\", \"shell\", \"filesystem\", \"zoxide\", \"commands\", \"env\", \"ssh\"]  # Source-group ordering in the popup; earlier-listed sources appear first
 
 # [suggest.providers]
 # commands = true
@@ -68,6 +68,9 @@ const DEFAULT_CONFIG_TOML: &str = "\
 [theme]
 # name = \"dark\"  # Built-in: dark, light, catppuccin, material-darker, gruvbox, nord, dracula, tokyo-night — or a custom themes/<name>.toml file
 # transparency = false  # Clear popup backgrounds so the terminal background shows through
+
+# [providers]
+# enabled = [\"herdr\"]  # Activate terminal-multiplexer provider files in providers/*.toml
 
 # [ai]
 # redact_secrets = true  # Redact API keys, tokens, passwords from buffer/history before sending to LLM providers

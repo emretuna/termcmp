@@ -85,14 +85,14 @@ Controls the suggestion engine behavior.
 | `max_results` | integer | `50` | Maximum total candidates to consider. `0` resets to default `50`; values above `10000` are clamped to `10000`. |
 | `max_history_results` | integer | `5` | Maximum history entries shown in popup. Set to `0` to disable history. |
 | `match_mode` | string | `"fuzzy"` | How the typed query filters candidates. `"fuzzy"` matches characters as an in-order subsequence (`gco` → `git checkout`); `"substring"` requires the characters to appear contiguously (`cl` → `clone`, `include`, but not `calendar`). Space-separated words are matched as independent substrings. |
-| `order` | string array | `["ai", "history", "shell", "filesystem", "zoxide", "commands", "env", "ssh"]` | Source-group ordering for the popup. All items from an earlier-listed source appear before all items from a later one; within a group, items sort by score, then priority, then text. Recognised names: `commands`, `filesystem`, `history`, `ai`, `env`, `shell`, `ssh`, `zoxide`. Unknown names are dropped with a warning. |
+| `order` | string array | `["actions", "ai", "history", "shell", "filesystem", "zoxide", "commands", "env", "ssh"]` | Source-group ordering for the popup. All items from an earlier-listed source appear before all items from a later one; within a group, items sort by score, then priority, then text. Recognised names: `actions`, `commands`, `filesystem`, `history`, `ai`, `env`, `shell`, `ssh`, `zoxide`. Unknown names are dropped with a warning. |
 
 ```toml
 [suggest]
 max_results = 50
 max_history_results = 5
 match_mode = "fuzzy"  # or "substring" for contiguous matching
-order = ["ai", "history", "shell", "filesystem", "zoxide", "commands", "env", "ssh"]
+order = ["actions", "ai", "history", "shell", "filesystem", "zoxide", "commands", "env", "ssh"]
 ```
 
 Shell history loads up to 10,000 entries.
@@ -127,6 +127,11 @@ dropped with a warning (`normalize:879-909`).
 `providers.shell_completions`). There is no Bash provider — bash keeps
 markers + manual Ctrl+/ and `shell_env` stays `None`, so env-aware providers
 degrade under bash.
+
+**`actions` order name:** the group for terminal-multiplexer provider commands
+declared in `~/.config/termcmp/providers/*.toml` (see [`[providers]`](#providers)).
+Dropping it from `suggest.order` does not disable those rows — it only sorts them
+after every named source.
 
 ### `[keybindings]`
 
@@ -215,6 +220,47 @@ Examples:
 - `"dim"` — faint text (default description style)
 - `"fg:#cdd6f4 bg:#585b70 bold"` — Catppuccin-style selection
 - `"bold underline fg:208"` — bold underlined orange text
+
+### `[providers]`
+
+Activate terminal-multiplexer providers (herdr, tmux, …). Each provider is a TOML file in `~/.config/termcmp/providers/` that bundles named shell commands. Enabled providers inject their commands into the normal popup as fuzzy-matched suggestions: the typed buffer filters them exactly like command/history candidates. Accepting one with the `accept` key (Tab) fills the prompt with the full command for review; accepting with `accept_and_enter` (Enter) injects and runs it immediately.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | string array | `[]` | Provider `name`s to activate. Empty disables the feature. Names match the `name` field inside each provider file, not the filename. Files with an empty or duplicate `name`, and commands with an empty `name` or `command`, are skipped with a warning. |
+
+```toml
+[providers]
+enabled = ["herdr"]
+```
+
+#### Provider File Format
+
+`~/.config/termcmp/providers/herdr.toml`:
+
+```toml
+name = "herdr"
+nerd_icon = ""      # single Nerd Font glyph; empty falls back to '!'
+fallback_icon = "!" # single ASCII glyph used when popup.nerd_icons = false
+
+[[commands]]
+name = "New vertical split"
+command = "herdr pane split --vertical"
+
+[[commands]]
+name = "Close pane"
+command = "herdr pane close"
+```
+
+`name` is required (a file without it is ignored). `commands` are offered in file order, and the popup description shows `"<provider> — <command>"`. Editing or adding a `providers/*.toml` file takes effect on the next popup trigger — no restart.
+
+Provider actions form their own popup group; `suggest.order` ranks that group
+through the `actions` name (see [`[suggest]`](#suggest)).
+
+Actions sort first in the popup, so navigation matters for the keys above: Enter
+runs an action only once the row has been selected with the navigation keys,
+whereas an un-navigated Enter submits what you typed. `popup.tab_accepts_top`
+relaxes that for Tab only — it never makes Enter auto-run a command.
 
 ### `[ai]`
 
@@ -503,6 +549,9 @@ commands = true
 filesystem = true
 shell_completions = true
 
+[providers]
+enabled = ["herdr"]
+
 [keybindings]
 accept = "tab"
 accept_and_enter = "enter"
@@ -554,6 +603,7 @@ name = "GPT-4o"
 | Section | Fields | Live Reload |
 |---------|--------|:-----------:|
 | `[theme]` | `name` | Yes |
+| `[providers]` | `enabled`, plus every `providers/*.toml` file | Yes |
 | `[keybindings]` | All fields | Yes |
 | `[trigger]` | `delay_ms`, `auto_trigger` | Yes |
 | `[popup]` | `max_visible`, `borders`, `border_radius`, `feedback_dismiss_ms`, `spinner`, `show_provider_errors`, `render_block_ms`, `min_width`, `max_width`, `description_box`, `description_box_max_width`, `description_box_lines`, `description_box_debounce_ms`, `tab_accepts_top`, `index_hints`, `key_hints`, `nerd_icons`, `small_terminal_threshold`, `small_terminal_max_visible`, `compact_mode`, `tui_process_blocklist` | Yes |

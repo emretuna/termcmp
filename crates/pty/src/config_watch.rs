@@ -2,7 +2,8 @@
 //!
 //! Watches `config.toml` for modifications and live-updates the handler's
 //! theme, keybindings, trigger chars, popup dimensions, and description-box
-//! settings without restarting.
+//! settings without restarting. Provider files (`providers/*.toml`) are watched
+//! too: any edit or creation re-loads the enabled multiplexer actions.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,6 +78,17 @@ fn is_theme_file(path: &Path) -> bool {
             .unwrap_or(false)
 }
 
+/// Whether `path` is a provider file (`<...>/providers/*.toml`). Unlike
+/// themes, ANY provider file edit or creation triggers a reload.
+fn is_provider_file(path: &Path) -> bool {
+    path.extension().map(|e| e == "toml").unwrap_or(false)
+        && path
+            .parent()
+            .and_then(|d| d.file_name())
+            .map(|d| d == "providers")
+            .unwrap_or(false)
+}
+
 /// Spawn a background task that watches `config_path` and the active theme
 /// file (`<config_dir>/themes/<name>.toml`) for modifications and hot-reloads
 ///
@@ -108,6 +120,15 @@ pub fn spawn_config_watcher(
     if themes_dir.is_dir() {
         if let Err(e) = watcher.watch(&themes_dir, RecursiveMode::NonRecursive) {
             tracing::debug!("theme dir watch failed ({}): {e}", themes_dir.display());
+        }
+    }
+    let providers_dir = watch_dir.join("providers");
+    if providers_dir.is_dir() {
+        if let Err(e) = watcher.watch(&providers_dir, RecursiveMode::NonRecursive) {
+            tracing::debug!(
+                "provider dir watch failed ({}): {e}",
+                providers_dir.display()
+            );
         }
     }
 
@@ -164,12 +185,14 @@ pub fn spawn_config_watcher(
                         .map(|f| f == config_file_name)
                         .unwrap_or(false)
                         || watched_theme.as_ref().is_some_and(|t| same_file(p, t))
+                        || is_provider_file(p)
                 }),
                 EventKind::Create(_) => event.paths.iter().any(|p| {
                     p.file_name()
                         .map(|f| f == config_file_name)
                         .unwrap_or(false)
                         || is_theme_file(p)
+                        || is_provider_file(p)
                 }),
                 _ => false,
             };
@@ -291,6 +314,10 @@ fn apply_config_reload(
         let (async_providers, ask_ai) = crate::proxy::build_providers(config, shell_kind);
         h.set_async_providers(async_providers);
         h.set_ask_ai_provider(ask_ai);
+        h.set_providers(config::load_enabled_providers(
+            config::config_dir().as_deref(),
+            &config.providers.enabled,
+        ));
         // Repaint a visible popup so theme changes (e.g. transparency)
         // take effect immediately instead of waiting for the next keystroke.
         h.repaint_visible_into(parser, &mut overlay_bytes);

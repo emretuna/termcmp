@@ -16,7 +16,8 @@ use overlay::{
     render_indicator_row, DetailLayout, FeedbackKind, PopupTheme,
 };
 use parser::TerminalParser;
-use suggest::{AsyncProvider, Suggestion, SuggestionEngine, SuggestionKind};
+use suggest::{priority::Priority, types::ProviderActionSpec};
+use suggest::{AsyncProvider, Suggestion, SuggestionEngine, SuggestionKind, SuggestionSource};
 use terminal::TerminalProfile;
 use tokio::sync::{mpsc, Notify};
 
@@ -59,14 +60,19 @@ pub enum KeyOutcome {
     /// The user accepted the "Ask AI" sentinel; the proxy must run the LLM
     /// on demand and inject the response. No bytes are forwarded yet.
     AskAiAccept,
+    /// The user accepted a provider action. `execute=true` when the
+    /// accept_and_enter key was used (run + newline), `false` when the
+    /// accept key was used (fill only). The proxy injects the command.
+    ProviderAction { command: String, execute: bool },
 }
 
 impl KeyOutcome {
-    /// The forward bytes, or `&[]` for `AskAiAccept`.
+    /// The forward bytes, or `&[]` for `AskAiAccept` / `ProviderAction`.
     pub fn forward_bytes(&self) -> &[u8] {
         match self {
             KeyOutcome::Forward(b) => b,
             KeyOutcome::AskAiAccept => &[],
+            KeyOutcome::ProviderAction { .. } => &[],
         }
     }
 }
@@ -812,6 +818,22 @@ impl InputHandler {
     /// Hot-reload hook: replace the Ask AI provider (None disables the item).
     pub fn set_ask_ai_provider(&mut self, provider: Option<Arc<llm::LlmProvider>>) {
         self.ask_ai_provider = provider;
+    }
+    /// Hot-swap the provider action candidates (terminal-multiplexer commands).
+    pub fn with_providers(mut self, providers: Vec<config::ProviderFile>) -> Self {
+        self.set_providers(providers);
+        self
+    }
+
+    /// Hot-reload hook: rebuild the provider action candidates from disk-loaded files.
+    pub fn set_providers(&mut self, providers: Vec<config::ProviderFile>) {
+        let actions = provider_actions_from(&providers);
+        tracing::debug!(
+            actions = actions.len(),
+            files = ?providers.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            "installed multiplexer provider actions",
+        );
+        self.engine.set_provider_actions(actions);
     }
 
     /// Clone of the Ask AI provider for the proxy's on-demand spawn task.
@@ -1604,6 +1626,18 @@ impl InputHandler {
                 // No bytes are forwarded now; nothing is auto-executed.
                 return KeyOutcome::AskAiAccept;
             }
+            if self.effective_selection_is_provider_action() {
+                let cmd = self.suggestions[self.effective_selected().unwrap()]
+                    .action
+                    .as_ref()
+                    .unwrap()
+                    .command
+                    .clone();
+                return KeyOutcome::ProviderAction {
+                    command: cmd,
+                    execute: false,
+                };
+            }
             if self.effective_selected().is_none() {
                 self.dismiss(stdout);
                 return KeyOutcome::Forward(key_to_bytes(key));
@@ -1615,6 +1649,22 @@ impl InputHandler {
                 // Safety: never auto-run an AI answer. Divert to the same on-demand
                 // path (fills buffer, user presses Enter themselves).
                 return KeyOutcome::AskAiAccept;
+            }
+            // `popup.tab_accepts_top` only makes Tab accept the un-navigated
+            // top row. Enter must fire an action exclusively after explicit
+            // navigation: otherwise a stray Enter on a top-ranked provider
+            // action runs the multiplexer command instead of the typed line.
+            if self.overlay.selected.is_some() && self.effective_selection_is_provider_action() {
+                let cmd = self.suggestions[self.effective_selected().unwrap()]
+                    .action
+                    .as_ref()
+                    .unwrap()
+                    .command
+                    .clone();
+                return KeyOutcome::ProviderAction {
+                    command: cmd,
+                    execute: true,
+                };
             }
             if self.overlay.selected.is_some() {
                 let mut forward = self.accept_suggestion(parser);
@@ -1745,6 +1795,12 @@ impl InputHandler {
         self.effective_selected()
             .and_then(|i| self.suggestions.get(i))
             .is_some_and(|s| s.kind == suggest::SuggestionKind::AskAi)
+    }
+    /// True when the effective selection is a provider action row.
+    fn effective_selection_is_provider_action(&self) -> bool {
+        self.effective_selected()
+            .and_then(|i| self.suggestions.get(i))
+            .is_some_and(|s| s.kind == SuggestionKind::ProviderAction && s.action.is_some())
     }
 
     /// Accept the current suggestion, with directory chaining for paths ending in '/'.
@@ -3505,6 +3561,34 @@ impl InputHandler {
         bytes.extend_from_slice(response.as_bytes());
         bytes
     }
+    /// Delete the current buffer up to the cursor, insert `command`, and append
+    /// `\r` when `execute`. Mirrors `ask_ai_forward_bytes` (delete with 0x7F),
+    /// reusing the same delete-then-write model so the injected command replaces
+    /// the typed prefix instead of being appended to it.
+    pub fn provider_action_forward_bytes(
+        &self,
+        parser: &Arc<Mutex<TerminalParser>>,
+        command: &str,
+        execute: bool,
+    ) -> Vec<u8> {
+        let p = match parser.lock() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("parser poisoned in provider_action_forward_bytes: {e}");
+                return Vec::new();
+            }
+        };
+        let state = p.state();
+        let buffer = state.command_buffer().unwrap_or("");
+        let cursor = state.buffer_cursor();
+        let delete = cursor.min(buffer.chars().count());
+        let mut bytes = vec![0x7F; delete];
+        bytes.extend_from_slice(command.as_bytes());
+        if execute {
+            bytes.push(0x0D);
+        }
+        bytes
+    }
 
     fn teardown_popup(&mut self, stdout: &mut dyn Write, preserve_trigger_request: bool) {
         let detail_layout = self.last_detail_layout.clone();
@@ -3730,6 +3814,31 @@ impl InputHandler {
         self.pending_failed.clear();
         self.pending_empty_count = 0;
     }
+}
+
+/// Build popup candidates from enabled multiplexer provider files, in file order.
+fn provider_actions_from(providers: &[config::ProviderFile]) -> Vec<Suggestion> {
+    let mut out = Vec::new();
+    for provider in providers {
+        let nerd_icon = provider.nerd_icon.chars().next().unwrap_or('!');
+        let fallback_icon = provider.fallback_icon.chars().next().unwrap_or('!');
+        for cmd in &provider.commands {
+            out.push(Suggestion {
+                text: cmd.name.clone(),
+                description: Some(format!("{} — {}", provider.name, cmd.command)),
+                kind: SuggestionKind::ProviderAction,
+                source: SuggestionSource::ProviderAction,
+                priority: Some(Priority::new(90)),
+                action: Some(ProviderActionSpec {
+                    command: cmd.command.clone(),
+                    nerd_icon,
+                    fallback_icon,
+                }),
+                ..Default::default()
+            });
+        }
+    }
+    out
 }
 
 /// Terminal cursor location (row, col), read under the parser lock.
@@ -6450,6 +6559,209 @@ mod tests {
         let mut buf = Vec::new();
         let outcome = handler.process_key(&KeyEvent::Tab, &parser, &mut buf);
         assert_eq!(outcome, KeyOutcome::AskAiAccept);
+    }
+    fn provider_action_suggestion(text: &str, command: &str) -> Suggestion {
+        Suggestion {
+            text: text.to_string(),
+            description: Some(format!("herdr — {command}")),
+            kind: SuggestionKind::ProviderAction,
+            source: SuggestionSource::ProviderAction,
+            action: Some(ProviderActionSpec {
+                command: command.to_string(),
+                nerd_icon: '!',
+                fallback_icon: '!',
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn provider_action_accept_routes_tab_and_enter() {
+        let mut handler =
+            make_visible_handler(vec![provider_action_suggestion("split", "echo hi")]);
+        handler.overlay.selected = Some(0);
+        let parser = Arc::new(Mutex::new(parser::TerminalParser::new(24, 80)));
+        let mut buf = Vec::new();
+        assert_eq!(
+            handler.process_key(&KeyEvent::Tab, &parser, &mut buf),
+            KeyOutcome::ProviderAction {
+                command: "echo hi".to_string(),
+                execute: false,
+            }
+        );
+        assert_eq!(
+            handler.process_key(&KeyEvent::Enter, &parser, &mut buf),
+            KeyOutcome::ProviderAction {
+                command: "echo hi".to_string(),
+                execute: true,
+            }
+        );
+
+        let mut normal = make_visible_handler(vec![command_suggestion("git status", None)]);
+        normal.overlay.selected = Some(0);
+        let outcome = normal.process_key(&KeyEvent::Tab, &parser, &mut buf);
+        assert!(
+            matches!(outcome, KeyOutcome::Forward(_)),
+            "normal Command selection keeps the ordinary forward outcome, got {outcome:?}"
+        );
+    }
+
+    /// Actions rank first, so the un-navigated top row is a provider action
+    /// whenever `popup.tab_accepts_top` is on. Tab may accept it (that is the
+    /// opt-in), Enter must not: plain Enter submits what the user typed, or a
+    /// stray Enter would run a multiplexer command instead.
+    #[test]
+    fn stray_enter_does_not_execute_unnavigated_provider_action() {
+        let parser = Arc::new(Mutex::new(parser::TerminalParser::new(24, 80)));
+        let mut buf = Vec::new();
+
+        let mut handler =
+            make_visible_handler(vec![provider_action_suggestion("split", "echo hi")])
+                .with_tab_accepts_top(true);
+        assert_eq!(handler.overlay.selected, None);
+        assert_eq!(
+            handler.process_key(&KeyEvent::Enter, &parser, &mut buf),
+            KeyOutcome::Forward(vec![0x0D]),
+            "un-navigated Enter must submit the typed line, never an action"
+        );
+
+        let mut tab_handler =
+            make_visible_handler(vec![provider_action_suggestion("split", "echo hi")])
+                .with_tab_accepts_top(true);
+        assert_eq!(
+            tab_handler.process_key(&KeyEvent::Tab, &parser, &mut buf),
+            KeyOutcome::ProviderAction {
+                command: "echo hi".to_string(),
+                execute: false,
+            },
+            "tab_accepts_top still fills the top action row without executing"
+        );
+
+        let mut navigated =
+            make_visible_handler(vec![provider_action_suggestion("split", "echo hi")]);
+        navigated.overlay.selected = Some(0);
+        assert_eq!(
+            navigated.process_key(&KeyEvent::Enter, &parser, &mut buf),
+            KeyOutcome::ProviderAction {
+                command: "echo hi".to_string(),
+                execute: true,
+            },
+            "a navigated action row executes on Enter"
+        );
+    }
+
+    #[test]
+    fn provider_action_forward_bytes_replaces_prefix() {
+        let handler = make_handler();
+        let parser = Arc::new(Mutex::new(parser::TerminalParser::new(24, 80)));
+        parser
+            .lock()
+            .unwrap()
+            .state_mut()
+            .predict_command_buffer("spl".to_string(), 3);
+        let mut expected = vec![0x7F; 3];
+        expected.extend_from_slice(b"echo hi");
+        assert_eq!(
+            handler.provider_action_forward_bytes(&parser, "echo hi", false),
+            expected
+        );
+        expected.push(0x0D);
+        assert_eq!(
+            handler.provider_action_forward_bytes(&parser, "echo hi", true),
+            expected
+        );
+    }
+
+    #[test]
+    fn provider_actions_from_builds_rows_in_file_order() {
+        let files = vec![config::ProviderFile {
+            name: "herdr".to_string(),
+            nerd_icon: "H".to_string(),
+            fallback_icon: String::new(),
+            commands: vec![
+                config::ProviderCommand {
+                    name: "first".to_string(),
+                    command: "cmd-one".to_string(),
+                },
+                config::ProviderCommand {
+                    name: "second".to_string(),
+                    command: "cmd-two".to_string(),
+                },
+            ],
+        }];
+        let actions = provider_actions_from(&files);
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].text, "first");
+        assert_eq!(actions[1].text, "second");
+        assert_eq!(actions[0].description.as_deref(), Some("herdr — cmd-one"));
+        let spec = actions[0].action.as_ref().expect("action payload");
+        assert_eq!(spec.command, "cmd-one");
+        assert_eq!(spec.nerd_icon, 'H');
+        assert_eq!(spec.fallback_icon, '!');
+
+        let empty = vec![config::ProviderFile {
+            name: "tmux".to_string(),
+            nerd_icon: String::new(),
+            fallback_icon: String::new(),
+            commands: vec![config::ProviderCommand {
+                name: "only".to_string(),
+                command: "cmd".to_string(),
+            }],
+        }];
+        let spec = provider_actions_from(&empty)[0]
+            .action
+            .clone()
+            .expect("action payload");
+        assert_eq!(spec.nerd_icon, '!');
+        assert_eq!(spec.fallback_icon, '!');
+    }
+
+    #[test]
+    fn provider_action_survives_live_rerank() {
+        let handler = make_handler();
+        let ranked = handler.rerank_live(
+            "split",
+            "split",
+            vec![
+                provider_action_suggestion("New vertical split", "echo hi"),
+                command_suggestion("git status", None),
+            ],
+        );
+        assert!(
+            ranked
+                .iter()
+                .any(|s| s.kind == SuggestionKind::ProviderAction),
+            "matching provider action must survive live re-rank: {ranked:?}"
+        );
+    }
+
+    /// The proxy builds the popup's source grouping with
+    /// `SourceOrder::from_names(config.suggest.order)`, never with
+    /// `SourceOrder::default_order()`. If the documented default name list and
+    /// the engine's default order drift, sources silently sort last (rank
+    /// `usize::MAX`) — e.g. multiplexer provider actions vanishing to the
+    /// bottom of every popup. This pins the two to the same grouping.
+    #[test]
+    fn default_config_order_matches_engine_default_order() {
+        let from_config = suggest::SourceOrder::from_names(&config::SuggestConfig::default().order);
+        let engine_default = suggest::SourceOrder::default_order();
+        for source in [
+            suggest::SuggestionSource::ProviderAction,
+            suggest::SuggestionSource::Llm,
+            suggest::SuggestionSource::History,
+            suggest::SuggestionSource::Provider,
+            suggest::SuggestionSource::Filesystem,
+            suggest::SuggestionSource::Zoxide,
+            suggest::SuggestionSource::Commands,
+            suggest::SuggestionSource::Env,
+            suggest::SuggestionSource::SshConfig,
+        ] {
+            assert_eq!(
+                from_config.rank(source),
+                engine_default.rank(source),
+                "rank mismatch for {source:?}: default suggest.order must reproduce SourceOrder::default_order()"
+            );
+        }
     }
 
     #[test]

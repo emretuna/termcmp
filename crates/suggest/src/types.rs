@@ -19,6 +19,8 @@ pub enum SuggestionKind {
     Llm,
     /// Sentinel action item: on-demand "Ask AI" trigger, pinned to the popup top.
     AskAi,
+    /// Terminal-multiplexer action; runs a configured command on accept.
+    ProviderAction,
 }
 
 impl SuggestionKind {
@@ -37,6 +39,7 @@ impl SuggestionKind {
             Self::Directory => 25,
             Self::Zoxide => 25,
             Self::FilePath => 20,
+            Self::ProviderAction => 90,
             Self::History => 10,
         })
     }
@@ -55,6 +58,8 @@ pub enum SuggestionSource {
     Provider,
     /// LLM-powered completions.
     Llm,
+    /// Terminal-multiplexer provider command.
+    ProviderAction,
 }
 
 /// User-configured source-group ordering. Lower rank = earlier group in the
@@ -66,11 +71,13 @@ pub struct SourceOrder {
 }
 
 impl SourceOrder {
-    /// Default order matching `config::SuggestConfig::default`: AI,
-    /// history, shell completions, filesystem, zoxide, commands, environment, SSH.
+    /// Default order matching `config::SuggestConfig::default`: multiplexer
+    /// provider actions, AI, history, shell completions, filesystem, zoxide,
+    /// commands, environment, SSH.
     pub fn default_order() -> Self {
         Self {
             order: vec![
+                SuggestionSource::ProviderAction,
                 SuggestionSource::Llm,
                 SuggestionSource::History,
                 SuggestionSource::Provider,
@@ -84,13 +91,14 @@ impl SourceOrder {
     }
 
     /// Parse user-facing config strings into a `SourceOrder`.
-    /// Recognised names: `commands`, `filesystem`, `history`, `ai`, `env`,
-    /// `shell`, `zoxide`, `ssh`. Unrecognised names are silently skipped.
+    /// Recognised names: `actions`, `commands`, `filesystem`, `history`, `ai`,
+    /// `env`, `shell`, `zoxide`, `ssh`. Unrecognised names are silently skipped.
     pub fn from_names(names: &[String]) -> Self {
         let order = names
             .iter()
             .filter_map(|n| match n.as_str() {
                 "commands" => Some(SuggestionSource::Commands),
+                "actions" => Some(SuggestionSource::ProviderAction),
                 "filesystem" => Some(SuggestionSource::Filesystem),
                 "zoxide" => Some(SuggestionSource::Zoxide),
                 "history" => Some(SuggestionSource::History),
@@ -132,6 +140,21 @@ pub struct Suggestion {
     /// the kind's base priority (see `SuggestionKind::base_priority`).
     /// Higher values rank earlier in the popup.
     pub priority: Option<Priority>,
+    /// Payload for `SuggestionKind::ProviderAction` rows; `None` for every
+    /// other kind. Skipped by serde: never crosses a wire/JSON boundary.
+    #[serde(skip)]
+    pub action: Option<ProviderActionSpec>,
+}
+
+/// Accept-time payload for a multiplexer action row.
+#[derive(Debug, Clone)]
+pub struct ProviderActionSpec {
+    /// Shell command injected on accept.
+    pub command: String,
+    /// Nerd Font glyph (used when `popup.nerd_icons` is true).
+    pub nerd_icon: char,
+    /// ASCII fallback glyph (used when `popup.nerd_icons` is false).
+    pub fallback_icon: char,
 }
 
 impl Default for Suggestion {
@@ -152,6 +175,7 @@ impl Default for Suggestion {
             score: 0,
             match_indices: Vec::new(),
             priority: None,
+            action: None,
         }
     }
 }
@@ -199,6 +223,14 @@ mod source_order {
     }
 
     #[test]
+    fn from_names_maps_actions_to_provider_action() {
+        let order = SourceOrder::from_names(&["commands".into(), "actions".into()]);
+        assert_eq!(order.rank(SuggestionSource::Commands), 0);
+        assert_eq!(order.rank(SuggestionSource::ProviderAction), 1);
+        assert_eq!(order.rank(SuggestionSource::Llm), usize::MAX);
+    }
+
+    #[test]
     fn default_has_all_sources() {
         let order = SourceOrder::default();
         for source in [
@@ -210,6 +242,7 @@ mod source_order {
             SuggestionSource::SshConfig,
             SuggestionSource::Provider,
             SuggestionSource::Llm,
+            SuggestionSource::ProviderAction,
         ] {
             assert!(
                 order.rank(source) < usize::MAX,

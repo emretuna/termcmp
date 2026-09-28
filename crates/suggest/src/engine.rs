@@ -92,6 +92,10 @@ pub struct SuggestionEngine {
     frecency: crate::frecency::FrecencyStore,
     /// Suggestion settings hot-swappable at runtime via [`Self::set_config`].
     config: std::sync::RwLock<LiveSuggestConfig>,
+    /// Terminal-multiplexer provider actions, hot-swapped by the PTY handler
+    /// on startup and provider-file reload. Its own lock: these candidates
+    /// are not part of [`LiveSuggestConfig`].
+    provider_actions: std::sync::RwLock<Vec<Suggestion>>,
 }
 
 impl SuggestionEngine {
@@ -106,6 +110,7 @@ impl SuggestionEngine {
             alias_map: AliasStore::load(shell),
             frecency: crate::frecency::FrecencyStore::load(),
             config: std::sync::RwLock::new(LiveSuggestConfig::default()),
+            provider_actions: std::sync::RwLock::new(Vec::new()),
         })
     }
 
@@ -149,6 +154,16 @@ impl SuggestionEngine {
     /// callers can hold it across a rank without keeping the read lock.
     pub fn config(&self) -> LiveSuggestConfig {
         config_lock(&self.config).clone()
+    }
+
+    /// Hot-swap the provider action candidates (kind/source = ProviderAction).
+    pub fn set_provider_actions(&self, actions: Vec<Suggestion>) {
+        *config_lock_mut(&self.provider_actions) = actions;
+    }
+
+    /// Owned snapshot of the current provider action candidates.
+    fn provider_actions_snapshot(&self) -> Vec<Suggestion> {
+        config_lock(&self.provider_actions).clone()
     }
 
     /// The active query match strategy. Read by the PTY handler so its live
@@ -554,6 +569,11 @@ impl SuggestionEngine {
             }
         }
 
+        // Provider actions join the pool for every ranking path (command
+        // position, redirect, filesystem/arg, zoxide): they are ordinary
+        // fuzzy candidates, so the same pass filters and sorts them.
+        candidates.extend(self.provider_actions_snapshot());
+
         // Arrange input: source-order groups, then priority within group.
         // Frizbee's ScoreThenIndexAsc preserves this as tiebreak for equal
         // scores.
@@ -604,6 +624,7 @@ mod tests {
             alias_map: AliasStore::empty(),
             frecency: crate::frecency::FrecencyStore::in_memory(),
             config: std::sync::RwLock::new(LiveSuggestConfig::default()),
+            provider_actions: std::sync::RwLock::new(Vec::new()),
         }
     }
 
@@ -635,6 +656,77 @@ mod tests {
         let results = engine.suggest_sync(&ctx, Path::new("/tmp"), "gi").unwrap();
         // Should have "git" from both commands and history
         assert!(results.iter().any(|s| s.text == "git"));
+    }
+
+    #[test]
+    fn provider_actions_are_fuzzy_matched_candidates() {
+        let engine = make_engine();
+        engine.set_provider_actions(vec![Suggestion {
+            text: "New vertical split".into(),
+            description: Some("herdr — herdr pane split --vertical".into()),
+            kind: SuggestionKind::ProviderAction,
+            source: SuggestionSource::ProviderAction,
+            action: Some(crate::types::ProviderActionSpec {
+                command: "herdr pane split --vertical".into(),
+                nerd_icon: 'x',
+                fallback_icon: '!',
+            }),
+            ..Default::default()
+        }]);
+
+        let ctx = make_ctx(None, vec![], "split", 0);
+        let results = engine
+            .suggest_sync(&ctx, Path::new("/tmp"), "split")
+            .unwrap();
+        let action = results
+            .iter()
+            .find(|s| s.kind == SuggestionKind::ProviderAction)
+            .expect("matching provider action must survive filtering");
+        assert_eq!(action.text, "New vertical split");
+        assert_eq!(
+            action.action.as_ref().unwrap().command,
+            "herdr pane split --vertical"
+        );
+
+        // An empty query matches everything: actions show on a blank trigger.
+        let ctx = make_ctx(None, vec![], "", 0);
+        let results = engine.suggest_sync(&ctx, Path::new("/tmp"), "").unwrap();
+        assert!(results
+            .iter()
+            .any(|s| s.text == "New vertical split" && s.kind == SuggestionKind::ProviderAction));
+
+        // Queries that don't match filter them out, like every other source.
+        let ctx = make_ctx(None, vec![], "zzz", 0);
+        let results = engine.suggest_sync(&ctx, Path::new("/tmp"), "zzz").unwrap();
+        assert!(!results
+            .iter()
+            .any(|s| s.kind == SuggestionKind::ProviderAction));
+    }
+
+    #[test]
+    fn provider_actions_group_before_command_candidates() {
+        let engine = make_engine();
+        engine.set_provider_actions(vec![Suggestion {
+            text: "git worktree prune".into(),
+            kind: SuggestionKind::ProviderAction,
+            source: SuggestionSource::ProviderAction,
+            ..Default::default()
+        }]);
+
+        let ctx = make_ctx(None, vec![], "gi", 0);
+        let results = engine.suggest_sync(&ctx, Path::new("/tmp"), "gi").unwrap();
+        let action_at = results
+            .iter()
+            .position(|s| s.source == SuggestionSource::ProviderAction)
+            .expect("provider action listed for a matching query");
+        let command_at = results
+            .iter()
+            .position(|s| s.text == "git" && s.source == SuggestionSource::Commands)
+            .expect("`git` command candidate");
+        assert!(
+            action_at < command_at,
+            "provider actions must form the first source group"
+        );
     }
 
     #[test]

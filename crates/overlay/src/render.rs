@@ -1,6 +1,7 @@
 use std::io::Write;
 
 use anyhow::{bail, Result};
+use suggest::types::ProviderActionSpec;
 use suggest::{Suggestion, SuggestionKind};
 use terminal::TerminalProfile;
 
@@ -1206,17 +1207,18 @@ pub(crate) fn sanitize_display_text(text: &str) -> String {
 pub(crate) fn kind_icon(kind: SuggestionKind, nerd_icons: bool) -> char {
     if nerd_icons {
         match kind {
-            SuggestionKind::Command => '\u{F018D}',       // console
-            SuggestionKind::Subcommand => '\u{F07B7}',    // chevron-right
-            SuggestionKind::Flag => '\u{F0240}',          // flag
-            SuggestionKind::FilePath => '\u{F0214}',      // file
-            SuggestionKind::Directory => '\u{F024B}',     // folder
-            SuggestionKind::Zoxide => '\u{F0B07}',        // zoxide
-            SuggestionKind::History => '\u{F02DA}',       // time
-            SuggestionKind::EnvVar => '\u{F022E}',        // usd
-            SuggestionKind::ProviderValue => '\u{F05B7}', // wrench
-            SuggestionKind::Llm => '\u{F06A9}',           // cog
-            SuggestionKind::AskAi => '\u{F169F}',         // question-sign
+            SuggestionKind::Command => '\u{F018D}',        // console
+            SuggestionKind::Subcommand => '\u{F07B7}',     // chevron-right
+            SuggestionKind::Flag => '\u{F0240}',           // flag
+            SuggestionKind::FilePath => '\u{F0214}',       // file
+            SuggestionKind::Directory => '\u{F024B}',      // folder
+            SuggestionKind::Zoxide => '\u{F0B07}',         // zoxide
+            SuggestionKind::History => '\u{F02DA}',        // time
+            SuggestionKind::EnvVar => '\u{F022E}',         // usd
+            SuggestionKind::ProviderValue => '\u{F05B7}',  // wrench
+            SuggestionKind::Llm => '\u{F06A9}',            // cog
+            SuggestionKind::AskAi => '\u{F169F}',          // question-sign
+            SuggestionKind::ProviderAction => '\u{F065F}', // puzzle — provider action
         }
     } else {
         match kind {
@@ -1231,14 +1233,43 @@ pub(crate) fn kind_icon(kind: SuggestionKind, nerd_icons: bool) -> char {
             SuggestionKind::ProviderValue => 'w',
             SuggestionKind::Llm => '*',
             SuggestionKind::AskAi => '?',
+            SuggestionKind::ProviderAction => '!',
         }
+    }
+}
+
+/// Gutter icon for a suggestion row.
+///
+/// A row carrying a provider action payload renders that spec's configured
+/// glyph (nerd or ASCII fallback per `nerd_icons`); every other row falls
+/// back to the kind default from [`kind_icon`].
+pub(crate) fn gutter_icon(
+    kind: SuggestionKind,
+    action: Option<&ProviderActionSpec>,
+    nerd_icons: bool,
+) -> char {
+    match action {
+        Some(spec) => {
+            if nerd_icons {
+                spec.nerd_icon
+            } else {
+                spec.fallback_icon
+            }
+        }
+        None => kind_icon(kind, nerd_icons),
     }
 }
 
 /// Write the leading gutter (`" K "`) for a suggestion row. Always occupies
 /// `layout::GUTTER_COLS` display columns.
-fn write_gutter(buf: &mut Vec<u8>, kind: SuggestionKind, is_selected: bool, theme: &PopupTheme) {
-    let kind_char = kind_icon(kind, theme.nerd_icons);
+fn write_gutter(
+    buf: &mut Vec<u8>,
+    kind: SuggestionKind,
+    action: Option<&ProviderActionSpec>,
+    is_selected: bool,
+    theme: &PopupTheme,
+) {
+    let kind_char = gutter_icon(kind, action, theme.nerd_icons);
     if !theme.kind_icon_on.is_empty() {
         ansi::reset(buf);
         emit_bg(buf, theme);
@@ -1445,7 +1476,7 @@ fn format_item(
     is_selected: bool,
     theme: &PopupTheme,
 ) {
-    write_gutter(buf, s.kind, is_selected, theme);
+    write_gutter(buf, s.kind, s.action.as_ref(), is_selected, theme);
 
     let total_width = width as usize;
     let max_text_chars = total_width.saturating_sub(crate::layout::GUTTER_COLS);
@@ -3781,6 +3812,71 @@ mod tests {
         assert_eq!(kind_icon(SuggestionKind::ProviderValue, false), 'w');
         assert_eq!(kind_icon(SuggestionKind::Llm, false), '*');
         assert_eq!(kind_icon(SuggestionKind::AskAi, false), '?');
+    }
+
+    #[test]
+    fn gutter_icon_prefers_provider_action_glyph() {
+        use suggest::types::ProviderActionSpec;
+        let action = ProviderActionSpec {
+            command: "x".into(),
+            nerd_icon: '\u{F0AB0}',
+            fallback_icon: '@',
+        };
+        let suggestion = Suggestion {
+            text: "New vertical split".into(),
+            kind: SuggestionKind::ProviderAction,
+            source: SuggestionSource::ProviderAction,
+            action: Some(action),
+            ..Default::default()
+        };
+        assert_eq!(
+            gutter_icon(suggestion.kind, suggestion.action.as_ref(), true),
+            '\u{F0AB0}'
+        );
+        assert_eq!(
+            gutter_icon(suggestion.kind, suggestion.action.as_ref(), false),
+            '@'
+        );
+    }
+
+    #[test]
+    fn gutter_icon_without_action_falls_back_to_kind() {
+        let plain = make("checkout", None, SuggestionKind::Command);
+        assert_eq!(
+            gutter_icon(plain.kind, plain.action.as_ref(), true),
+            kind_icon(SuggestionKind::Command, true)
+        );
+        assert_eq!(
+            gutter_icon(plain.kind, plain.action.as_ref(), false),
+            kind_icon(SuggestionKind::Command, false)
+        );
+    }
+
+    #[test]
+    fn format_item_emits_provider_action_glyph() {
+        use suggest::types::ProviderActionSpec;
+        let mut buf = Vec::new();
+        let s = Suggestion {
+            text: "New vertical split".into(),
+            kind: SuggestionKind::ProviderAction,
+            source: SuggestionSource::ProviderAction,
+            action: Some(ProviderActionSpec {
+                command: "x".into(),
+                nerd_icon: '\u{F0AB0}',
+                fallback_icon: '@',
+            }),
+            ..Default::default()
+        };
+        format_item(&mut buf, &s, 40, false, &bordered_theme());
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.starts_with(" \u{F0AB0}  New vertical split"),
+            "should render action glyph in gutter: got '{output}'"
+        );
+        assert!(
+            !output.contains('\u{F065F}'),
+            "should not render the kind default glyph: got '{output}'"
+        );
     }
 
     #[test]

@@ -304,6 +304,10 @@ pub async fn run_proxy(
             h = h.with_async_provider(provider);
         }
         h = h.with_ask_ai_provider(ask_ai);
+        h = h.with_providers(config::load_enabled_providers(
+            config::config_dir().as_deref(),
+            &config.providers.enabled,
+        ));
 
         Arc::new(Mutex::new(h))
     };
@@ -668,6 +672,15 @@ pub async fn run_proxy(
                     }
                 }
                 match outcome {
+                    crate::handler::KeyOutcome::ProviderAction { command, execute } => {
+                        spawn_provider_action(
+                            &handler_for_stdin,
+                            &parser_for_stdin,
+                            Arc::clone(&pty_writer),
+                            command,
+                            execute,
+                        );
+                    }
                     crate::handler::KeyOutcome::AskAiAccept => {
                         spawn_ask_ai(
                             &handler_for_stdin,
@@ -2232,6 +2245,59 @@ fn spawn_ask_ai(
             .await;
             if let Err(e) = res {
                 tracing::warn!("ask-ai PTY write task failed: {e}");
+            }
+        }
+    });
+}
+/// Inject a provider action command into the terminal prompt, replacing the
+/// typed prefix. Synchronous (no LLM to await) but writes on `spawn_blocking`
+/// to keep the locks off the async worker.
+fn spawn_provider_action(
+    handler: &Arc<Mutex<InputHandler>>,
+    parser: &Arc<Mutex<TerminalParser>>,
+    pty_writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    command: String,
+    execute: bool,
+) {
+    // 1. Dismiss popup + collect overlay-cleanup bytes.
+    let mut stdout_buf = Vec::new();
+    if let Ok(mut h) = handler.lock() {
+        h.dismiss(&mut stdout_buf);
+    }
+    // 2. Compute forward bytes (buffer replace + command + optional \r).
+    let forward = match handler.lock() {
+        Ok(h) => h.provider_action_forward_bytes(parser, &command, execute),
+        Err(_) => Vec::new(),
+    };
+    tokio::spawn(async move {
+        if !stdout_buf.is_empty() {
+            let res = tokio::task::spawn_blocking(move || {
+                let mut stdout = std::io::stdout().lock();
+                stdout.write_all(&stdout_buf).and_then(|()| stdout.flush())
+            })
+            .await;
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::debug!("provider action stdout cleanup write failed: {e}"),
+                Err(e) => tracing::debug!("provider action stdout cleanup task failed: {e}"),
+            }
+        }
+        if !forward.is_empty() {
+            let res = tokio::task::spawn_blocking(move || {
+                let mut w = match pty_writer.lock() {
+                    Ok(w) => w,
+                    Err(e) => {
+                        tracing::warn!("pty_writer mutex poisoned in provider action: {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = w.write_all(&forward).and_then(|()| w.flush()) {
+                    tracing::warn!("provider action PTY write failed: {e}");
+                }
+            })
+            .await;
+            if let Err(e) = res {
+                tracing::warn!("provider action PTY write task failed: {e}");
             }
         }
     });

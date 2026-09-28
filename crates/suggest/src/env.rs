@@ -54,6 +54,7 @@ where
             score: 0,
             match_indices: Vec::new(),
             priority: None,
+            action: None,
         })
         .collect();
 

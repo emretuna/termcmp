@@ -15,7 +15,7 @@
 use suggest::Suggestion;
 
 use crate::layout::{DESC_GAP_COLS, GUTTER_COLS, TRAILING_PAD_COLS};
-use crate::render::{kind_icon, sanitize_display_text, translate_match_indices};
+use crate::render::{gutter_icon, sanitize_display_text, translate_match_indices};
 use crate::types::{OverlayState, PopupLayout};
 use crate::util::{display_text, truncate_with_ellipsis};
 
@@ -147,7 +147,7 @@ pub fn build_content_row(
     let total_width = item_width as usize;
 
     // 1. Gutter: " K "
-    let icon = kind_icon(s.kind, nerd_icons);
+    let icon = gutter_icon(s.kind, s.action.as_ref(), nerd_icons);
     spans.push(StyledSpan {
         text: format!(" {icon}  "),
         style: SpanStyle::Gutter,
@@ -353,6 +353,7 @@ pub fn build_popup_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::kind_icon;
     use suggest::{SuggestionKind, SuggestionSource};
 
     fn make(text: &str, desc: Option<&str>, kind: SuggestionKind) -> Suggestion {
