@@ -244,12 +244,12 @@ nerd_icon = ""      # single Nerd Font glyph; empty falls back to '!'
 fallback_icon = "!" # single ASCII glyph used when popup.nerd_icons = false
 
 [[commands]]
-name = "New vertical split"
-command = "herdr pane split --vertical"
+name = "Split right"
+command = "herdr pane split --current --direction right"
 
 [[commands]]
-name = "Close pane"
-command = "herdr pane close"
+name = "Close this pane"
+command = "herdr pane close \"$HERDR_PANE_ID\""
 ```
 
 `name` is required (a file without it is ignored). `commands` are offered in file order, and the popup description shows `"<provider> — <command>"`. Editing or adding a `providers/*.toml` file takes effect on the next popup trigger — no restart.
