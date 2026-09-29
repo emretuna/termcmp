@@ -248,15 +248,36 @@ mod tests {
             quote_state: QuoteState::None,
             is_first_segment: true,
         };
-        let results = provider
-            .provide_for_command(
-                &ctx,
-                Path::new("/tmp"),
-                "z",
-                Some(temp.path().to_str().unwrap()),
-            )
-            .unwrap();
-        assert_eq!(results.len(), 1);
+        // `provide_for_command` enforces a 500ms production deadline on the
+        // query child and returns an EMPTY list when it expires (both the
+        // timeout and spawn-failure paths only `warn!`, and tests install no
+        // tracing subscriber). Under a fully loaded `cargo test --workspace`
+        // run the fork/exec alone can blow that window, which surfaces as
+        // `left: 0`. Binary resolution is pinned separately by
+        // `resolve_binary_prefers_shell_path` and output parsing by
+        // `parse_paths_filters_missing_directories_and_caps_results`; what
+        // this test owns is the end-to-end path, so retry a bounded number of
+        // times instead of depending on one scheduling window.
+        let mut results = Vec::new();
+        for _ in 0..6 {
+            results = provider
+                .provide_for_command(
+                    &ctx,
+                    Path::new("/tmp"),
+                    "z",
+                    Some(temp.path().to_str().unwrap()),
+                )
+                .unwrap();
+            if !results.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            results.len(),
+            1,
+            "shim never answered within 6 attempts (each capped at {QUERY_TIMEOUT:?})"
+        );
         assert_eq!(results[0].text, target.to_string_lossy());
         assert_eq!(results[0].source, SuggestionSource::Zoxide);
     }
