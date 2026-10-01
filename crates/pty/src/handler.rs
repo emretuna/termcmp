@@ -819,7 +819,7 @@ impl InputHandler {
     pub fn set_ask_ai_provider(&mut self, provider: Option<Arc<llm::LlmProvider>>) {
         self.ask_ai_provider = provider;
     }
-    /// Hot-swap the provider action candidates (terminal-multiplexer commands).
+    /// Hot-swap the provider action candidates (user-defined commands).
     pub fn with_providers(mut self, providers: Vec<config::ProviderFile>) -> Self {
         self.set_providers(providers);
         self
@@ -831,7 +831,7 @@ impl InputHandler {
         tracing::debug!(
             actions = actions.len(),
             files = ?providers.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
-            "installed multiplexer provider actions",
+            "installed provider actions",
         );
         self.engine.set_provider_actions(actions);
     }
@@ -1653,7 +1653,7 @@ impl InputHandler {
             // `popup.tab_accepts_top` only makes Tab accept the un-navigated
             // top row. Enter must fire an action exclusively after explicit
             // navigation: otherwise a stray Enter on a top-ranked provider
-            // action runs the multiplexer command instead of the typed line.
+            // action runs the provider command instead of the typed line.
             if self.overlay.selected.is_some() && self.effective_selection_is_provider_action() {
                 let cmd = self.suggestions[self.effective_selected().unwrap()]
                     .action
@@ -3816,7 +3816,7 @@ impl InputHandler {
     }
 }
 
-/// Build popup candidates from enabled multiplexer provider files, in file order.
+/// Build popup candidates from enabled provider files, in file order.
 fn provider_actions_from(providers: &[config::ProviderFile]) -> Vec<Suggestion> {
     let mut out = Vec::new();
     for provider in providers {
@@ -6609,7 +6609,7 @@ mod tests {
     /// Actions rank first, so the un-navigated top row is a provider action
     /// whenever `popup.tab_accepts_top` is on. Tab may accept it (that is the
     /// opt-in), Enter must not: plain Enter submits what the user typed, or a
-    /// stray Enter would run a multiplexer command instead.
+    /// stray Enter would run a provider command instead.
     #[test]
     fn stray_enter_does_not_execute_unnavigated_provider_action() {
         let parser = Arc::new(Mutex::new(parser::TerminalParser::new(24, 80)));
@@ -6739,7 +6739,7 @@ mod tests {
     /// `SourceOrder::from_names(config.suggest.order)`, never with
     /// `SourceOrder::default_order()`. If the documented default name list and
     /// the engine's default order drift, sources silently sort last (rank
-    /// `usize::MAX`) — e.g. multiplexer provider actions vanishing to the
+    /// `usize::MAX`) — e.g. provider actions vanishing to the
     /// bottom of every popup. This pins the two to the same grouping.
     #[test]
     fn default_config_order_matches_engine_default_order() {

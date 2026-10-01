@@ -92,7 +92,7 @@ pub struct SuggestionEngine {
     frecency: crate::frecency::FrecencyStore,
     /// Suggestion settings hot-swappable at runtime via [`Self::set_config`].
     config: std::sync::RwLock<LiveSuggestConfig>,
-    /// Terminal-multiplexer provider actions, hot-swapped by the PTY handler
+    /// Custom provider actions, hot-swapped by the PTY handler
     /// on startup and provider-file reload. Its own lock: these candidates
     /// are not part of [`LiveSuggestConfig`].
     provider_actions: std::sync::RwLock<Vec<Suggestion>>,

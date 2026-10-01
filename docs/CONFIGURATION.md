@@ -128,7 +128,7 @@ dropped with a warning (`normalize:879-909`).
 markers + manual Ctrl+/ and `shell_env` stays `None`, so env-aware providers
 degrade under bash.
 
-**`actions` order name:** the group for terminal-multiplexer provider commands
+**`actions` order name:** the group for custom provider commands
 declared in `~/.config/termcmp/providers/*.toml` (see [`[providers]`](#providers)).
 Dropping it from `suggest.order` does not disable those rows — it only sorts them
 after every named source.
@@ -223,7 +223,7 @@ Examples:
 
 ### `[providers]`
 
-Activate terminal-multiplexer providers (herdr, tmux, …). Each provider is a TOML file in `~/.config/termcmp/providers/` that bundles named shell commands. Enabled providers inject their commands into the normal popup as fuzzy-matched suggestions: the typed buffer filters them exactly like command/history candidates. Accepting one with the `accept` key (Tab) fills the prompt with the full command for review; accepting with `accept_and_enter` (Enter) injects and runs it immediately.
+Activate custom providers — user-defined command shortcuts (like shell aliases). Each provider is a TOML file in `~/.config/termcmp/providers/` that bundles named shell commands. Enabled providers inject their commands into the normal popup as fuzzy-matched suggestions: the typed buffer filters them exactly like command/history candidates. Accepting one with the `accept` key (Tab) fills the prompt with the full command for review; accepting with `accept_and_enter` (Enter) injects and runs it immediately.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

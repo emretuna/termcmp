@@ -3,7 +3,7 @@
 //! Watches `config.toml` for modifications and live-updates the handler's
 //! theme, keybindings, trigger chars, popup dimensions, and description-box
 //! settings without restarting. Provider files (`providers/*.toml`) are watched
-//! too: any edit or creation re-loads the enabled multiplexer actions.
+//! too: any edit or creation re-loads the enabled provider actions.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};

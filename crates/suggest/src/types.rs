@@ -19,7 +19,7 @@ pub enum SuggestionKind {
     Llm,
     /// Sentinel action item: on-demand "Ask AI" trigger, pinned to the popup top.
     AskAi,
-    /// Terminal-multiplexer action; runs a configured command on accept.
+    /// Custom provider action; runs a configured command on accept.
     ProviderAction,
 }
 
@@ -58,7 +58,7 @@ pub enum SuggestionSource {
     Provider,
     /// LLM-powered completions.
     Llm,
-    /// Terminal-multiplexer provider command.
+    /// Custom provider command (a user-defined shortcut).
     ProviderAction,
 }
 
@@ -71,7 +71,7 @@ pub struct SourceOrder {
 }
 
 impl SourceOrder {
-    /// Default order matching `config::SuggestConfig::default`: multiplexer
+    /// Default order matching `config::SuggestConfig::default`: custom
     /// provider actions, AI, history, shell completions, filesystem, zoxide,
     /// commands, environment, SSH.
     pub fn default_order() -> Self {
@@ -146,7 +146,7 @@ pub struct Suggestion {
     pub action: Option<ProviderActionSpec>,
 }
 
-/// Accept-time payload for a multiplexer action row.
+/// Accept-time payload for a provider-action row.
 #[derive(Debug, Clone)]
 pub struct ProviderActionSpec {
     /// Shell command injected on accept.

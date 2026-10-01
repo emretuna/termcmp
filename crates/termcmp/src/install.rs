@@ -70,7 +70,7 @@ const DEFAULT_CONFIG_TOML: &str = "\
 # transparency = false  # Clear popup backgrounds so the terminal background shows through
 
 # [providers]
-# enabled = [\"herdr\"]  # Activate terminal-multiplexer provider files in providers/*.toml
+# enabled = [\"herdr\"]  # Activate custom provider files (user-defined command shortcuts) in providers/*.toml
 
 # [ai]
 # redact_secrets = true  # Redact API keys, tokens, passwords from buffer/history before sending to LLM providers

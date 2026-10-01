@@ -41,6 +41,20 @@ termcmp install
 - **TUI-aware** — popup only appears at the prompt, never inside neovim/lazygit/omp agent
 - **Small terminal friendly** — compact mode for dropdown terminals and small panes
 - **Hot-reload config** — edit `~/.config/termcmp/config.toml`, changes apply immediately
+- **Custom providers** — user-defined command shortcuts from `~/.config/termcmp/providers/*.toml`, fuzzy-matched in the popup ([Providers](#providers))
+
+## Providers
+
+Define custom command shortcuts in `~/.config/termcmp/providers/*.toml` and activate them via `[providers] enabled`. Enabled providers inject their commands into the normal popup as fuzzy-matched candidates — accept with Tab to fill the prompt for review, or Enter to run immediately. Independent of which terminal or multiplexer you use. See [`[providers]`](docs/CONFIGURATION.md#providers).
+
+```toml
+# ~/.config/termcmp/providers/mytools.toml
+name = "mytools"
+
+[[commands]]
+name = "deploy-staging"
+command = "kubectl rollout restart deployment/api -n staging"
+```
 
 ## Documentation
 

@@ -651,7 +651,7 @@ pub struct ProviderCommand {
 
 /// Provider File schema — `~/.config/termcmp/providers/<any>.toml`.
 ///
-/// A provider is a bundle of terminal-multiplexer actions (herdr, tmux, …).
+/// A provider is a bundle of named shell commands (user-defined shortcuts).
 /// Enabled by listing [`ProviderFile::name`] in `[providers].enabled`; the
 /// filename itself is irrelevant (hot-reload and dedup key off `name`).
 #[derive(Debug, Clone, Default, Deserialize)]
