@@ -36,7 +36,7 @@ termcmp install
 - **Frizbee fuzzy matching** — type `gco` to match `git checkout`, `cl` to match `clone`
 - **LLM completions** (optional) — AI-powered suggestions when enabled
 - **Privacy-first** — secrets (API keys, tokens, passwords) are redacted before any LLM request
-- **Multiplexer-safe** — works inside tmux, wezterm, zellij, herdr, screen. Multiplexer/agent session tracking (`tmux pane_current_command`, herdr `foreground_process_group_id`, workmux) needs `[experimental] session_isolation = false`; the default isolates the shell session instead
+- **Multiplexer-safe** — works inside tmux, wezterm, zellij, herdr, screen. Agent tracking works out of the box inside tmux and herdr; setting `[experimental] session_isolation = true` keeps `/dev/tty` prompts working in a multiplexer at the cost of that tracking
 - **Password prompts work** — `sudo`, `ssh`, `git` and `pinentry` read `/dev/tty` directly, so the default session isolation is what makes their prompts receive every keystroke
 - **TUI-aware** — popup only appears at the prompt, never inside neovim/lazygit/omp agent
 - **Small terminal friendly** — compact mode for dropdown terminals and small panes

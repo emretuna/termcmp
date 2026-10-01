@@ -177,7 +177,10 @@ pub async fn run_proxy(
     // Topology is fixed at spawn (see `spawn_shell_with_pty`) and everything
     // below that depends on it reads this. Read once — the flag requires a
     // restart, so the config watcher must not change it mid-run.
-    let isolated = config.experimental.session_isolation;
+    let isolated = effective_isolation(
+        config.experimental.session_isolation,
+        terminal_profile.is_multiplexer(),
+    );
     // Foreground pgrp that owned the outer tty before we started (the user's
     // shell). We mirror child pgrps while running and MUST restore this on
     // exit — otherwise our termios restore happens as a background pgrp and
@@ -2678,6 +2681,18 @@ pub fn should_fallback_to_shell(
     matches!(terminal, terminal::Terminal::Unknown(_)) && !multi_terminal_enabled
 }
 
+/// Session isolation gives the inner shell its own controlling terminal so
+/// `/dev/tty` prompts work, but it makes foreground process-group mirroring
+/// impossible — which tmux `pane_current_command` and herdr
+/// `foreground_process_group_id` depend on for agent tracking. The two cannot
+/// coexist, so an unset config resolves to "isolate on a direct terminal,
+/// mirror inside a multiplexer". An explicit `true`/`false` always wins:
+/// `true` keeps `/dev/tty` prompts working in tmux/herdr at the cost of
+/// tracking, `false` mirrors everywhere.
+fn effective_isolation(cfg_isolation: Option<bool>, in_multiplexer: bool) -> bool {
+    cfg_isolation.unwrap_or(!in_multiplexer)
+}
+
 /// Outcome of dispatching a CPR response back through the proxy. Pure
 /// transformation over `TerminalState` — extracted from Task A so the
 /// FIFO ordering invariant can be unit-tested without spawning the
@@ -2748,6 +2763,19 @@ mod tests {
             &Terminal::Unknown("foot".into()),
             true
         ));
+    }
+
+    #[test]
+    fn test_isolation_resolves_per_topology_when_unset() {
+        // Unset: isolated on a direct terminal, mirrored under tmux/herdr so
+        // their agent tracking sees the inner command instead of termcmp.
+        assert!(effective_isolation(None, false));
+        assert!(!effective_isolation(None, true));
+        // Explicit values always win over the topology.
+        assert!(effective_isolation(Some(true), false));
+        assert!(effective_isolation(Some(true), true));
+        assert!(!effective_isolation(Some(false), false));
+        assert!(!effective_isolation(Some(false), true));
     }
 
     #[test]

@@ -34,9 +34,11 @@ fn shell_has_job_control(tmux: &mut TmuxSession) -> bool {
 /// Test that tmux `pane_current_command` shows the shell, not termcmp
 ///
 /// Legacy topology (`session_isolation = false`): the outer tty's foreground
-/// pgrp is mirrored onto inner jobs, which is what tmux reads. Under the
-/// default isolated topology that mirror cannot run (TIOCSPGRP onto an inner
-/// pgrp is EINVAL), so this observation is legacy-only by design.
+/// pgrp is mirrored onto inner jobs, which is what tmux reads. An explicit
+/// `true` cannot mirror (TIOCSPGRP onto an inner pgrp is EINVAL), so this
+/// observation needs the mirrored topology — inside tmux that is also the auto
+/// default, tested by
+/// [`test_tmux_default_config_keeps_foreground_process_visible`].
 #[test]
 fn test_tmux_pane_current_command_shows_shell() {
     let tmux = TmuxSession::spawn_legacy();
@@ -99,6 +101,71 @@ fn test_tmux_pane_current_command_updates_with_foreground_job() {
         pane_cmd
     );
 
+    tmux.exit();
+}
+
+/// Test that the shipped default (no `session_isolation` key) keeps the
+/// foreground process visible to tmux.
+///
+/// This is the agent-tracking contract: tmux `pane_current_command` and herdr
+/// `foreground_process_group_id` both read the outer tty's foreground pgrp, so
+/// a proxy that keeps that pgrp for itself reports every pane as `termcmp` and
+/// the multiplexer can no longer find a running agent. Regression: herdr panes
+/// resolved to `Unknown("herdr")`, the multiplexer check missed them, and
+/// isolation stayed on.
+#[test]
+fn test_tmux_default_config_keeps_foreground_process_visible() {
+    let mut tmux = TmuxSession::spawn_auto_isolation();
+    tmux.expect_output("$");
+    let job_control = shell_has_job_control(&mut tmux);
+
+    let idle = tmux.display_message("#{pane_current_command}");
+    assert!(
+        !idle.contains("termcmp"),
+        "idle pane should report the inner shell, got: {idle}"
+    );
+
+    tmux.send_line("sleep 20");
+    // The mirror flips on SIGCHLD plus a 100 ms tick.
+    std::thread::sleep(Duration::from_millis(400));
+    let running = tmux.display_message("#{pane_current_command}");
+    assert!(
+        !running.contains("termcmp"),
+        "a pane running a command must not report termcmp, got: {running}"
+    );
+    if job_control {
+        let running = tmux.wait_for_pane_command("sleep", Duration::from_secs(3));
+        assert!(
+            running.contains("sleep"),
+            "pane_current_command should follow the foreground job, got: {running}"
+        );
+    }
+
+    tmux.send_keys("C-c");
+    tmux.expect_output("$");
+    tmux.exit();
+}
+
+/// Test that an explicit `session_isolation = true` opts back out of tracking.
+///
+/// The other half of the tri-state: a multiplexer pane whose user needs
+/// `/dev/tty` password readers keeps isolation, and the price is that tmux
+/// reports the pane as running `termcmp`. Uses [`TmuxSession::spawn`], which
+/// writes that key explicitly.
+#[test]
+fn test_tmux_explicit_isolation_hides_foreground_process() {
+    let mut tmux = TmuxSession::spawn();
+    tmux.expect_output("$");
+
+    tmux.send_line("sleep 20");
+    std::thread::sleep(Duration::from_millis(400));
+    let running = tmux.display_message("#{pane_current_command}");
+    assert!(
+        running.contains("termcmp"),
+        "explicit isolation must keep the proxy as the pane's foreground process, got: {running}"
+    );
+
+    tmux.send_keys("C-c");
     tmux.exit();
 }
 

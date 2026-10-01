@@ -132,7 +132,7 @@ The `terminal` crate detects the terminal at startup and assigns capabilities vi
 - **RenderStrategy** — `Synchronized` (DECSET 2026) or `PreRenderBuffer` (single write)
 - **PromptDetection** — `Osc133` (native) or `ShellIntegration` (OSC 7771 markers)
 
-Detection uses `TERM_PROGRAM` plus terminal-specific env vars (`KITTY_WINDOW_ID`, `WEZTERM_UNIX_SOCKET`, `ALACRITTY_SOCKET`, `ZED_TERM`, `VSCODE_IPC_HOOK_CLI`). Inside tmux, these env vars leak through from the outer terminal, allowing detection of the host terminal.
+Detection uses `TERM_PROGRAM` plus terminal-specific env vars (`KITTY_WINDOW_ID`, `WEZTERM_UNIX_SOCKET`, `ALACRITTY_SOCKET`, `ZED_TERM`, `VSCODE_IPC_HOOK_CLI`). Inside tmux — and inside herdr (where `TERM_PROGRAM=herdr`, `HERDR_ENV=1`, and no `TMUX` is set) — these env vars leak through from the outer terminal, allowing detection of the host terminal.
 
 `terminal_from_termname` covers only `xterm-kitty|kitty`, `xterm-ghostty|ghostty`, `wezterm`, and `alacritty` inside tmux; Rio/Zed/VSCode/Otty/iTerm2/Terminal.app inside tmux rely on leaked env or the `TERM_PROGRAM` fallback, and `Unknown` falls back to `(PreRenderBuffer, ShellIntegration)` — safe (no Synchronized even if supported).
 

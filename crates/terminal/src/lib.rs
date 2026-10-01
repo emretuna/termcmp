@@ -105,6 +105,14 @@ impl fmt::Display for PromptDetection {
     }
 }
 
+/// Which terminal multiplexer (if any) termcmp is running inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Multiplexer {
+    None,
+    Tmux,
+    Herdr,
+}
+
 /// Terminal capabilities detected at startup.
 ///
 /// Fields are private to enforce the invariant that `render_strategy` and
@@ -115,7 +123,7 @@ pub struct TerminalProfile {
     terminal: Terminal,
     render_strategy: RenderStrategy,
     prompt_detection: PromptDetection,
-    in_tmux: bool,
+    multiplexer: Multiplexer,
 }
 
 impl TerminalProfile {
@@ -128,17 +136,22 @@ impl TerminalProfile {
     pub fn prompt_detection(&self) -> PromptDetection {
         self.prompt_detection
     }
-    pub fn in_tmux(&self) -> bool {
-        self.in_tmux
+    pub fn multiplexer(&self) -> Multiplexer {
+        self.multiplexer
+    }
+    /// True inside tmux or herdr (any multiplexer). Used to auto-disable
+    /// session isolation, which cannot coexist with foreground pgrp mirroring.
+    pub fn is_multiplexer(&self) -> bool {
+        !matches!(self.multiplexer, Multiplexer::None)
     }
 
     /// Human-readable display name, e.g. "Ghostty" or "iTerm2 (via tmux)".
     pub fn display_name(&self) -> String {
         let base = self.terminal.to_string();
-        if self.in_tmux {
-            format!("{base} (via tmux)")
-        } else {
-            base
+        match self.multiplexer {
+            Multiplexer::None => base,
+            Multiplexer::Tmux => format!("{base} (via tmux)"),
+            Multiplexer::Herdr => format!("{base} (via herdr)"),
         }
     }
 
@@ -146,6 +159,11 @@ impl TerminalProfile {
     ///
     /// Checks terminal-specific env vars and `TERM_PROGRAM` to identify
     /// the terminal and set appropriate strategies.
+    ///
+    /// herdr: `TERM_PROGRAM=herdr`, `HERDR_ENV=1`, no `TMUX`, outer-terminal
+    /// env leaked (`GHOSTTY_RESOURCES_DIR`/`KITTY_WINDOW_ID`/etc.). Resolved
+    /// like tmux, without a `herdr` termname query (herdr sets `TERM=dumb` in
+    /// panes).
     pub fn detect() -> Self {
         let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
         let env_is_set = |key: &str| std::env::var(key).map(|v| !v.is_empty()).unwrap_or(false);
@@ -181,6 +199,14 @@ impl TerminalProfile {
         };
 
         let in_tmux = env_is_set("TMUX");
+        // herdr exports HERDR_ENV=1 in every pane shell (see herdr
+        // "add-herdr-support" docs). It rewrites TERM_PROGRAM=herdr, sets no
+        // TMUX, but leaks the outer terminal's env vars
+        // (GHOSTTY_RESOURCES_DIR, KITTY_WINDOW_ID, …), so it must be resolved
+        // via the same leaked-env branch as tmux.
+        let in_herdr = std::env::var("HERDR_ENV")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let has_ghostty_res = env_is_existing_dir("GHOSTTY_RESOURCES_DIR");
         let has_iterm_session = env_is_set("ITERM_SESSION_ID");
         let has_kitty_window_id = env_is_set("KITTY_WINDOW_ID");
@@ -204,13 +230,20 @@ impl TerminalProfile {
         if in_tmux {
             if let Some(terminal) = tmux_client_termname().and_then(|t| terminal_from_termname(&t))
             {
-                return Self::new(terminal, true);
+                return Self::new(terminal, Multiplexer::Tmux);
             }
         }
 
+        let multiplexer = if in_tmux {
+            Multiplexer::Tmux
+        } else if in_herdr {
+            Multiplexer::Herdr
+        } else {
+            Multiplexer::None
+        };
         Self::detect_from_env(
             &term_program,
-            in_tmux,
+            multiplexer,
             has_ghostty_res,
             has_iterm_session,
             has_kitty_window_id,
@@ -225,7 +258,7 @@ impl TerminalProfile {
     #[allow(clippy::too_many_arguments)]
     fn detect_from_env(
         term_program: &str,
-        in_tmux: bool,
+        multiplexer: Multiplexer,
         has_ghostty_res: bool,
         has_iterm_session: bool,
         has_kitty_window_id: bool,
@@ -234,57 +267,58 @@ impl TerminalProfile {
         has_zed_term: bool,
         has_vscode_ipc: bool,
     ) -> Self {
-        // Direct terminal detection (not inside tmux)
-        if !in_tmux {
+        // Direct terminal detection (not inside a multiplexer).
+        if matches!(multiplexer, Multiplexer::None) {
             // Kitty reports TERM_PROGRAM=xterm-kitty, so use KITTY_WINDOW_ID instead.
             if has_kitty_window_id {
-                return Self::new(Terminal::Kitty, false);
+                return Self::new(Terminal::Kitty, Multiplexer::None);
             }
             if has_wezterm_socket {
-                return Self::new(Terminal::WezTerm, false);
+                return Self::new(Terminal::WezTerm, Multiplexer::None);
             }
             // Alacritty doesn't set TERM_PROGRAM — detect via ALACRITTY_SOCKET.
             if has_alacritty_socket {
-                return Self::new(Terminal::Alacritty, false);
+                return Self::new(Terminal::Alacritty, Multiplexer::None);
             }
             if has_zed_term {
-                return Self::new(Terminal::Zed, false);
+                return Self::new(Terminal::Zed, Multiplexer::None);
             }
             if has_vscode_ipc {
-                return Self::new(Terminal::VSCode, false);
+                return Self::new(Terminal::VSCode, Multiplexer::None);
             }
-            return Self::from_term_program(term_program, false);
+            return Self::from_term_program(term_program, Multiplexer::None);
         }
 
-        // Inside tmux: terminal info comes from env vars that leak through.
-        // Check terminal-specific env vars before falling back to TERM_PROGRAM.
+        // Inside a multiplexer (tmux or herdr): terminal info comes from the
+        // outer terminal's env vars that leak through. Check terminal-specific
+        // env vars before falling back to TERM_PROGRAM.
         if has_ghostty_res {
-            return Self::new(Terminal::Ghostty, true);
+            return Self::new(Terminal::Ghostty, multiplexer);
         }
         if has_kitty_window_id {
-            return Self::new(Terminal::Kitty, true);
+            return Self::new(Terminal::Kitty, multiplexer);
         }
         if has_wezterm_socket {
-            return Self::new(Terminal::WezTerm, true);
+            return Self::new(Terminal::WezTerm, multiplexer);
         }
         if has_alacritty_socket {
-            return Self::new(Terminal::Alacritty, true);
+            return Self::new(Terminal::Alacritty, multiplexer);
         }
         if has_zed_term {
-            return Self::new(Terminal::Zed, true);
+            return Self::new(Terminal::Zed, multiplexer);
         }
         if has_vscode_ipc {
-            return Self::new(Terminal::VSCode, true);
+            return Self::new(Terminal::VSCode, multiplexer);
         }
         if has_iterm_session {
-            return Self::new(Terminal::ITerm2, true);
+            return Self::new(Terminal::ITerm2, multiplexer);
         }
 
-        // Fallback: try TERM_PROGRAM (some terminals set it even in tmux)
-        Self::from_term_program(term_program, true)
+        // Fallback: try TERM_PROGRAM (some terminals set it even in a multiplexer)
+        Self::from_term_program(term_program, multiplexer)
     }
 
-    fn from_term_program(term_program: &str, in_tmux: bool) -> Self {
+    fn from_term_program(term_program: &str, multiplexer: Multiplexer) -> Self {
         let terminal = match term_program {
             "ghostty" => Terminal::Ghostty,
             "otty" => Terminal::Otty,
@@ -304,10 +338,10 @@ impl TerminalProfile {
                 Terminal::Unknown(sanitized)
             }
         };
-        Self::new(terminal, in_tmux)
+        Self::new(terminal, multiplexer)
     }
 
-    fn new(terminal: Terminal, in_tmux: bool) -> Self {
+    fn new(terminal: Terminal, multiplexer: Multiplexer) -> Self {
         let (render_strategy, prompt_detection) = match &terminal {
             // Full native support: synchronized output + OSC 133 prompt markers.
             // Otty is a Ghostty fork, so it shares Ghostty's profile exactly.
@@ -334,62 +368,62 @@ impl TerminalProfile {
             terminal,
             render_strategy,
             prompt_detection,
-            in_tmux,
+            multiplexer,
         }
     }
 
     /// Test constructor: Ghostty profile (Synchronized, OSC 133).
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_ghostty() -> Self {
-        Self::new(Terminal::Ghostty, false)
+        Self::new(Terminal::Ghostty, Multiplexer::None)
     }
 
     /// Test constructor: Otty profile (Synchronized, OSC 133) — Ghostty fork.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_otty() -> Self {
-        Self::new(Terminal::Otty, false)
+        Self::new(Terminal::Otty, Multiplexer::None)
     }
 
     /// Test constructor: iTerm2 profile (PreRenderBuffer, ShellIntegration).
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_iterm2() -> Self {
-        Self::new(Terminal::ITerm2, false)
+        Self::new(Terminal::ITerm2, Multiplexer::None)
     }
 
     /// Test constructor: Terminal.app profile (PreRenderBuffer, ShellIntegration).
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_terminal_app() -> Self {
-        Self::new(Terminal::TerminalApp, false)
+        Self::new(Terminal::TerminalApp, Multiplexer::None)
     }
 
     /// Test constructor: Kitty profile (Synchronized, OSC 133).
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_kitty() -> Self {
-        Self::new(Terminal::Kitty, false)
+        Self::new(Terminal::Kitty, Multiplexer::None)
     }
 
     /// Test constructor: WezTerm profile (Synchronized, OSC 133).
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_wezterm() -> Self {
-        Self::new(Terminal::WezTerm, false)
+        Self::new(Terminal::WezTerm, Multiplexer::None)
     }
 
     /// Test constructor: Alacritty profile (Synchronized, ShellIntegration).
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_alacritty() -> Self {
-        Self::new(Terminal::Alacritty, false)
+        Self::new(Terminal::Alacritty, Multiplexer::None)
     }
 
     /// Test constructor: Rio profile (Synchronized, OSC 133).
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_rio() -> Self {
-        Self::new(Terminal::Rio, false)
+        Self::new(Terminal::Rio, Multiplexer::None)
     }
 
     /// Test constructor: Zed profile (Synchronized, OSC 133).
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_zed() -> Self {
-        Self::new(Terminal::Zed, false)
+        Self::new(Terminal::Zed, Multiplexer::None)
     }
 
     /// Test constructor: VSCode profile (Synchronized, OSC 133). Covers
@@ -397,13 +431,13 @@ impl TerminalProfile {
     /// they share the xterm.js frontend and shell-integration model.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_vscode() -> Self {
-        Self::new(Terminal::VSCode, false)
+        Self::new(Terminal::VSCode, Multiplexer::None)
     }
 
     /// Test constructor: Unknown terminal profile (PreRenderBuffer, ShellIntegration).
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_unknown(name: &str) -> Self {
-        Self::new(Terminal::Unknown(name.into()), false)
+        Self::new(Terminal::Unknown(name.into()), Multiplexer::None)
     }
 }
 
@@ -506,27 +540,27 @@ mod tests {
 
     #[test]
     fn test_ghostty_profile() {
-        let profile = TerminalProfile::from_term_program("ghostty", false);
+        let profile = TerminalProfile::from_term_program("ghostty", Multiplexer::None);
         assert_eq!(*profile.terminal(), Terminal::Ghostty);
         assert_eq!(profile.render_strategy(), RenderStrategy::Synchronized);
         assert_eq!(profile.prompt_detection(), PromptDetection::Osc133);
-        assert!(!profile.in_tmux());
+        assert_eq!(profile.multiplexer(), Multiplexer::None);
     }
 
     #[test]
     fn test_otty_profile() {
         // Otty is a Ghostty fork — same capability profile as Ghostty.
-        let profile = TerminalProfile::from_term_program("otty", false);
+        let profile = TerminalProfile::from_term_program("otty", Multiplexer::None);
         assert_eq!(*profile.terminal(), Terminal::Otty);
         assert_eq!(profile.render_strategy(), RenderStrategy::Synchronized);
         assert_eq!(profile.prompt_detection(), PromptDetection::Osc133);
-        assert!(!profile.in_tmux());
+        assert_eq!(profile.multiplexer(), Multiplexer::None);
         assert_eq!(profile.display_name(), "Otty");
     }
 
     #[test]
     fn test_iterm2_profile() {
-        let profile = TerminalProfile::from_term_program("iTerm.app", false);
+        let profile = TerminalProfile::from_term_program("iTerm.app", Multiplexer::None);
         assert_eq!(*profile.terminal(), Terminal::ITerm2);
         assert_eq!(profile.render_strategy(), RenderStrategy::PreRenderBuffer);
         assert_eq!(
@@ -537,7 +571,7 @@ mod tests {
 
     #[test]
     fn test_terminal_app_profile() {
-        let profile = TerminalProfile::from_term_program("Apple_Terminal", false);
+        let profile = TerminalProfile::from_term_program("Apple_Terminal", Multiplexer::None);
         assert_eq!(*profile.terminal(), Terminal::TerminalApp);
         assert_eq!(profile.render_strategy(), RenderStrategy::PreRenderBuffer);
         assert_eq!(
@@ -548,7 +582,7 @@ mod tests {
 
     #[test]
     fn test_wezterm_profile() {
-        let profile = TerminalProfile::from_term_program("WezTerm", false);
+        let profile = TerminalProfile::from_term_program("WezTerm", Multiplexer::None);
         assert_eq!(*profile.terminal(), Terminal::WezTerm);
         assert_eq!(profile.render_strategy(), RenderStrategy::Synchronized);
         assert_eq!(profile.prompt_detection(), PromptDetection::Osc133);
@@ -556,7 +590,7 @@ mod tests {
 
     #[test]
     fn test_alacritty_profile() {
-        let profile = TerminalProfile::from_term_program("alacritty", false);
+        let profile = TerminalProfile::from_term_program("alacritty", Multiplexer::None);
         assert_eq!(*profile.terminal(), Terminal::Alacritty);
         assert_eq!(profile.render_strategy(), RenderStrategy::Synchronized);
         assert_eq!(
@@ -567,7 +601,7 @@ mod tests {
 
     #[test]
     fn test_rio_profile() {
-        let profile = TerminalProfile::from_term_program("rio", false);
+        let profile = TerminalProfile::from_term_program("rio", Multiplexer::None);
         assert_eq!(*profile.terminal(), Terminal::Rio);
         assert_eq!(profile.render_strategy(), RenderStrategy::Synchronized);
         assert_eq!(profile.prompt_detection(), PromptDetection::Osc133);
@@ -575,7 +609,7 @@ mod tests {
 
     #[test]
     fn test_zed_profile_from_term_program() {
-        let profile = TerminalProfile::from_term_program("zed", false);
+        let profile = TerminalProfile::from_term_program("zed", Multiplexer::None);
         assert_eq!(*profile.terminal(), Terminal::Zed);
         assert_eq!(profile.render_strategy(), RenderStrategy::Synchronized);
         assert_eq!(profile.prompt_detection(), PromptDetection::Osc133);
@@ -583,7 +617,7 @@ mod tests {
 
     #[test]
     fn test_vscode_profile_from_term_program() {
-        let profile = TerminalProfile::from_term_program("vscode", false);
+        let profile = TerminalProfile::from_term_program("vscode", Multiplexer::None);
         assert_eq!(*profile.terminal(), Terminal::VSCode);
         assert_eq!(profile.render_strategy(), RenderStrategy::Synchronized);
         assert_eq!(profile.prompt_detection(), PromptDetection::Osc133);
@@ -592,20 +626,20 @@ mod tests {
     #[test]
     fn test_capitalized_vscode_is_unknown() {
         // Match the existing strict-casing policy for other terminals.
-        let profile = TerminalProfile::from_term_program("VSCode", false);
+        let profile = TerminalProfile::from_term_program("VSCode", Multiplexer::None);
         assert!(matches!(profile.terminal(), Terminal::Unknown(_)));
     }
 
     #[test]
     fn test_capitalized_zed_is_unknown() {
         // Match the existing strict-casing policy for other terminals.
-        let profile = TerminalProfile::from_term_program("Zed", false);
+        let profile = TerminalProfile::from_term_program("Zed", Multiplexer::None);
         assert!(matches!(profile.terminal(), Terminal::Unknown(_)));
     }
 
     #[test]
     fn test_unknown_terminal_profile() {
-        let profile = TerminalProfile::from_term_program("foot", false);
+        let profile = TerminalProfile::from_term_program("foot", Multiplexer::None);
         assert!(matches!(profile.terminal(), Terminal::Unknown(_)));
         assert_eq!(profile.render_strategy(), RenderStrategy::PreRenderBuffer);
         assert_eq!(
@@ -616,7 +650,7 @@ mod tests {
 
     #[test]
     fn test_empty_term_program() {
-        let profile = TerminalProfile::from_term_program("", false);
+        let profile = TerminalProfile::from_term_program("", Multiplexer::None);
         assert!(matches!(profile.terminal(), Terminal::Unknown(_)));
         assert_eq!(profile.display_name(), "unknown");
     }
@@ -649,20 +683,22 @@ mod tests {
     }
 
     #[test]
-    fn test_display_name_with_tmux() {
-        let profile = TerminalProfile::new(Terminal::Ghostty, true);
+    fn test_display_name_with_multiplexer() {
+        let profile = TerminalProfile::new(Terminal::Ghostty, Multiplexer::Tmux);
         assert_eq!(profile.display_name(), "Ghostty (via tmux)");
-        let profile = TerminalProfile::new(Terminal::ITerm2, false);
+        let profile = TerminalProfile::new(Terminal::Ghostty, Multiplexer::Herdr);
+        assert_eq!(profile.display_name(), "Ghostty (via herdr)");
+        let profile = TerminalProfile::new(Terminal::ITerm2, Multiplexer::None);
         assert_eq!(profile.display_name(), "iTerm2");
     }
 
-    // -- detect_from_env (direct + tmux paths) --
+    // -- detect_from_env (direct + multiplexer paths) --
 
     // Helper: call detect_from_env with only the specified flags set.
     #[allow(clippy::too_many_arguments)]
     fn detect(
         term_program: &str,
-        in_tmux: bool,
+        multiplexer: Multiplexer,
         ghostty_res: bool,
         iterm_session: bool,
         kitty_wid: bool,
@@ -673,7 +709,7 @@ mod tests {
     ) -> TerminalProfile {
         TerminalProfile::detect_from_env(
             term_program,
-            in_tmux,
+            multiplexer,
             ghostty_res,
             iterm_session,
             kitty_wid,
@@ -687,10 +723,18 @@ mod tests {
     #[test]
     fn test_detect_ghostty_direct() {
         let p = detect(
-            "ghostty", false, false, false, false, false, false, false, false,
+            "ghostty",
+            Multiplexer::None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
         );
         assert_eq!(*p.terminal(), Terminal::Ghostty);
-        assert!(!p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::None);
     }
 
     #[test]
@@ -699,10 +743,18 @@ mod tests {
         // the TERM_PROGRAM path. It notably does NOT set GHOSTTY_RESOURCES_DIR,
         // so ghostty_res stays false here.
         let p = detect(
-            "otty", false, false, false, false, false, false, false, false,
+            "otty",
+            Multiplexer::None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
         );
         assert_eq!(*p.terminal(), Terminal::Otty);
-        assert!(!p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::None);
     }
 
     #[test]
@@ -710,100 +762,224 @@ mod tests {
         // Otty has no dedicated env var for tmux detection (it does not set
         // GHOSTTY_RESOURCES_DIR) — falls back to TERM_PROGRAM, same as Rio.
         let p = detect(
-            "otty", true, false, false, false, false, false, false, false,
+            "otty",
+            Multiplexer::Tmux,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
         );
         assert_eq!(*p.terminal(), Terminal::Otty);
-        assert!(p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::Tmux);
         assert_eq!(p.display_name(), "Otty (via tmux)");
     }
 
     #[test]
     fn test_detect_kitty_direct() {
         // Kitty reports TERM_PROGRAM=xterm-kitty, so detect via KITTY_WINDOW_ID.
-        let p = detect("", false, false, false, true, false, false, false, false);
+        let p = detect(
+            "",
+            Multiplexer::None,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::Kitty);
-        assert!(!p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::None);
     }
 
     #[test]
     fn test_detect_wezterm_direct_via_term_program() {
         let p = detect(
-            "WezTerm", false, false, false, false, false, false, false, false,
+            "WezTerm",
+            Multiplexer::None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
         );
         assert_eq!(*p.terminal(), Terminal::WezTerm);
-        assert!(!p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::None);
     }
 
     #[test]
     fn test_detect_wezterm_direct_via_socket() {
-        let p = detect("", false, false, false, false, true, false, false, false);
+        let p = detect(
+            "",
+            Multiplexer::None,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::WezTerm);
-        assert!(!p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::None);
     }
 
     #[test]
     fn test_detect_alacritty_direct() {
         // Alacritty doesn't set TERM_PROGRAM — detected via ALACRITTY_SOCKET
-        let p = detect("", false, false, false, false, false, true, false, false);
+        let p = detect(
+            "",
+            Multiplexer::None,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::Alacritty);
-        assert!(!p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::None);
     }
 
     #[test]
     fn test_detect_rio_direct() {
         let p = detect(
-            "rio", false, false, false, false, false, false, false, false,
+            "rio",
+            Multiplexer::None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
         );
         assert_eq!(*p.terminal(), Terminal::Rio);
-        assert!(!p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::None);
     }
 
     #[test]
     fn test_detect_zed_direct_via_zed_term() {
-        let p = detect("", false, false, false, false, false, false, true, false);
+        let p = detect(
+            "",
+            Multiplexer::None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::Zed);
-        assert!(!p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::None);
     }
 
     #[test]
     fn test_detect_zed_via_tmux() {
-        let p = detect("", true, false, false, false, false, false, true, false);
+        let p = detect(
+            "",
+            Multiplexer::Tmux,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::Zed);
-        assert!(p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::Tmux);
         assert_eq!(p.display_name(), "Zed (via tmux)");
     }
 
     #[test]
     fn test_detect_ghostty_takes_priority_over_zed_via_tmux() {
-        let p = detect("", true, true, false, false, false, false, true, false);
+        let p = detect(
+            "",
+            Multiplexer::Tmux,
+            true,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::Ghostty);
     }
 
     #[test]
     fn test_detect_vscode_direct_via_ipc_hook() {
-        let p = detect("", false, false, false, false, false, false, false, true);
+        let p = detect(
+            "",
+            Multiplexer::None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
         assert_eq!(*p.terminal(), Terminal::VSCode);
-        assert!(!p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::None);
     }
 
     #[test]
     fn test_detect_vscode_via_tmux() {
-        let p = detect("", true, false, false, false, false, false, false, true);
+        let p = detect(
+            "",
+            Multiplexer::Tmux,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
         assert_eq!(*p.terminal(), Terminal::VSCode);
-        assert!(p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::Tmux);
         assert_eq!(p.display_name(), "VSCode (via tmux)");
     }
 
     #[test]
     fn test_detect_kitty_takes_priority_over_vscode() {
-        let p = detect("", false, false, false, true, false, false, false, true);
+        let p = detect(
+            "",
+            Multiplexer::None,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            true,
+        );
         assert_eq!(*p.terminal(), Terminal::Kitty);
     }
 
     #[test]
     fn test_detect_zed_takes_priority_over_vscode() {
         // ZED_TERM checked before VSCODE_IPC_HOOK_CLI in detect_from_env.
-        let p = detect("", false, false, false, false, false, false, true, true);
+        let p = detect(
+            "",
+            Multiplexer::None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            true,
+        );
         assert_eq!(*p.terminal(), Terminal::Zed);
     }
 
@@ -811,9 +987,19 @@ mod tests {
     fn test_detect_zed_direct_with_both_zed_term_and_term_program() {
         // Direct path: both ZED_TERM and TERM_PROGRAM=zed set. ZED_TERM is
         // the reliable signal and is checked before the TERM_PROGRAM fallback.
-        let p = detect("zed", false, false, false, false, false, false, true, false);
+        let p = detect(
+            "zed",
+            Multiplexer::None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::Zed);
-        assert!(!p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::None);
     }
 
     #[test]
@@ -822,7 +1008,7 @@ mod tests {
         // Only ZED_TERM is set — it's the reliable signal inside tmux.
         let p = detect(
             "tmux-256color",
-            true,
+            Multiplexer::Tmux,
             false,
             false,
             false,
@@ -832,36 +1018,76 @@ mod tests {
             false,
         );
         assert_eq!(*p.terminal(), Terminal::Zed);
-        assert!(p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::Tmux);
     }
 
     #[test]
     fn test_detect_zed_takes_priority_over_iterm_via_tmux() {
         // ZED_TERM checked before ITERM_SESSION_ID in the tmux branch.
-        let p = detect("", true, false, true, false, false, false, true, false);
+        let p = detect(
+            "",
+            Multiplexer::Tmux,
+            false,
+            true,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::Zed);
-        assert!(p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::Tmux);
     }
 
     #[test]
     fn test_detect_tmux_kitty_takes_priority_over_zed() {
         // KITTY_WINDOW_ID checked before ZED_TERM in the tmux branch.
-        let p = detect("", true, false, false, true, false, false, true, false);
+        let p = detect(
+            "",
+            Multiplexer::Tmux,
+            false,
+            false,
+            true,
+            false,
+            false,
+            true,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::Kitty);
-        assert!(p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::Tmux);
     }
 
     #[test]
     fn test_detect_tmux_kitty_takes_priority_over_vscode() {
         // KITTY_WINDOW_ID checked before VSCODE_IPC_HOOK_CLI in the tmux branch.
-        let p = detect("", true, false, false, true, false, false, false, true);
+        let p = detect(
+            "",
+            Multiplexer::Tmux,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            true,
+        );
         assert_eq!(*p.terminal(), Terminal::Kitty);
-        assert!(p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::Tmux);
     }
 
     #[test]
     fn test_detect_vscode_takes_priority_over_iterm_via_tmux() {
-        let p = detect("", true, false, true, false, false, false, false, true);
+        let p = detect(
+            "",
+            Multiplexer::Tmux,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
         assert_eq!(*p.terminal(), Terminal::VSCode);
     }
 
@@ -869,40 +1095,88 @@ mod tests {
     fn test_detect_vscode_via_term_program_fallback() {
         // IPC hook missing (rare); TERM_PROGRAM=vscode still triggers detection.
         let p = detect(
-            "vscode", false, false, false, false, false, false, false, false,
+            "vscode",
+            Multiplexer::None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
         );
         assert_eq!(*p.terminal(), Terminal::VSCode);
     }
 
     #[test]
     fn test_detect_ghostty_via_tmux() {
-        let p = detect("", true, true, false, false, false, false, false, false);
+        let p = detect(
+            "",
+            Multiplexer::Tmux,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::Ghostty);
-        assert!(p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::Tmux);
         assert_eq!(p.display_name(), "Ghostty (via tmux)");
     }
 
     #[test]
     fn test_detect_kitty_via_tmux() {
-        let p = detect("", true, false, false, true, false, false, false, false);
+        let p = detect(
+            "",
+            Multiplexer::Tmux,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::Kitty);
-        assert!(p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::Tmux);
         assert_eq!(p.display_name(), "Kitty (via tmux)");
     }
 
     #[test]
     fn test_detect_wezterm_via_tmux() {
-        let p = detect("", true, false, false, false, true, false, false, false);
+        let p = detect(
+            "",
+            Multiplexer::Tmux,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::WezTerm);
-        assert!(p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::Tmux);
         assert_eq!(p.display_name(), "WezTerm (via tmux)");
     }
 
     #[test]
     fn test_detect_alacritty_via_tmux() {
-        let p = detect("", true, false, false, false, false, true, false, false);
+        let p = detect(
+            "",
+            Multiplexer::Tmux,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::Alacritty);
-        assert!(p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::Tmux);
         assert_eq!(p.display_name(), "Alacritty (via tmux)");
     }
 
@@ -911,58 +1185,148 @@ mod tests {
         // Rio has no dedicated env var for tmux detection — falls back to TERM_PROGRAM.
         // This documents the expected behavior; if Rio-specific env detection is added
         // later, this test captures the current path.
-        let p = detect("rio", true, false, false, false, false, false, false, false);
+        let p = detect(
+            "rio",
+            Multiplexer::Tmux,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::Rio);
-        assert!(p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::Tmux);
     }
 
     #[test]
     fn test_detect_iterm2_via_tmux() {
-        let p = detect("", true, false, true, false, false, false, false, false);
+        let p = detect(
+            "",
+            Multiplexer::Tmux,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::ITerm2);
-        assert!(p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::Tmux);
         assert_eq!(p.display_name(), "iTerm2 (via tmux)");
     }
 
     #[test]
     fn test_detect_tmux_ghostty_takes_priority_over_iterm() {
-        let p = detect("", true, true, true, false, false, false, false, false);
+        let p = detect(
+            "",
+            Multiplexer::Tmux,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::Ghostty);
     }
 
     #[test]
     fn test_detect_tmux_ghostty_takes_priority_over_kitty() {
-        let p = detect("", true, true, false, true, false, false, false, false);
+        let p = detect(
+            "",
+            Multiplexer::Tmux,
+            true,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::Ghostty);
     }
 
     #[test]
     fn test_detect_tmux_kitty_takes_priority_over_wezterm() {
-        let p = detect("", true, false, false, true, true, false, false, false);
+        let p = detect(
+            "",
+            Multiplexer::Tmux,
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::Kitty);
     }
 
     #[test]
     fn test_detect_direct_kitty_takes_priority_over_wezterm() {
-        let p = detect("", false, false, false, true, true, false, false, false);
+        let p = detect(
+            "",
+            Multiplexer::None,
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::Kitty);
     }
 
     #[test]
     fn test_detect_direct_wezterm_takes_priority_over_alacritty() {
-        let p = detect("", false, false, false, false, true, true, false, false);
+        let p = detect(
+            "",
+            Multiplexer::None,
+            false,
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::WezTerm);
     }
 
     #[test]
     fn test_detect_tmux_wezterm_takes_priority_over_alacritty() {
-        let p = detect("", true, false, false, false, true, true, false, false);
+        let p = detect(
+            "",
+            Multiplexer::Tmux,
+            false,
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::WezTerm);
     }
 
     #[test]
     fn test_detect_tmux_alacritty_takes_priority_over_iterm() {
-        let p = detect("", true, false, true, false, false, true, false, false);
+        let p = detect(
+            "",
+            Multiplexer::Tmux,
+            false,
+            true,
+            false,
+            false,
+            true,
+            false,
+            false,
+        );
         assert_eq!(*p.terminal(), Terminal::Alacritty);
     }
 
@@ -970,7 +1334,7 @@ mod tests {
     fn test_detect_tmux_falls_back_to_term_program() {
         let p = detect(
             "Apple_Terminal",
-            true,
+            Multiplexer::Tmux,
             false,
             false,
             false,
@@ -980,14 +1344,104 @@ mod tests {
             false,
         );
         assert_eq!(*p.terminal(), Terminal::TerminalApp);
-        assert!(p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::Tmux);
     }
 
     #[test]
     fn test_detect_tmux_unknown_terminal() {
-        let p = detect("", true, false, false, false, false, false, false, false);
+        let p = detect(
+            "",
+            Multiplexer::Tmux,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(matches!(p.terminal(), Terminal::Unknown(_)));
-        assert!(p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::Tmux);
+    }
+
+    #[test]
+    fn test_detect_ghostty_via_herdr() {
+        let p = detect(
+            "herdr",
+            Multiplexer::Herdr,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(*p.terminal(), Terminal::Ghostty);
+        assert_eq!(p.multiplexer(), Multiplexer::Herdr);
+        assert_eq!(p.display_name(), "Ghostty (via herdr)");
+    }
+
+    #[test]
+    fn test_detect_kitty_via_herdr() {
+        let p = detect(
+            "herdr",
+            Multiplexer::Herdr,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(*p.terminal(), Terminal::Kitty);
+        assert_eq!(p.multiplexer(), Multiplexer::Herdr);
+    }
+
+    #[test]
+    fn test_detect_herdr_without_leaked_env_is_unknown() {
+        let p = detect(
+            "herdr",
+            Multiplexer::Herdr,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(*p.terminal(), Terminal::Unknown("herdr".into()));
+    }
+
+    #[test]
+    fn test_is_multiplexer() {
+        assert!(!TerminalProfile::for_ghostty().is_multiplexer());
+        let herdr = detect(
+            "herdr",
+            Multiplexer::Herdr,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(herdr.is_multiplexer());
+        let tmux = detect(
+            "",
+            Multiplexer::Tmux,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(tmux.is_multiplexer());
     }
 
     // -- Test constructors --
@@ -1081,7 +1535,7 @@ mod tests {
 
     #[test]
     fn test_capitalized_ghostty_is_unknown() {
-        let profile = TerminalProfile::from_term_program("Ghostty", false);
+        let profile = TerminalProfile::from_term_program("Ghostty", Multiplexer::None);
         assert!(matches!(profile.terminal(), Terminal::Unknown(_)));
     }
 
@@ -1089,31 +1543,31 @@ mod tests {
     fn test_capitalized_otty_is_unknown() {
         // Otty reports TERM_PROGRAM=otty (lowercase); match the strict-casing
         // policy applied to every other terminal.
-        let profile = TerminalProfile::from_term_program("Otty", false);
+        let profile = TerminalProfile::from_term_program("Otty", Multiplexer::None);
         assert!(matches!(profile.terminal(), Terminal::Unknown(_)));
     }
 
     #[test]
     fn test_lowercase_iterm_is_unknown() {
-        let profile = TerminalProfile::from_term_program("iterm.app", false);
+        let profile = TerminalProfile::from_term_program("iterm.app", Multiplexer::None);
         assert!(matches!(profile.terminal(), Terminal::Unknown(_)));
     }
 
     #[test]
     fn test_lowercase_apple_terminal_is_unknown() {
-        let profile = TerminalProfile::from_term_program("apple_terminal", false);
+        let profile = TerminalProfile::from_term_program("apple_terminal", Multiplexer::None);
         assert!(matches!(profile.terminal(), Terminal::Unknown(_)));
     }
 
     #[test]
     fn test_lowercase_wezterm_is_unknown() {
-        let profile = TerminalProfile::from_term_program("wezterm", false);
+        let profile = TerminalProfile::from_term_program("wezterm", Multiplexer::None);
         assert!(matches!(profile.terminal(), Terminal::Unknown(_)));
     }
 
     #[test]
     fn test_capitalized_alacritty_is_unknown() {
-        let profile = TerminalProfile::from_term_program("Alacritty", false);
+        let profile = TerminalProfile::from_term_program("Alacritty", Multiplexer::None);
         assert!(matches!(profile.terminal(), Terminal::Unknown(_)));
     }
 
@@ -1123,33 +1577,71 @@ mod tests {
     fn test_empty_env_vars_do_not_trigger_detection() {
         // All flags false simulates empty env vars (the real detect() now
         // treats empty strings as absent).
-        let p = detect("", false, false, false, false, false, false, false, false);
+        let p = detect(
+            "",
+            Multiplexer::None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(matches!(p.terminal(), Terminal::Unknown(_)));
-        assert!(!p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::None);
     }
 
     #[test]
     fn test_empty_tmux_does_not_trigger_tmux_branch() {
-        // Even with ghostty_res true, in_tmux=false should use the direct path.
+        // Even with ghostty_res true, multiplexer=None should use the direct path.
         let p = detect(
-            "ghostty", false, true, false, false, false, false, false, false,
+            "ghostty",
+            Multiplexer::None,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
         );
         assert_eq!(*p.terminal(), Terminal::Ghostty);
-        assert!(!p.in_tmux());
+        assert_eq!(p.multiplexer(), Multiplexer::None);
     }
 
     #[test]
     fn test_stale_socket_does_not_trigger_wezterm() {
         // has_wezterm_socket=false simulates a non-existent socket path
         // (the real detect() now checks Path::exists()).
-        let p = detect("", false, false, false, false, false, false, false, false);
+        let p = detect(
+            "",
+            Multiplexer::None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(matches!(p.terminal(), Terminal::Unknown(_)));
     }
 
     #[test]
     fn test_stale_socket_does_not_trigger_alacritty() {
         // has_alacritty_socket=false simulates a non-existent socket path.
-        let p = detect("", false, false, false, false, false, false, false, false);
+        let p = detect(
+            "",
+            Multiplexer::None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(matches!(p.terminal(), Terminal::Unknown(_)));
     }
 
@@ -1170,7 +1662,17 @@ mod tests {
             !std::path::Path::new(stale).exists(),
             "test precondition: {stale} must not exist"
         );
-        let p = detect("", false, false, false, false, false, false, false, false);
+        let p = detect(
+            "",
+            Multiplexer::None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(
             !matches!(p.terminal(), Terminal::Ghostty),
             "stale GHOSTTY_RESOURCES_DIR should not trigger Ghostty detection"
@@ -1182,7 +1684,7 @@ mod tests {
     fn test_malicious_term_program_sanitized() {
         // ESC sequences should be stripped from Unknown terminal name.
         let malicious = "evil\x1b[31mterm\x1b[0m";
-        let profile = TerminalProfile::from_term_program(malicious, false);
+        let profile = TerminalProfile::from_term_program(malicious, Multiplexer::None);
         match profile.terminal() {
             Terminal::Unknown(name) => {
                 assert!(!name.contains('\x1b'), "ESC not stripped: {name:?}");
@@ -1195,7 +1697,7 @@ mod tests {
     #[test]
     fn test_term_program_with_control_chars_sanitized() {
         let nasty = "foo\x07bar\x00baz";
-        let profile = TerminalProfile::from_term_program(nasty, false);
+        let profile = TerminalProfile::from_term_program(nasty, Multiplexer::None);
         match profile.terminal() {
             Terminal::Unknown(name) => {
                 assert_eq!(name, "foobarbaz");
@@ -1206,7 +1708,7 @@ mod tests {
 
     #[test]
     fn test_clean_unknown_term_program_unchanged() {
-        let profile = TerminalProfile::from_term_program("foot", false);
+        let profile = TerminalProfile::from_term_program("foot", Multiplexer::None);
         match profile.terminal() {
             Terminal::Unknown(name) => assert_eq!(name, "foot"),
             other => panic!("expected Unknown, got {other:?}"),

@@ -90,3 +90,19 @@ fn rust_terminal_enum_has_wezterm_variant() {
     let profile = TerminalProfile::for_wezterm();
     assert!(matches!(profile.terminal(), terminal::Terminal::WezTerm));
 }
+
+#[test]
+fn init_zsh_recognises_herdr_panes() {
+    // Rust `Multiplexer::Herdr` detection and the shell-side herdr guard
+    // must stay in sync: adding a multiplexer needs both the Rust enum
+    // variant and an init.zsh marker.
+    let src = init_zsh_text();
+    assert!(
+        src.contains("HERDR_ENV"),
+        "init.zsh must gate herdr panes via HERDR_ENV"
+    );
+    assert!(
+        src.contains("== \"herdr\""),
+        "init.zsh must stop the ancestor walk at a herdr process"
+    );
+}

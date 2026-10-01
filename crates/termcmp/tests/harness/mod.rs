@@ -152,6 +152,15 @@ impl TermcmpProcess {
         // (see should_fallback_to_shell in proxy.rs — Unknown terminals
         // require `[experimental] multi_terminal = true`).
         cmd.env("TERM_PROGRAM", "ghostty");
+        // Run in a known-direct terminal topology. The proxy resolves an unset
+        // `session_isolation` per topology, and `TMUX`/`HERDR_ENV` inherit from
+        // the developer's shell (a herdr pane or tmux session on a laptop),
+        // which would silently flip these tests to the mirrored topology and
+        // break the `/dev/tty` passthrough assertions. Multiplexer-specific
+        // behaviour is covered by `TmuxSession`, which sets the marker itself.
+        for marker in ["TMUX", "TMUX_PANE", "HERDR_ENV", "HERDR_PANE_ID"] {
+            cmd.env_remove(marker);
+        }
 
         let child = pty_pair
             .slave
@@ -541,16 +550,50 @@ pub struct TmuxSession {
 
 #[allow(dead_code)]
 impl TmuxSession {
-    /// Spawn a tmux session with termcmp as the pane's DIRECT child.
+    /// Spawn a tmux session with termcmp as the pane's DIRECT child, in the
+    /// **isolated** topology (`session_isolation = true` written explicitly).
     ///
     /// Every topology/foreground/OSC test depends on termcmp being the pane
-    /// process (pane_current_command == "termcmp", job control mirroring,
-    /// etc.). Do not wrap termcmp here.
+    /// process (job control, popup rendering, OSC forwarding). Do not wrap
+    /// termcmp here.
+    ///
+    /// The config is load-bearing: with `session_isolation` left unset, the
+    /// tri-state default resolves to *mirrored* inside a detected
+    /// multiplexer — which every pane is, once tmux sets `$TMUX`. That would
+    /// silently drop the inner shell's controlling terminal and make
+    /// `shell_has_job_control()` false on Linux, turning the job-control
+    /// tests into skips. Tests that want the auto/mirrored default must ask
+    /// for it via [`TmuxSession::spawn_auto_isolation`].
     pub fn spawn() -> Self {
+        Self::spawn_with_isolation("[experimental]\nsession_isolation = true\n", "isolated")
+    }
+
+    /// Spawn a tmux session whose pane runs termcmp with `session_isolation`
+    /// **unset** — the shipped default a real tmux/herdr user gets.
+    ///
+    /// Inside tmux this must resolve to the mirrored topology so
+    /// `pane_current_command` (tmux) and `foreground_process_group_id`
+    /// (herdr) see the inner command instead of `termcmp`. The config file
+    /// still exists so the developer's own `~/.config/termcmp/config.toml`
+    /// cannot leak into the assertion.
+    pub fn spawn_auto_isolation() -> Self {
+        Self::spawn_with_isolation("[experimental]\n", "auto")
+    }
+
+    /// Shared construction for the two isolation-selecting spawns. `body` is
+    /// the exact config-file content; `label` names the topology in the
+    /// write-failure panic. Files are left in place (same convention as the
+    /// exit markers) — deleting one would race the pane's startup load.
+    fn spawn_with_isolation(body: &str, label: &str) -> Self {
+        let config_path =
+            std::env::temp_dir().join(format!("termcmp-{}-config-{}", label, unique_suffix()));
+        std::fs::write(&config_path, body).unwrap_or_else(|e| panic!("write {label} config: {e}"));
         let pane_cmd: Vec<String> = vec![
             env!("CARGO_BIN_EXE_termcmp").to_string(),
             "--log-level".to_string(),
             "error".to_string(),
+            "--config".to_string(),
+            config_path.to_string_lossy().into_owned(),
             "/bin/bash".to_string(),
             "--norc".to_string(),
         ];
@@ -562,12 +605,13 @@ impl TmuxSession {
     /// so the inner shell stays in the proxy's session and the outer tty's
     /// foreground pgrp can be mirrored onto inner jobs.
     ///
-    /// Only the tests that observe foreground-group mirroring
-    /// (`pane_current_command` tracking) may use this; the default topology
-    /// isolates the shell session so `/dev/tty` password prompts work, at the
-    /// cost of that observation. The config file is left in place (same
-    /// convention as the exit markers) — deleting it would race the pane's
-    /// startup config load.
+    /// Explicit `false` is the opt-out a user sets on a *direct* terminal that
+    /// is not a detected multiplexer (workmux, or any tracker termcmp does not
+    /// recognize). Inside tmux/herdr the same topology arrives automatically
+    /// when the key is unset — see [`TmuxSession::spawn_auto_isolation`].
+    ///
+    /// The config file is left in place (same convention as the exit markers)
+    /// — deleting it would race the pane's startup config load.
     pub fn spawn_legacy() -> Self {
         let config_path =
             std::env::temp_dir().join(format!("termcmp-legacy-config-{}", unique_suffix()));

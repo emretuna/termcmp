@@ -384,7 +384,7 @@ Opt-in features that are not yet considered stable.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `multi_terminal` | bool | `false` | Enable unsupported/unknown terminals. All 10 supported terminals (Ghostty, Otty, Kitty, WezTerm, Alacritty, Rio, iTerm2, Terminal.app, Zed, VSCode) work without this flag. Set to `true` only if you want to try Termcmp on an unlisted terminal. |
-| `session_isolation` | bool | `true` | Give the inner shell its own session and controlling terminal, so `/dev/tty` password prompts (sudo/ssh/git/pinentry) see the inner PTY. Set to `false` to restore foreground-process-group mirroring for tmux/herdr agent tracking, at the cost of broken `/dev/tty` password input. Requires restart. |
+| `session_isolation` | bool | `unset` | Give the inner shell its own session and controlling terminal, so `/dev/tty` password prompts (sudo/ssh/git/pinentry) see the inner PTY. When unset, isolation is on in a direct terminal and off inside a detected multiplexer — tmux (`$TMUX` set) or herdr (`$HERDR_ENV=1`) — so `tmux pane_current_command` / herdr `foreground_process_group_id` see the running agent instead of `termcmp`. An explicit value always wins: `true` keeps isolation (and working `/dev/tty` prompts) even inside tmux/herdr, at the cost of agent tracking; `false` restores foreground-process-group mirroring everywhere, at the cost of broken `/dev/tty` password input. The two cannot coexist: mirroring onto the outer tty puts `/dev/tty` readers back in contention with the proxy's reader. Requires restart. |
 
 ```toml
 [experimental]
@@ -399,7 +399,7 @@ Termcmp auto-detects the terminal via `TERM_PROGRAM` and terminal-specific env v
 - **Alacritty** — DECSET 2026 synchronized output, OSC 7771 shell integration prompt markers (Alacritty does not support OSC 133).
 - **iTerm2 / Terminal.app** — pre-render buffer (single `write()` atomicity), OSC 7771 shell integration prompt markers.
 
-**tmux support:** Ghostty, Kitty, WezTerm, Alacritty, iTerm2, Zed, and VSCode are detected inside tmux via their respective env vars. Terminal.app inside tmux is not detected (it sets no env var that leaks through tmux).
+**tmux support:** Ghostty, Kitty, WezTerm, Alacritty, iTerm2, Zed, and VSCode are detected inside tmux via their respective env vars. Terminal.app inside tmux is not detected (it sets no env var that leaks through tmux). The same leaked-env detection resolves the outer terminal inside herdr (`$HERDR_ENV=1` marks a herdr pane, `$TERM_PROGRAM=herdr`), and herdr panes have agent tracking enabled automatically.
 
 ## Frecency Boosting
 

@@ -58,30 +58,32 @@ pub struct TermcmpProviders {
     pub enabled: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Experimental knobs. Every field defaults to "unset/false": an unset
+/// [`ExperimentalConfig::session_isolation`] is resolved per topology by the
+/// proxy — isolated on a direct terminal so `/dev/tty` password prompts work,
+/// mirrored inside tmux/herdr so their agent tracking sees the inner command.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExperimentalConfig {
     pub multi_terminal: bool,
     /// Give the inner shell its own session with the inner PTY slave as its
     /// controlling terminal. `/dev/tty` readers (sudo, ssh, git, pinentry)
     /// then reach the inner PTY instead of the outer tty that the proxy's
-    /// reader is concurrently draining. Set `false` to restore the legacy
-    /// single-session topology, which is required for foreground pgrp
-    /// mirroring onto the outer tty (tmux `pane_current_command`, herdr
+    /// reader is concurrently draining. `false` restores the legacy
+    /// single-session topology, which is what foreground process-group
+    /// mirroring onto the outer tty needs (tmux `pane_current_command`, herdr
     /// `foreground_process_group_id`, workmux). Read once at startup —
     /// changing it requires a restart.
-    pub session_isolation: bool,
-}
-
-impl Default for ExperimentalConfig {
-    fn default() -> Self {
-        Self {
-            multi_terminal: false,
-            // Isolation is the default: without it `/dev/tty` password
-            // prompts are split between the app and the proxy's reader.
-            session_isolation: true,
-        }
-    }
+    ///
+    /// Tri-state. Unset (`None`) means "isolate on a direct terminal, mirror
+    /// inside a detected multiplexer" — tmux (`$TMUX`) and herdr
+    /// (`$HERDR_ENV=1`) panes get agent tracking automatically, because the
+    /// two topologies cannot coexist: mirroring the child pgrp onto the outer
+    /// tty puts `/dev/tty` readers back in contention with the proxy reader.
+    /// An explicit value always wins: `Some(true)` keeps isolation even in a
+    /// multiplexer (tracking goes dark), `Some(false)` mirrors everywhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_isolation: Option<bool>,
 }
 
 /// Per-feature thinking/reasoning toggle. Maps to wire-format fields:
@@ -2117,16 +2119,25 @@ multi_terminal = true
 
     #[test]
     fn test_experimental_session_isolation_default_and_override() {
-        assert!(
+        // Unset is the tri-state default: the proxy resolves it per topology.
+        assert_eq!(
             TermcmpConfig::default().experimental.session_isolation,
-            "session isolation must default on — /dev/tty password readers depend on it"
+            None,
+            "session isolation must stay unset so the proxy can resolve it per topology"
         );
-        let toml_str = r#"
-[experimental]
-session_isolation = false
-"#;
-        let config: TermcmpConfig = toml::from_str(toml_str).unwrap();
-        assert!(!config.experimental.session_isolation);
+        let config: TermcmpConfig =
+            toml::from_str("[experimental]\nsession_isolation = false\n").unwrap();
+        assert_eq!(config.experimental.session_isolation, Some(false));
+        let config: TermcmpConfig =
+            toml::from_str("[experimental]\nsession_isolation = true\n").unwrap();
+        assert_eq!(config.experimental.session_isolation, Some(true));
+        // An unset key must not be written back out, or `termcmp config`
+        // would emit a value that reloads as an explicit setting.
+        let dumped = toml::to_string(&TermcmpConfig::default()).unwrap();
+        assert!(
+            !dumped.contains("session_isolation"),
+            "unset session_isolation leaked into serialization: {dumped}"
+        );
     }
 
     #[test]

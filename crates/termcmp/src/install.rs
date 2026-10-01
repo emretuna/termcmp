@@ -113,7 +113,7 @@ const DEFAULT_CONFIG_TOML: &str = "\
 
 # [experimental]
 # multi_terminal = false  # Allow running in unsupported terminals (at your own risk)
-# session_isolation = true  # Give the inner shell its own session/controlling terminal so /dev/tty password prompts work; false restores foreground-group mirroring for tmux/herdr agent tracking
+# session_isolation = true  # true keeps the inner shell isolated so /dev/tty password prompts work everywhere (agent tracking goes dark); false mirrors the foreground process group for tmux/herdr/workmux; unset (default) isolates on a direct terminal and mirrors inside tmux/herdr
 ";
 
 pub(crate) const INIT_BEGIN: &str = "# >>> termcmp initialize >>>";
