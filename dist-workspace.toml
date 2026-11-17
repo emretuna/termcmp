@@ -22,3 +22,8 @@ install-updater = false
 # Preserve custom release.yml edits (SLSA attestations, release-gate test job,
 # publish-to-homebrew step) that `dist init` would otherwise revert.
 allow-dirty = ["ci"]
+
+# GitHub retired the macos-14 runner image on 2026-11-02; dist 0.31.0 still
+# plans Apple Silicon builds on it, so pin a live arm64 image explicitly.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
