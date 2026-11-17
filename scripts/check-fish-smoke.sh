@@ -257,6 +257,9 @@ assert_guard_line "guard: inconclusive walk honors guard" 'GUARD_psfail=1 VAR=se
 assert_guard_line "guard: tmux direct child of proxy skips" 'GUARD_tmux-direct=1 VAR=unset'
 assert_guard_line "guard: fresh tmux pane launches proxy" 'GUARD_tmux-fresh=0 VAR=set'
 
+# Orphaned fish idempotency test, wired into the gated smoke path.
+fish "$REPO_ROOT/tests/shell/test_fish_idempotency.fish"
+
 # --- Verdict ----------------------------------------------------------------
 if [ "$FAILURES" -gt 0 ]; then
     echo ""

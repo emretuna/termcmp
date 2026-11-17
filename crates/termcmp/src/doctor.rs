@@ -1,7 +1,10 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-use crate::install::{INIT_BEGIN, INIT_END, SHELL_BEGIN, SHELL_END, ZSH_INIT, ZSH_INTEGRATION};
+use crate::install::{
+    BASH_INIT, BASH_INTEGRATION, FISH_INIT, FISH_INTEGRATION, INIT_BEGIN, INIT_END, SHELL_BEGIN,
+    SHELL_END, ZSH_INIT, ZSH_INTEGRATION,
+};
 use crate::sanitize::sanitize_for_terminal;
 
 enum Severity {
@@ -290,22 +293,24 @@ fn extract_block_source_path(content: &str, begin: &str, end: &str) -> BlockSour
     }
 }
 
-/// Check 4: Shell integration installed in ~/.zshrc (zsh-only scope — fish/bash installs are not checked).
+/// Check 4: Shell integration installed in a shell rc file.
 ///
-/// Beyond verifying the init marker is present, this also surfaces:
+/// Shared by zsh, bash, and fish — the managed-block layout is identical, so
+/// only the rc path, label, script names, and embedded snippet contents
+/// differ. Beyond verifying the init marker is present, this also surfaces:
 ///
 /// * a stray init block with no shell-integration block (half-installed),
 /// * duplicate init OR shell-integration blocks (a botched manual edit),
 /// * a managed block whose `source` line cannot be parsed (hand-edited
 ///   beyond recognition),
 /// * the file the managed block actually `source`s missing or unreadable
-///   (so a stale .zshrc pointing at a long-gone install path Fails loudly,
+///   (so a stale rc pointing at a long-gone install path Fails loudly,
 ///   even when the canonical install dir happens to have files),
 /// * installed snippet contents that drift from the embedded copy
 ///   (`termcmp install` re-runs the embedded version onto disk),
-/// * the legacy OSC 7770 reporter in `termcmp.zsh` (pre-OSC 7772
+/// * the legacy OSC 7770 reporter in the integration script (pre-OSC 7772
 ///   migration),
-/// * the `.zshrc` sourcing from a non-canonical location, so the next
+/// * the rc sourcing from a non-canonical location, so the next
 ///   `termcmp install` won't silently swap the user's edits out.
 ///
 /// Order (each step returns on its first finding so the output stays
@@ -327,20 +332,23 @@ fn extract_block_source_path(content: &str, begin: &str, end: &str) -> BlockSour
 /// A clean system that never ran `install` (no managed blocks present)
 /// uses `Skip` so the doctor still exits 0; partial installs (one block
 /// but not the other) are escalated to `Fail` with concrete remediation.
-fn check_shell_integration() -> CheckResult {
-    let Some(home) = dirs::home_dir() else {
-        return CheckResult::skip("no $HOME — cannot check shell integration");
-    };
-    let zshrc = home.join(".zshrc");
-    let content = match std::fs::read_to_string(&zshrc) {
+fn check_shell_integration_for(
+    rc_path: &Path,
+    rc_label: &str,
+    init_name: &str,
+    script_name: &str,
+    embedded_init: &str,
+    embedded_script: &str,
+) -> CheckResult {
+    let content = match std::fs::read_to_string(rc_path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return CheckResult::skip(format!("no {} — clean system", zshrc.display()));
+            return CheckResult::skip(format!("no {} — clean system", rc_path.display()));
         }
         Err(e) => {
             return CheckResult::fail(format!(
                 "cannot read {}: {} ({:?})",
-                zshrc.display(),
+                rc_path.display(),
                 e,
                 e.kind()
             ));
@@ -349,7 +357,9 @@ fn check_shell_integration() -> CheckResult {
 
     // 1. Both managed blocks present?
     if !content.contains(INIT_BEGIN) {
-        return CheckResult::skip("no termcmp managed block in .zshrc — run `termcmp install`");
+        return CheckResult::skip(format!(
+            "no termcmp managed block in {rc_label} — run `termcmp install`"
+        ));
     }
     if !content.contains(SHELL_BEGIN) {
         return CheckResult::fail(
@@ -362,7 +372,7 @@ fn check_shell_integration() -> CheckResult {
     let shell_count = content.matches(SHELL_BEGIN).count();
     if init_count > 1 || shell_count > 1 {
         return CheckResult::fail(format!(
-            "duplicate managed blocks in .zshrc (init={init_count}, shell={shell_count}) — \
+            "duplicate managed blocks in {rc_label} (init={init_count}, shell={shell_count}) — \
              run `termcmp uninstall` then reinstall",
         ));
     }
@@ -370,7 +380,7 @@ fn check_shell_integration() -> CheckResult {
     // 3. Source line in each block is parseable?
     // Parse the actual source paths from each managed block; the
     // canonical install dir is a separate check below. This catches
-    // stale .zshrc managed blocks pointing at long-gone install paths
+    // stale rc managed blocks pointing at long-gone install paths
     // (e.g. a previous XDG_CONFIG_HOME) — the previous canonical-only
     // probe would silently pass if files happened to exist at the
     // canonical location.
@@ -390,17 +400,17 @@ fn check_shell_integration() -> CheckResult {
     let (init_path, script_path) = match (init_source, script_source) {
         (BlockSource::Parsed(init), BlockSource::Parsed(script)) => (init, script),
         (BlockSource::NoSourceLine, BlockSource::NoSourceLine) => {
-            return CheckResult::warn(
-                "termcmp managed blocks present in .zshrc but neither references \
+            return CheckResult::warn(format!(
+                "termcmp managed blocks present in {rc_label} but neither references \
                  an external script via `source` — this is the pre-v0.9 install style. \
                  Run `termcmp install` to migrate to the current layout.",
-            );
+            ));
         }
         (BlockSource::Unterminated, _) | (_, BlockSource::Unterminated) => {
-            return CheckResult::fail(
-                "termcmp managed block in .zshrc is missing its END marker — \
+            return CheckResult::fail(format!(
+                "termcmp managed block in {rc_label} is missing its END marker — \
                  run `termcmp uninstall` then reinstall",
-            );
+            ));
         }
         (BlockSource::MultipleSourceLines { first, additional }, _) => {
             let count = 1 + additional.len();
@@ -409,7 +419,7 @@ fn check_shell_integration() -> CheckResult {
                 .collect::<Vec<_>>()
                 .join(", ");
             return CheckResult::fail(format!(
-                "termcmp init block in .zshrc has {count} `source` lines \
+                "termcmp init block in {rc_label} has {count} `source` lines \
                  ({paths}) — every listed path will run at shell startup. Run \
                  `termcmp uninstall` then reinstall to restore a single \
                  source line per block.",
@@ -422,38 +432,38 @@ fn check_shell_integration() -> CheckResult {
                 .collect::<Vec<_>>()
                 .join(", ");
             return CheckResult::fail(format!(
-                "termcmp shell-integration block in .zshrc has {count} \
+                "termcmp shell-integration block in {rc_label} has {count} \
                  `source` lines ({paths}) — every listed path will run at shell \
                  startup. Run `termcmp uninstall` then reinstall to restore \
                  a single source line per block.",
             ));
         }
         (BlockSource::UnparseableQuoting, _) | (_, BlockSource::UnparseableQuoting) => {
-            return CheckResult::fail(
-                "termcmp managed block in .zshrc has a `source` line with \
+            return CheckResult::fail(format!(
+                "termcmp managed block in {rc_label} has a `source` line with \
                  unrecognized quoting around the path — run `termcmp uninstall` \
                  then reinstall",
-            );
+            ));
         }
         (BlockSource::NoSourceLine, _) => {
-            return CheckResult::fail(
-                "termcmp init block in .zshrc has no parseable `source` line — \
+            return CheckResult::fail(format!(
+                "termcmp init block in {rc_label} has no parseable `source` line — \
                  run `termcmp uninstall` then reinstall",
-            );
+            ));
         }
         (_, BlockSource::NoSourceLine) => {
-            return CheckResult::fail(
-                "termcmp shell-integration block in .zshrc has no parseable \
+            return CheckResult::fail(format!(
+                "termcmp shell-integration block in {rc_label} has no parseable \
                  `source` line — run `termcmp uninstall` then reinstall",
-            );
+            ));
         }
         (BlockSource::BlockNotFound, _) | (_, BlockSource::BlockNotFound) => {
             // Gated above by `content.contains(BEGIN)` checks; encoded for
             // exhaustiveness only.
-            return CheckResult::fail(
-                "termcmp managed block in .zshrc disappeared between checks — \
+            return CheckResult::fail(format!(
+                "termcmp managed block in {rc_label} disappeared between checks — \
                  run `termcmp uninstall` then reinstall",
-            );
+            ));
         }
     };
 
@@ -484,7 +494,7 @@ fn check_shell_integration() -> CheckResult {
     };
 
     // 5. Legacy OSC 7770 reporter present? Checked BEFORE the content-drift
-    // comparison so an upgrading user with a pre-OSC 7772 termcmp.zsh
+    // comparison so an upgrading user with a pre-OSC 7772 integration
     // on disk gets a migration-specific message. The embedded snippet no
     // longer emits OSC 7770, so deferring this check until after the drift
     // comparison would render it unreachable on every upgrade path.
@@ -495,7 +505,7 @@ fn check_shell_integration() -> CheckResult {
     }
 
     // 6. Installed snippets match embedded versions?
-    if installed_init != ZSH_INIT || installed_script != ZSH_INTEGRATION {
+    if installed_init != embedded_init || installed_script != embedded_script {
         return CheckResult::warn(format!(
             "shell integration files at {} / {} drifted from embedded version — run `termcmp install` to refresh",
             init_path.display(),
@@ -507,48 +517,101 @@ fn check_shell_integration() -> CheckResult {
     // Drift here is non-fatal (the user may deliberately ship their own
     // copy), but flag it so the next `termcmp install` doesn't
     // appear to swap their edits out from under them.
-    let canonical_shell_dir = home.join(".config/termcmp/shell");
-    let canonical_init = canonical_shell_dir.join("init.zsh");
-    let canonical_script = canonical_shell_dir.join("termcmp.zsh");
-    if init_path != canonical_init || script_path != canonical_script {
-        return CheckResult::warn(format!(
-            ".zshrc managed block sources non-canonical paths ({}, {}) — expected ({}, {}); \
-             run `termcmp install` to refresh",
-            init_path.display(),
-            script_path.display(),
-            canonical_init.display(),
-            canonical_script.display(),
-        ));
+    if let Some(home) = dirs::home_dir() {
+        let canonical_shell_dir = home.join(".config/termcmp/shell");
+        let canonical_init = canonical_shell_dir.join(init_name);
+        let canonical_script = canonical_shell_dir.join(script_name);
+        if init_path != canonical_init || script_path != canonical_script {
+            return CheckResult::warn(format!(
+                "{rc_label} managed block sources non-canonical paths ({}, {}) — expected ({}, {}); \
+                 run `termcmp install` to refresh",
+                init_path.display(),
+                script_path.display(),
+                canonical_init.display(),
+                canonical_script.display(),
+            ));
+        }
     }
 
     CheckResult::ok("termcmp shell integration looks healthy")
+}
+
+/// Check 4 driver: probe every rc file that exists at its default path.
+/// A missing rc file produces a Skip line (so a clean system still exits 0).
+fn check_shell_integration() -> Vec<CheckResult> {
+    let Some(home) = dirs::home_dir() else {
+        return vec![CheckResult::skip(
+            "no $HOME — cannot check shell integration",
+        )];
+    };
+
+    // (rc relative path, message label, init file name, integration file name,
+    //  embedded init, embedded integration)
+    let shells: [(&str, &str, &str, &str, &str, &str); 3] = [
+        (
+            ".zshrc",
+            ".zshrc",
+            "init.zsh",
+            "termcmp.zsh",
+            ZSH_INIT,
+            ZSH_INTEGRATION,
+        ),
+        (
+            ".bashrc",
+            ".bashrc",
+            "init.bash",
+            "termcmp.bash",
+            BASH_INIT,
+            BASH_INTEGRATION,
+        ),
+        (
+            ".config/fish/config.fish",
+            "config.fish",
+            "init.fish",
+            "termcmp.fish",
+            FISH_INIT,
+            FISH_INTEGRATION,
+        ),
+    ];
+
+    let mut results = Vec::new();
+    for (rel_path, label, init_name, script_name, embedded_init, embedded_script) in shells {
+        let rc_path = home.join(rel_path);
+        if rc_path.exists() {
+            results.push(check_shell_integration_for(
+                &rc_path,
+                label,
+                init_name,
+                script_name,
+                embedded_init,
+                embedded_script,
+            ));
+        } else {
+            results.push(CheckResult::skip(format!(
+                "no {} — clean system",
+                rc_path.display()
+            )));
+        }
+    }
+    results
 }
 
 /// Check 5: Running inside a supported terminal
 ///
 /// Uses `TerminalProfile::detect()` as the single source of truth for which
 /// terminal is running, avoiding divergence between detect() and is_supported().
-fn check_terminal(config: &config::TermcmpConfig) -> CheckResult {
+fn check_terminal() -> CheckResult {
     let profile = terminal::TerminalProfile::detect();
-    check_terminal_profile(&profile, config.experimental.multi_terminal)
+    check_terminal_profile(&profile)
 }
 
-/// Testable terminal check logic — pure function on profile.
-fn check_terminal_profile(
-    profile: &terminal::TerminalProfile,
-    multi_terminal: bool,
-) -> CheckResult {
+/// Testable terminal check logic — pure function on profile. Unknown
+/// terminals run with the safe rendering profile; there is no startup gate.
+fn check_terminal_profile(profile: &terminal::TerminalProfile) -> CheckResult {
     if !profile.terminal().is_known() {
-        if multi_terminal {
-            return CheckResult::ok(format!(
-                "Unknown terminal ({}) — multi_terminal enabled, proceeding anyway",
-                profile.display_name(),
-            ));
-        }
-        return CheckResult::warn(format!(
-            "Unsupported terminal ({}) — supported: {}",
+        return CheckResult::ok(format!(
+            "Unknown terminal ({}) — safe rendering profile (single-write frames + shell-integration markers)",
             profile.display_name(),
-            terminal::Terminal::supported_terminals().join(", ")
         ));
     }
 
@@ -581,16 +644,11 @@ pub fn run_doctor(config_path: Option<&Path>) -> Result<()> {
         }
     }
 
-    // Check 4: Shell integration
-    results.push(check_shell_integration());
+    // Check 4: Shell integration (one result per existing rc file)
+    results.extend(check_shell_integration());
 
-    // Check 5: Terminal support (needs config for experimental flag)
-    match &config {
-        Some(cfg) => results.push(check_terminal(cfg)),
-        None => results.push(CheckResult::skip(
-            "Terminal support — config invalid, cannot check experimental flags",
-        )),
-    }
+    // Check 5: Terminal support (terminal detection does not depend on config)
+    results.push(check_terminal());
 
     print_results(&results);
 
@@ -614,7 +672,7 @@ mod tests {
     #[test]
     fn test_check_terminal_ghostty_ok() {
         let profile = terminal::TerminalProfile::for_ghostty();
-        let result = check_terminal_profile(&profile, false);
+        let result = check_terminal_profile(&profile);
         assert!(matches!(result.severity, Severity::Ok));
         assert!(result.message.contains("Ghostty"));
     }
@@ -622,7 +680,7 @@ mod tests {
     #[test]
     fn test_check_terminal_kitty_ok() {
         let profile = terminal::TerminalProfile::for_kitty();
-        let result = check_terminal_profile(&profile, false);
+        let result = check_terminal_profile(&profile);
         assert!(matches!(result.severity, Severity::Ok));
         assert!(result.message.contains("Kitty"));
     }
@@ -630,7 +688,7 @@ mod tests {
     #[test]
     fn test_check_terminal_wezterm_ok() {
         let profile = terminal::TerminalProfile::for_wezterm();
-        let result = check_terminal_profile(&profile, false);
+        let result = check_terminal_profile(&profile);
         assert!(matches!(result.severity, Severity::Ok));
         assert!(result.message.contains("WezTerm"));
     }
@@ -638,7 +696,7 @@ mod tests {
     #[test]
     fn test_check_terminal_alacritty_ok() {
         let profile = terminal::TerminalProfile::for_alacritty();
-        let result = check_terminal_profile(&profile, false);
+        let result = check_terminal_profile(&profile);
         assert!(matches!(result.severity, Severity::Ok));
         assert!(result.message.contains("Alacritty"));
     }
@@ -646,7 +704,7 @@ mod tests {
     #[test]
     fn test_check_terminal_rio_ok() {
         let profile = terminal::TerminalProfile::for_rio();
-        let result = check_terminal_profile(&profile, false);
+        let result = check_terminal_profile(&profile);
         assert!(matches!(result.severity, Severity::Ok));
         assert!(result.message.contains("Rio"));
     }
@@ -654,25 +712,17 @@ mod tests {
     #[test]
     fn test_check_terminal_iterm2_ok() {
         let profile = terminal::TerminalProfile::for_iterm2();
-        let result = check_terminal_profile(&profile, false);
+        let result = check_terminal_profile(&profile);
         assert!(matches!(result.severity, Severity::Ok));
         assert!(result.message.contains("iTerm2"));
     }
 
     #[test]
-    fn test_check_terminal_unknown_warns() {
+    fn test_check_terminal_unknown_ok() {
         let profile = terminal::TerminalProfile::for_unknown("foot");
-        let result = check_terminal_profile(&profile, false);
-        assert!(matches!(result.severity, Severity::Warn));
-        assert!(result.message.contains("Unsupported"));
-    }
-
-    #[test]
-    fn test_check_terminal_unknown_with_multi_terminal_ok() {
-        let profile = terminal::TerminalProfile::for_unknown("foot");
-        let result = check_terminal_profile(&profile, true);
+        let result = check_terminal_profile(&profile);
         assert!(matches!(result.severity, Severity::Ok));
-        assert!(result.message.contains("multi_terminal"));
+        assert!(result.message.contains("safe rendering profile"));
     }
 
     #[test]

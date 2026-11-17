@@ -13,6 +13,7 @@ pub(crate) const ZSH_INIT: &str = include_str!("../../../shell/init.zsh");
 pub(crate) const FISH_INTEGRATION: &str = include_str!("../../../shell/termcmp.fish");
 pub(crate) const FISH_INIT: &str = include_str!("../../../shell/init.fish");
 pub(crate) const BASH_INTEGRATION: &str = include_str!("../../../shell/termcmp.bash");
+pub(crate) const BASH_INIT: &str = include_str!("../../../shell/init.bash");
 
 const DEFAULT_CONFIG_TOML: &str = "\
 # Termcmp configuration
@@ -112,8 +113,9 @@ const DEFAULT_CONFIG_TOML: &str = "\
 # name = \"GPT-4o\"
 
 # [experimental]
-# multi_terminal = false  # Allow running in unsupported terminals (at your own risk)
-# session_isolation = true  # true keeps the inner shell isolated so /dev/tty password prompts work everywhere (agent tracking goes dark); false mirrors the foreground process group for tmux/herdr/workmux; unset (default) isolates on a direct terminal and mirrors inside tmux/herdr
+# multi_terminal = false  # Deprecated no-op: unknown terminals now always run with the safe profile
+# agent_tracking = false  # true mirrors the foreground process group for tmux/herdr/workmux agent tracking (breaks /dev/tty password prompts); false (default) isolates the inner shell so passwords and job control work everywhere
+# session_isolation = true  # Legacy alias: false == agent_tracking = true; true == agent_tracking = false. agent_tracking wins when both are set.
 ";
 
 pub(crate) const INIT_BEGIN: &str = "# >>> termcmp initialize >>>";
@@ -223,14 +225,14 @@ fn detect_shell_targets(home: &Path) -> Vec<ShellTarget> {
 /// Fish managed block that sources the init script (placed near the top
 /// of `~/.config/fish/config.fish`).
 fn fish_init_block(init_path: &Path) -> String {
-    let path = sanitize_path(init_path);
+    let path = shell_safe_path(init_path);
     format!(
         "{INIT_BEGIN}\n\
          {MANAGED_WARNING}\n\
          if test -f {path}\n  \
          source {path}\n\
          else\n  \
-         echo \"termcmp: init script missing: {path}\" >&2\n  \
+         echo \"termcmp: init script missing: \"{path} >&2\n  \
          echo \"termcmp: run 'termcmp install' to restore it\" >&2\n\
          end\n\
          {INIT_END}"
@@ -245,7 +247,7 @@ fn fish_shell_integration_block(script_path: &Path) -> String {
          {MANAGED_WARNING}\n\
          source {}\n\
          {SHELL_END}",
-        sanitize_path(script_path)
+        shell_safe_path(script_path)
     )
 }
 
@@ -352,6 +354,7 @@ fn install_to(targets: &[ShellTarget], config_dir: &Path, dry_run: bool) -> Resu
     let shell_dir = config_dir.join("shell");
     let zsh_init_path = shell_dir.join("init.zsh");
     let zsh_script_path = shell_dir.join("termcmp.zsh");
+    let bash_init_path = shell_dir.join("init.bash");
     let bash_script_path = shell_dir.join("termcmp.bash");
     let fish_init_path = shell_dir.join("init.fish");
     let fish_script_path = shell_dir.join("termcmp.fish");
@@ -364,6 +367,10 @@ fn install_to(targets: &[ShellTarget], config_dir: &Path, dry_run: bool) -> Resu
         println!(
             "  Would write zsh integration to {}",
             sanitize_path(&zsh_script_path)
+        );
+        println!(
+            "  Would write bash init script to {}",
+            sanitize_path(&bash_init_path)
         );
         println!(
             "  Would write bash integration to {}",
@@ -400,8 +407,7 @@ fn install_to(targets: &[ShellTarget], config_dir: &Path, dry_run: bool) -> Resu
                 ShellTarget::Bash(rc) => {
                     println!("  Would update {}\n", sanitize_path(rc));
                     println!("  \x1b[36m\u{2139}\x1b[0m  The following would be added to your shell config:\n");
-                    let block = shell_integration_block(&bash_script_path);
-                    println!("    \x1b[36m{}\x1b[0m\n", block.replace('\n', "\n    "));
+                    print_shell_blocks(&bash_init_path, &bash_script_path);
                 }
                 ShellTarget::Fish(rc) => {
                     println!("  Would update {}\n", sanitize_path(rc));
@@ -431,6 +437,13 @@ fn install_to(targets: &[ShellTarget], config_dir: &Path, dry_run: bool) -> Resu
     println!(
         "  Wrote zsh integration to {}",
         sanitize_path(&zsh_script_path)
+    );
+
+    atomic_write::atomic_write_preserving_mode(&bash_init_path, BASH_INIT.as_bytes())
+        .with_context(|| format!("failed to write {}", bash_init_path.display()))?;
+    println!(
+        "  Wrote bash init script to {}",
+        sanitize_path(&bash_init_path)
     );
 
     atomic_write::atomic_write_preserving_mode(&bash_script_path, BASH_INTEGRATION.as_bytes())
@@ -487,7 +500,7 @@ fn install_to(targets: &[ShellTarget], config_dir: &Path, dry_run: bool) -> Resu
     for target in targets {
         let ok = match target {
             ShellTarget::Zsh(rc) => install_zsh_config(rc, &zsh_init_path, &zsh_script_path)?,
-            ShellTarget::Bash(rc) => install_bash_config(rc, &bash_script_path)?,
+            ShellTarget::Bash(rc) => install_bash_config(rc, &bash_init_path, &bash_script_path)?,
             ShellTarget::Fish(rc) => install_fish_config(rc, &fish_init_path, &fish_script_path)?,
         };
         if ok {
@@ -597,10 +610,10 @@ fn install_zsh_config(zshrc_path: &Path, init_path: &Path, script_path: &Path) -
     }
 }
 
-/// Write the managed shell-integration block into `.bashrc`. Bash has no
-/// init script (no proxy auto-exec — users launch `termcmp` manually), so
-/// only the integration block is appended at the bottom.
-fn install_bash_config(bashrc_path: &Path, script_path: &Path) -> Result<bool> {
+/// Write managed blocks into the bash config file (`.bashrc`) — init block at
+/// the top (auto-exec the proxy), shell integration at the bottom (OSC
+/// reporting).
+fn install_bash_config(bashrc_path: &Path, init_path: &Path, script_path: &Path) -> Result<bool> {
     let existing = if bashrc_path.exists() {
         fs::read_to_string(bashrc_path)
             .with_context(|| format!("failed to read {}", bashrc_path.display()))?
@@ -610,13 +623,14 @@ fn install_bash_config(bashrc_path: &Path, script_path: &Path) -> Result<bool> {
 
     backup_rc_file(bashrc_path)?;
 
-    // Strip existing managed blocks (idempotent). The INIT strip is a
-    // harmless no-op (bash gets no init block) but keeps the pattern uniform.
+    // Strip existing managed blocks (idempotent)
     let (content, _) = remove_block(&existing, INIT_BEGIN, INIT_END);
     let (content, _) = remove_block(&content, SHELL_BEGIN, SHELL_END);
 
-    // User content first, integration block at the bottom.
+    // Prepend init block, append shell integration block.
     let mut new_bashrc = String::new();
+    new_bashrc.push_str(&init_block(init_path));
+    new_bashrc.push('\n');
     if !content.is_empty() {
         new_bashrc.push_str(&content);
         if !content.ends_with('\n') {
@@ -626,10 +640,21 @@ fn install_bash_config(bashrc_path: &Path, script_path: &Path) -> Result<bool> {
     new_bashrc.push_str(&shell_integration_block(script_path));
     new_bashrc.push('\n');
 
-    atomic_write::atomic_write_preserving_mode(bashrc_path, new_bashrc.as_bytes())
-        .with_context(|| format!("failed to write {}", bashrc_path.display()))?;
-    println!("  Updated {}", sanitize_path(bashrc_path));
-    Ok(true)
+    match atomic_write::atomic_write_preserving_mode(bashrc_path, new_bashrc.as_bytes()) {
+        Ok(()) => {
+            println!("  Updated {}", sanitize_path(bashrc_path));
+            Ok(true)
+        }
+        Err(e) if atomic_write::is_permission_denied(&e) => {
+            println!(
+                "\n  \x1b[33m\u{26a0}  Could not write to {} (permission denied)\x1b[0m\n",
+                sanitize_path(bashrc_path)
+            );
+            print_shell_blocks(init_path, script_path);
+            Ok(false)
+        }
+        Err(e) => Err(e.context(format!("failed to write {}", bashrc_path.display()))),
+    }
 }
 
 /// Write managed blocks into the fish config file (`config.fish`).
@@ -760,6 +785,7 @@ fn uninstall_from(
     for name in &[
         "init.zsh",
         "termcmp.zsh",
+        "init.bash",
         "termcmp.bash",
         "init.fish",
         "termcmp.fish",
@@ -1282,6 +1308,9 @@ mod tests {
         // All shell scripts are deployed regardless of detected targets.
         assert!(config.join("shell/init.fish").exists());
         assert!(config.join("shell/termcmp.fish").exists());
+        let bash_init = config.join("shell/init.bash");
+        assert!(bash_init.exists());
+        assert_eq!(fs::read_to_string(&bash_init).unwrap(), BASH_INIT);
         let bash_script = config.join("shell/termcmp.bash");
         assert!(bash_script.exists());
         assert_eq!(fs::read_to_string(&bash_script).unwrap(), BASH_INTEGRATION);
@@ -1428,6 +1457,8 @@ mod tests {
         // Shell scripts should be removed
         assert!(!config.join("shell/init.zsh").exists());
         assert!(!config.join("shell/termcmp.zsh").exists());
+        assert!(!config.join("shell/init.bash").exists());
+        assert!(!config.join("shell/termcmp.bash").exists());
         assert!(!config.join("shell/init.fish").exists());
         assert!(!config.join("shell/termcmp.fish").exists());
     }
@@ -1534,6 +1565,14 @@ mod tests {
     #[test]
     fn test_install_readonly_zshrc_succeeds() {
         use std::os::unix::fs::PermissionsExt;
+
+        // Root bypasses DAC permission checks, so a 0o555 dir is still
+        // writable and PermissionDenied cannot be triggered. Skip under
+        // root (e.g. the Docker Linux matrix build stage).
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("skipping test_install_readonly_zshrc_succeeds: running as root");
+            return;
+        }
 
         // Exercises the full first-install PermissionDenied path: parent
         // dir is read-only, so backup creation fails-fast with
@@ -1840,11 +1879,23 @@ mod tests {
         assert!(zsh_content.contains(SHELL_BEGIN));
         assert!(zsh_content.contains("export ZSH_USER=1"));
 
-        // bash: integration block only (no init), user content survives
+        // bash: both blocks, user content survives, init block precedes
+        // user content and the integration block follows it.
         let bash_content = fs::read_to_string(&bashrc).unwrap();
+        assert!(bash_content.contains(INIT_BEGIN));
         assert!(bash_content.contains(SHELL_BEGIN));
-        assert!(!bash_content.contains(INIT_BEGIN));
         assert!(bash_content.contains("export BASH_USER=2"));
+        let bash_init_pos = bash_content.find(INIT_BEGIN).unwrap();
+        let bash_user_pos = bash_content.find("export BASH_USER=2").unwrap();
+        let bash_shell_pos = bash_content.find(SHELL_BEGIN).unwrap();
+        assert!(
+            bash_init_pos < bash_user_pos,
+            "bash init block must precede user content"
+        );
+        assert!(
+            bash_user_pos < bash_shell_pos,
+            "bash integration block must follow user content"
+        );
 
         // fish: both blocks, user content survives
         let fish_content = fs::read_to_string(&fish_config).unwrap();

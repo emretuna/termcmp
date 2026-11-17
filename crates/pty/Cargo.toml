@@ -30,4 +30,6 @@ libc = "0.2"
 [dev-dependencies]
 # Enables the `TerminalProfile::for_*()` fixture constructors for tests only.
 terminal = { path = "../terminal", features = ["test-utils"] }
+# Enables `parser::test_utils::build_osc7772_envelope` for test fixtures.
+parser = { path = "../parser", features = ["test-utils"] }
 tempfile = "3"

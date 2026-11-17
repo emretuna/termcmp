@@ -127,13 +127,6 @@ pub struct TerminalState {
     shell_env_dirty: bool,
     cursor_sync_requested: bool,
     cpr_synced: bool,
-    /// One-shot guard so the deprecation warning for the legacy OSC 7770
-    /// raw-framing path fires at most once per `TerminalState` instance.
-    /// Subsequent legacy dispatches downgrade to a `trace!` line so a stale
-    /// shell does not spam the proxy log on every keystroke. Production
-    /// currently constructs a single parser per proxy session, so this is
-    /// effectively per-process (narrow 7772 alphabet prevents `;`/BEL/ESC splitting).
-    legacy_osc7770_warned: bool,
     /// Last OSC 7774 diagnostic frame; consumers drain via
     /// [`Self::take_diagnostic`]. Currently observation-only (parser tests
     /// and the `tracing::warn!` emitted inline by `osc_dispatch`); reserved
@@ -184,24 +177,9 @@ impl TerminalState {
             shell_env_dirty: false,
             cursor_sync_requested: false,
             cpr_synced: false,
-            legacy_osc7770_warned: false,
             last_diagnostic: None,
             cpr_queue: VecDeque::new(),
             next_cpr_id: 0,
-        }
-    }
-
-    /// Returns true the first time it is called per `TerminalState`,
-    /// false thereafter. Used by the OSC 7770 (legacy) dispatch to log a
-    /// one-shot deprecation warning while downgrading repeated hits to
-    /// `trace!` to avoid spamming the log when a stale shell is talking
-    /// to a new binary. Idempotent after first call (strict buffer decode drops frame, lenient path decode best-effort).
-    pub(crate) fn check_and_set_legacy_osc7770_warned(&mut self) -> bool {
-        if self.legacy_osc7770_warned {
-            false
-        } else {
-            self.legacy_osc7770_warned = true;
-            true
         }
     }
 
@@ -420,7 +398,7 @@ impl TerminalState {
 
     /// Override the command buffer with a predicted value (e.g., after Tab
     /// acceptance in directory chaining). Does NOT set `buffer_dirty` since
-    /// this is a local prediction, not a shell-reported update via OSC 7770/7772.
+    /// this is a local prediction, not a shell-reported update via OSC 7772.
     pub fn predict_command_buffer(&mut self, buffer: String, cursor: usize) {
         self.buffer_cursor = cursor.min(buffer.chars().count());
         self.command_buffer = Some(buffer);
@@ -621,7 +599,7 @@ impl TerminalState {
         }
     }
 
-    /// Apply a shell-reported buffer state (typically from OSC 7770/7772).
+    /// Apply a shell-reported buffer state (typically from OSC 7772).
     /// Raises `buffer_dirty` (signals "recompute suggestions") and
     /// `buffer_pending_display` (signals "wait for the matching redraw before
     /// placing the popup").
@@ -1148,7 +1126,9 @@ mod tests {
         // OSC sets the flag, the printable byte after it clears the flag — this
         // is the in-frame fast path the proxy relies on.
         let mut p = crate::TerminalParser::new(24, 80);
-        p.process_bytes(b"\x1b]7770;3;git\x07x");
+        let mut bytes = crate::test_utils::build_osc7772_envelope("git", 3);
+        bytes.push(b'x');
+        p.process_bytes(&bytes);
         assert!(!p.state().buffer_pending_display());
     }
 
@@ -1214,27 +1194,5 @@ mod tests {
         assert!(state.buffer_pending_display());
         state.predict_command_buffer("git st".to_string(), 6);
         assert!(state.buffer_pending_display());
-    }
-
-    #[test]
-    fn check_and_set_legacy_osc7770_warned_is_one_shot() {
-        let mut s = TerminalState::new(24, 80);
-        assert!(
-            s.check_and_set_legacy_osc7770_warned(),
-            "first call returns true"
-        );
-        assert!(
-            !s.check_and_set_legacy_osc7770_warned(),
-            "second call returns false"
-        );
-        assert!(
-            !s.check_and_set_legacy_osc7770_warned(),
-            "third call still false"
-        );
-        s.update_dimensions(48, 120);
-        assert!(
-            !s.check_and_set_legacy_osc7770_warned(),
-            "resize must not reset"
-        );
     }
 }

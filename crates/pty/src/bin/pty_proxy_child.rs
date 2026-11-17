@@ -14,14 +14,12 @@
 //! `run_proxy`.
 //!
 //! Environment:
-//! - `PTY_PROXY_CHILD_FISH`: path of the shell to run (required).
-//! - `PTY_PROXY_CHILD_SESSION_ISOLATION`: `0` restores the legacy
-//!   single-session topology (inner shell shares this process's session, so
-//!   `ForegroundMirror` can point the outer tty at inner jobs). Anything else
-//!   — including unset — keeps the isolated topology. Resolved explicitly
-//!   rather than left unset: unset would let the ambient `$TMUX`/`$HERDR_ENV`
-//!   of the developer's shell auto-select the mirrored topology and change
-//!   what the test observes.
+//! - `PTY_PROXY_CHILD_SHELL`: path of the shell to run (required).
+//! - `PTY_PROXY_CHILD_AGENT_TRACKING`: `1` selects the mirror topology
+//!   (inner shell shares this process's session, so `ForegroundMirror` can
+//!   point the outer tty at inner jobs). Anything else — including unset —
+//!   keeps the isolated topology. Resolved explicitly rather than left
+//!   unset so the test's topology never depends on ambient config.
 
 use config::TermcmpConfig;
 use std::ffi::OsStr;
@@ -29,7 +27,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 
 fn main() {
-    let fish = std::env::var_os("PTY_PROXY_CHILD_FISH").expect("PTY_PROXY_CHILD_FISH unset");
+    let shell = std::env::var_os("PTY_PROXY_CHILD_SHELL").expect("PTY_PROXY_CHILD_SHELL unset");
 
     // Fresh session + controlling terminal: this is what makes the proxy
     // "foreground" for its first mirror call and permanently background
@@ -51,16 +49,13 @@ fn main() {
     supervisor_stream.set_nonblocking(true).ok();
 
     let mut config = TermcmpConfig::default();
-    // The test tty has no recognizable TERM profile; keep the proxy loop
-    // running instead of falling back to a plain shell.
-    config.experimental.multi_terminal = true;
-    config.experimental.session_isolation =
-        Some(std::env::var("PTY_PROXY_CHILD_SESSION_ISOLATION").as_deref() != Ok("0"));
+    config.experimental.agent_tracking =
+        std::env::var("PTY_PROXY_CHILD_AGENT_TRACKING").as_deref() == Ok("1");
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime in proxy child");
     let code = rt
         .block_on(pty::run_proxy(
-            OsStr::new(&fish),
+            OsStr::new(&shell),
             &[],
             &config,
             supervisor_stream,

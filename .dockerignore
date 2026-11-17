@@ -1,0 +1,12 @@
+# Build context hygiene: the Linux matrix builds from source inside the
+# container. Never ship host build artifacts (macOS target/ is ~4.5G and
+# incompatible with the Linux toolchain), VCS metadata, or local config.
+target/
+target-linux/
+.git/
+.github/
+benchmarks/
+assets/
+*.log
+.dockerignore
+docker/

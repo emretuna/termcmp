@@ -257,6 +257,20 @@ fn macos_proc_name(pid: libc::pid_t) -> Option<String> {
     String::from_utf8(buf[..end].to_vec()).ok()
 }
 
+/// Kernel secure-input state: echo disabled while canonical mode stays on
+/// (password readers: sudo/ssh/git/pinentry/`read -s`/`stty -echo` + reader).
+/// Polls the inner PTY directly rather than trusting the parser flag, which
+/// Task B only republishes on stdout reads — while ECHO is off the reader
+/// parks in `read` and produces no output, so the flag goes stale exactly
+/// when a popup must be suppressed. Fails closed (`false`) on tcgetattr error.
+fn inner_secure_input(fd: std::os::fd::RawFd) -> bool {
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
+        return false;
+    }
+    (termios.c_lflag & libc::ECHO) == 0 && (termios.c_lflag & libc::ICANON) != 0
+}
+
 /// Check whether a popup is eligible given the current terminal state.
 ///
 /// A popup is eligible only when the shell is at a prompt (`in_prompt == true`)
@@ -280,6 +294,14 @@ fn popup_eligible(
 ) -> bool {
     if !in_prompt || in_alt_screen || in_secure_input {
         return false;
+    }
+    // Kernel poll backstops the published flag: it is stale while ECHO is off
+    // (no stdout reads to republish it), which is precisely the password-prompt
+    // window. `fg_tty_fd` is the inner PTY master under isolation.
+    if let Some(fd) = fg_tty_fd {
+        if inner_secure_input(fd) {
+            return false;
+        }
     }
     // Check if foreground process is in blocklist
     if let Some(proc_name) = foreground_process_name(fg_tty_fd) {
@@ -1314,6 +1336,14 @@ impl InputHandler {
         &self.feedback
     }
 
+    /// Kernel secure-input poll on the inner tty (see [`inner_secure_input`]).
+    /// The feedback tick consults this so it never paints a spinner/empty/error
+    /// overlay over a password prompt while the published parser flag is stale.
+    #[doc(hidden)]
+    pub fn inner_secure_input(&self) -> bool {
+        self.inner_tty_fd.is_some_and(inner_secure_input)
+    }
+
     #[doc(hidden)]
     pub fn output_epoch(&self) -> u64 {
         self.output_epoch
@@ -1895,7 +1925,7 @@ impl InputHandler {
 
         // CD chaining: predict the buffer after acceptance and immediately
         // show next-level suggestions. Avoids timing issues with the shell's
-        // OSC 7770 roundtrip. Reuses the already-held parser lock for the
+        // OSC 7772 roundtrip. Reuses the already-held parser lock for the
         // prediction read and the `predict_command_buffer` mutation.
         let state = p.state();
         let buffer = state.command_buffer().unwrap_or("").to_string();
@@ -4745,18 +4775,18 @@ mod tests {
             ..Default::default()
         }]);
 
-        // Drive the parser to report a non-empty buffer. OSC 7770 ;
-        // <cursor> ; <buffer> BEL is the shell-integration buffer report
-        // consumed by `parser` (see performer.rs OSC 7770 handler).
+        // Drive the parser to report a non-empty buffer. OSC 7772 ;
+        // <cursor> ; <percent-encoded-buffer> BEL is the shell-integration
+        // buffer report consumed by `parser` (see performer.rs OSC 7772 handler).
         let parser = Arc::new(Mutex::new(parser::TerminalParser::new(24, 80)));
         let buffer = "xyzbogus";
         let cursor = buffer.chars().count();
-        let osc = format!("\x1b]7770;{cursor};{buffer}\x07");
-        parser.lock().unwrap().process_bytes(osc.as_bytes());
+        let osc = parser::test_utils::build_osc7772_envelope(buffer, cursor);
+        parser.lock().unwrap().process_bytes(&osc);
         assert_eq!(
             parser.lock().unwrap().state().command_buffer(),
             Some(buffer),
-            "setup: OSC 7770 must land in command_buffer"
+            "setup: OSC 7772 must land in command_buffer"
         );
 
         // Seed the fingerprint as if a prior trigger had populated this
@@ -9641,14 +9671,14 @@ mod tests {
 
     // ---- shell escape applied at the accept call site ----
 
-    /// Drive a parser to report a known command buffer via OSC 7770 so the
+    /// Drive a parser to report a known command buffer via OSC 7772 so the
     /// accept-time `parse_command_context` sees the expected state. Returns
     /// the parser ready for `handler.accept_suggestion(&parser)`.
     fn parser_with_buffer(buffer: &str) -> Arc<Mutex<parser::TerminalParser>> {
         let parser = Arc::new(Mutex::new(parser::TerminalParser::new(24, 80)));
         let cursor = buffer.chars().count();
-        let osc = format!("\x1b]7770;{cursor};{buffer}\x07");
-        parser.lock().unwrap().process_bytes(osc.as_bytes());
+        let osc = parser::test_utils::build_osc7772_envelope(buffer, cursor);
+        parser.lock().unwrap().process_bytes(&osc);
         parser
     }
 

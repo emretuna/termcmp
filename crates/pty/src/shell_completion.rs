@@ -1,4 +1,4 @@
-//! Shell-native completion providers (fish, zsh).
+//! Shell-native completion providers (fish, zsh, bash).
 //!
 //! Each provider runs the shell's own completion engine in a PTY subprocess
 //! and parses the output into suggestions. These are pure live providers:
@@ -12,6 +12,12 @@
 //! # Zsh
 //! A zpty-based capture widget runs `_main_complete` inside a real ZLE
 //! context and collects all `compadd` matches.
+//!
+//! # Bash
+//! Sources the system bash-completion, resolves the command's compspec via
+//! `complete -p`, and invokes the `-F` function (or prints the `-W` wordlist)
+//! with the `COMP_*` variables set. Runs on plain pipes — bash completion
+//! needs no tty.
 
 use std::future::Future;
 use std::io::Read;
@@ -165,6 +171,78 @@ fn run_in_pty(cmd: &str, args: &[&str], timeout: Duration) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).to_string())
 }
 
+/// Env vars that trigger terminal-emulator detection in shell init scripts.
+/// Removed from the completion probe environment so a sourced
+/// bash-completion script (or an init hook) cannot `exec` into a proxy.
+const COMPLETION_ENV_REMOVE: &[&str] = &[
+    "TERM_PROGRAM",
+    "GHOSTTY_RESOURCES_DIR",
+    "KITTY_WINDOW_ID",
+    "WEZTERM_UNIX_SOCKET",
+    "ALACRITTY_SOCKET",
+    "ZED_TERM",
+    "VSCODE_IPC_HOOK_CLI",
+    "ITERM_SESSION_ID",
+    "TERMCMP_ACTIVE",
+];
+
+/// Run a command with piped stdout and a polling deadline. Bash completion
+/// needs no controlling terminal, so this skips the PTY machinery entirely.
+/// Returns stdout on success, `None` on spawn failure, non-zero exit, or
+/// timeout.
+fn run_piped_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    tracing::debug!("spawning {cmd} {}", args.join(" "));
+    let mut command = std::process::Command::new(cmd);
+    command
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    for var in COMPLETION_ENV_REMOVE {
+        command.env_remove(var);
+    }
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!("failed to spawn {cmd}: {e}");
+            return None;
+        }
+    };
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    tracing::debug!("{cmd} timed out, killing");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                tracing::debug!("{cmd} wait error: {e}");
+                break None;
+            }
+        }
+    };
+
+    match status {
+        Some(s) if s.success() => {
+            let mut stdout = child.stdout.take()?;
+            let mut text = String::new();
+            stdout.read_to_string(&mut text).ok()?;
+            Some(text)
+        }
+        Some(s) => {
+            tracing::debug!("{cmd} exited with {s}");
+            None
+        }
+        None => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fish provider
 // ---------------------------------------------------------------------------
@@ -275,6 +353,163 @@ fn parse_fish_stdout(stdout: Option<&str>) -> Vec<CompletionLine> {
 }
 
 // ---------------------------------------------------------------------------
+// Bash provider
+// ---------------------------------------------------------------------------
+
+/// Bash completion query script. Invoked as
+/// `bash --norc --noprofile -c <script> -- <buffer> <point-bytes>`.
+///
+/// Sources the system bash-completion when present, reconstructs
+/// `COMP_WORDS`/`COMP_CWORD` from the buffer, resolves the command's compspec
+/// via `complete -p`, then either calls the `-F` completion function with the
+/// `COMP_*` convention or prints the `-W` wordlist. No compspec → exit 0 →
+/// empty result (the sync Commands/Filesystem lanes still serve the popup).
+const BASH_COMPLETION_SCRIPT: &str = r#"
+# Load the system bash-completion if present (distro paths vary).
+for f in /usr/share/bash-completion/bash_completion /etc/bash_completion /opt/homebrew/etc/profile.d/bash_completion.sh; do
+  [[ -r "$f" ]] && source "$f" 2>/dev/null && break
+done
+COMP_LINE="$1"; COMP_POINT="$2"
+read -ra COMP_WORDS <<< "$COMP_LINE"
+if [[ "$COMP_LINE" =~ [[:space:]]$ || -z "$COMP_LINE" ]]; then
+  COMP_CWORD=${#COMP_WORDS[@]}
+else
+  COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 ))
+fi
+cmd="${COMP_WORDS[0]:-}"
+[[ -n "$cmd" ]] || exit 0
+spec="$(complete -p "$cmd" 2>/dev/null)" || exit 0
+# Extract the -F function name from the compspec. If the compspec has
+# no -F (e.g. -W wordlist only), fall back to printing the -W words.
+if [[ "$spec" =~ -F[[:space:]]+([^[:space:]]+) ]]; then
+  fn="${BASH_REMATCH[1]}"
+  # prev-word convention: at CWORD 0 the prev is the command itself;
+  # COMP_WORDS[CWORD-1] would negative-index the last element otherwise.
+  prev="$cmd"
+  (( COMP_CWORD > 0 )) && prev="${COMP_WORDS[COMP_CWORD-1]}"
+  COMPREPLY=()
+  "$fn" "$cmd" "${COMP_WORDS[COMP_CWORD]:-}" "$prev" 2>/dev/null
+  printf '%s\n' "${COMPREPLY[@]}"
+elif [[ "$spec" =~ -W[[:space:]]+\'([^\']*)\' ]]; then
+  printf '%s\n' ${BASH_REMATCH[1]}
+fi
+"#;
+
+/// Run the bash completion query script and return stdout. `point` is a byte
+/// offset into `buffer` (bash's `COMP_POINT` unit).
+fn bash_query(buffer: &str, point: usize) -> Option<String> {
+    let point_str = point.to_string();
+    run_piped_with_timeout(
+        "bash",
+        &[
+            "--norc",
+            "--noprofile",
+            "-c",
+            BASH_COMPLETION_SCRIPT,
+            "--",
+            buffer,
+            &point_str,
+        ],
+        Duration::from_secs(5),
+    )
+}
+
+/// Async provider that queries bash's completion engine via the command's
+/// registered compspec.
+pub struct BashCompletionProvider {
+    max_results: usize,
+}
+
+impl BashCompletionProvider {
+    pub fn new(max_results: usize) -> Self {
+        Self { max_results }
+    }
+}
+
+impl AsyncProvider for BashCompletionProvider {
+    fn name(&self) -> &'static str {
+        "bash"
+    }
+
+    fn suggest<'a>(
+        &'a self,
+        req: &'a SuggestRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<Suggestion>>> + Send + 'a>> {
+        let buffer = req.buffer.to_string();
+        let cursor = req.cursor;
+        let word = current_word(&buffer, cursor);
+        let ctx = req.ctx.clone();
+        let max_results = self.max_results;
+
+        // If the command doesn't exist in PATH, the shell's _files fallback
+        // would dump home-dir listings as noise. Return empty.
+        if ctx.word_index > 0 {
+            if let Some(cmd) = ctx.command.as_deref() {
+                if !command_exists_in_path(cmd) {
+                    return Box::pin(async move { Ok(Vec::new()) });
+                }
+            }
+        }
+
+        Box::pin(async move {
+            let point = buffer::char_to_byte_offset(&buffer, cursor);
+            let base_stdout = bash_query(&buffer, point);
+            let base = parse_bash_stdout(base_stdout.as_deref());
+
+            // Eager expansion: re-query with a trailing space to surface the
+            // next level of completions (subcommands, arguments). At command
+            // position (word_index 0), only expand when the base query found
+            // exactly one exact match — the command exists and is complete.
+            // An empty base means the command is unknown; expanding would
+            // trigger the shell's _files fallback and dump home-dir listings.
+            let expanded_stdout = if ctx.word_index == 0 {
+                if base.len() == 1 && base[0].completion == word {
+                    let expanded = format!("{} ", buffer);
+                    bash_query(&expanded, expanded.len())
+                } else {
+                    None
+                }
+            } else if word_is_complete(&base, &word) {
+                let expanded = format!("{} ", buffer);
+                bash_query(&expanded, expanded.len())
+            } else {
+                None
+            };
+
+            let expanded = parse_bash_stdout(expanded_stdout.as_deref());
+            // Filter filesystem entries — the built-in FilesystemProvider owns these.
+            let base: Vec<_> = base
+                .into_iter()
+                .filter(|l| !is_filesystem_entry(&l.completion))
+                .collect();
+            let expanded: Vec<_> = expanded
+                .into_iter()
+                .filter(|l| !is_filesystem_entry(&l.completion))
+                .collect();
+            let expanded_buffer = format!("{} ", buffer);
+            let suggestions =
+                merge_completions(&buffer, &expanded_buffer, &base, &expanded, max_results);
+
+            Ok(suggestions)
+        })
+    }
+}
+
+/// Parse bash completion stdout into completion lines. The query script
+/// prints one completion per line with no descriptions.
+fn parse_bash_stdout(stdout: Option<&str>) -> Vec<CompletionLine> {
+    stdout
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| CompletionLine {
+            completion: line.trim().to_string(),
+            description: None,
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Zsh provider
 // ---------------------------------------------------------------------------
 
@@ -296,38 +531,82 @@ typeset _tc_cursor="${2:-${#1}}"
 typeset _tc_outfile="/tmp/.tc-zsh-comp.$$"
 rm -f "$_tc_outfile"
 
-# Spawn an interactive zsh in a pty (gives us a real ZLE context).
+# Poll zpty output until a marker appears or a 2s deadline expires.
+# Replaces the old fixed sleeps: typical compinit is ~200-400ms, not 2s.
+tc_wait_marker() {
+  local marker="$1" deadline=$(( SECONDS + 2 )) acc=""
+  while (( SECONDS < deadline )); do
+    acc+="$(zpty -r -t ztc 2>/dev/null)"
+    [[ "$acc" == *"$marker"* ]] && return 0
+    sleep 0.05
+  done
+  return 1
+}
+
+# Drain zpty output until it goes quiet. `zpty -r -t` only reads when
+# output is pending; without draining, echoed characters arrive in
+# fragments and a typed trigger key can interleave with the echo of a
+# previous write (the widget binding then never fires).
+tc_drain() {
+  local idle=0
+  while (( idle < 3 )); do
+    if [[ -n "$(zpty -r -t ztc 2>/dev/null)" ]]; then idle=0; else idle+=1; fi
+    sleep 0.02
+  done
+}
+
+# Drain until quiet OR a deadline expires. Used for the initial interactive
+# prompt, whose text is user-defined (custom PS1/oh-my-zsh) so no fixed marker
+# is reliable; quiescence works for any prompt and the bound keeps a noisy rc
+# from hanging the probe.
+tc_drain_bounded() {
+  local deadline=$(( SECONDS + 2 )) idle=0
+  while (( SECONDS < deadline )); do
+    if [[ -n "$(zpty -r -t ztc 2>/dev/null)" ]]; then idle=0; else idle+=1; fi
+    (( idle >= 3 )) && return 0
+    sleep 0.02
+  done
+  return 1
+}
+
+# Spawn an interactive zsh in a pty (gives us a real ZLE context). Keep the
+# user's rc (-i, NOT -f): fpath+=/compdef completions installed by brew
+# zsh-completions, oh-my-zsh, kubectl/docker etc. must stay visible to compsys.
 zpty ztc zsh -i 2>/dev/null || exit 1
 
-# Wait for startup and drain.
-sleep 1
-zpty -r -t ztc 2>/dev/null
+# Wait for the interactive prompt to settle. The prompt text is user-defined,
+# so drain to quiescence (bounded 2s) rather than match a fixed marker.
+tc_drain_bounded
 
-# Load compinit (full scan, not cached — we need all completion functions).
-zpty -w ztc 'autoload -Uz compinit && compinit -u 2>/dev/null; echo TC_COMPINIT_OK'
-sleep 2
-zpty -r -t ztc 2>/dev/null
+# Load compinit ONLY if compsys isn't already up. The user's .zshrc normally
+# runs compinit + compdef (brew zsh-completions, oh-my-zsh, kubectl/docker);
+# re-running compinit here clears those _comps registrations. When compsys is
+# already initialized keep it; otherwise initialize (skip the security check
+# + dump rebuild on the hot path when a dump exists).
+zpty -w ztc 'autoload -Uz compinit; if (( ! $+_comps )); then if [[ -f ~/.zcompdump ]]; then compinit -u -C; else compinit -u; fi; fi 2>/dev/null; echo TC_COMPINIT_OK'
+tc_wait_marker TC_COMPINIT_OK
 
 # Define the capture widget: overrides compadd to collect matches, runs
 # _main_complete via a completion widget, writes results to a file.
 zpty -w ztc 'function tc-capture { typeset -ga _tc_comps=(); function compadd { local -a m; builtin compadd -O m "$@" 2>/dev/null; _tc_comps+=("${m[@]}") }; zle -C tc-cap complete-word _main_complete; zle tc-cap 2>/dev/null; print -l "${_tc_comps[@]}" > '"$_tc_outfile"'; zle kill-whole-line }; zle -N tc-capture; bindkey "^Xx" tc-capture; echo TC_SETUP_OK'
-sleep 1
-zpty -r -t ztc 2>/dev/null
+tc_wait_marker TC_SETUP_OK
 
 # Clear the line and type the target buffer (no newline — goes into ZLE buffer).
+tc_drain
 zpty -w -n ztc $'\x15'
-sleep 0.2
-zpty -r -t ztc 2>/dev/null
+tc_drain
 
 zpty -w -n ztc "$_tc_buffer"
-sleep 0.3
-zpty -r -t ztc 2>/dev/null
+tc_drain
 
-# Trigger the capture widget with Ctrl-X x.
+# Trigger the capture widget with Ctrl-X x, then poll for the outfile the
+# widget writes. Poll for EXISTENCE (-e), not size (-s): the widget always
+# creates the file via `print -l … > file`, even for zero matches, so -s
+# would burn the full 2s deadline on every empty result.
 zpty -w -n ztc $'\x18'
-sleep 0.1
 zpty -w -n ztc 'x'
-sleep 1
+typeset -i _tc_deadline=$(( SECONDS + 2 ))
+while (( SECONDS < _tc_deadline )) && [[ ! -e "$_tc_outfile" ]]; do sleep 0.05; done
 zpty -r -t ztc 2>/dev/null
 
 # Clean up the pty.
@@ -470,7 +749,7 @@ fn build_full_text(buffer: &str, completion: &str) -> (String, Vec<u32>) {
 }
 
 /// Build one provider suggestion from a raw completion line. Shared by the
-/// fish and zsh providers.
+/// fish, zsh, and bash providers.
 fn build_provider_suggestion(
     buffer: &str,
     completion: &str,
@@ -633,5 +912,36 @@ mod tests {
     #[test]
     fn word_not_complete_on_multiple_matches() {
         assert!(!word_is_complete(&[line("git"), line("gitk")], "git"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Bash provider: stdout parsing + merge
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bash_stdout_one_completion_per_line() {
+        // Real bash completion output: one match per line, blanks skipped,
+        // surrounding whitespace trimmed, no descriptions.
+        let lines = parse_bash_stdout(Some("backups\ndb\n\n  storage  \n"));
+        let texts: Vec<&str> = lines.iter().map(|l| l.completion.as_str()).collect();
+        assert_eq!(texts, vec!["backups", "db", "storage"]);
+        assert!(lines.iter().all(|l| l.description.is_none()));
+    }
+
+    #[test]
+    fn bash_stdout_none_is_empty() {
+        // No compspec / spawn failure / timeout all surface as None.
+        assert!(parse_bash_stdout(None).is_empty());
+    }
+
+    #[test]
+    fn bash_merge_expands_into_full_text() {
+        // `supabase` (exact self-match) then the trailing-space query
+        // yields subcommands whose full_text carries the completed word.
+        let base = vec![line("supabase")];
+        let expanded = vec![line("backups"), line("db")];
+        let out = merge_completions("supabase", "supabase ", &base, &expanded, 10);
+        let texts: Vec<&str> = out.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["supabase", "supabase backups", "supabase db"]);
     }
 }

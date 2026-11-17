@@ -1,0 +1,14 @@
+name: Docker Linux matrix
+on:
+  pull_request:
+    paths: ['crates/**', 'shell/**', 'docker/**', 'scripts/**', 'Cargo.toml', 'Cargo.lock', 'tests/**']
+  schedule: [{cron: '0 6 * * 1'}]
+  workflow_dispatch:
+jobs:
+  linux-matrix:
+    name: Linux × shell (Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -t termcmp-matrix -f docker/Dockerfile .
+      - run: docker run --rm termcmp-matrix

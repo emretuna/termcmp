@@ -257,7 +257,7 @@ impl Perform for TerminalState {
             // OSC 7772 — Termcmp buffer report (percent-encoded, secure framing).
             //
             // Narrow alphabet prevents `;`/BEL/ESC splitting OSC params.
-            // Replaces the raw 7770 framing whose `;`/`\a`/`\e` bytes silently
+            // Replaced the raw 7770 framing whose `;`/`\a`/`\e` bytes silently
             // truncated buffers and could smuggle nested OSC sequences.
             //
             //   params[0] = "7772"
@@ -309,52 +309,6 @@ impl Perform for TerminalState {
                     }
                 };
                 tracing::debug!(cursor, "OSC 7772 — buffer update");
-                self.set_command_buffer(buffer, cursor);
-            }
-            // OSC 7770 — Termcmp buffer report (LEGACY raw framing).
-            //
-            // DEPRECATED: this path is structurally unsafe. vte splits OSC
-            // params on `;`, so a buffer like `if true; then` is silently
-            // truncated at the first semicolon, and embedded `\a` / `\e]`
-            // bytes can prematurely terminate the OSC envelope or smuggle
-            // a nested OSC into the parser (narrow alphabet prevents this in 7772).
-            // New shell integrations emit OSC 7772 (percent-encoded) instead.
-            //
-            // Decoding/state-update logic is unchanged; only logging now
-            // flags the legacy framing (one-shot `warn!` on first hit per
-            // parser instance, `trace!` thereafter). Slated for removal at
-            // v0.12.0.
-            b"7770" => {
-                if self.check_and_set_legacy_osc7770_warned() {
-                    tracing::warn!(
-                        "OSC 7770 (legacy raw framing) received — upgrade your shell integration."
-                    );
-                } else {
-                    tracing::trace!("OSC 7770 (legacy) — buffer update");
-                }
-                if params.len() < 3 {
-                    tracing::debug!("OSC 7770 — short params, dropping");
-                    return;
-                }
-                let cursor = match std::str::from_utf8(params[1])
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                {
-                    Some(c) => c,
-                    None => {
-                        tracing::warn!(
-                            "OSC 7770 — invalid cursor position, skipping buffer update"
-                        );
-                        return;
-                    }
-                };
-                let buffer = match String::from_utf8(params[2].to_vec()) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        tracing::warn!("OSC 7770 — invalid UTF-8 in buffer report, skipping");
-                        return;
-                    }
-                };
                 self.set_command_buffer(buffer, cursor);
             }
             // OSC 7 — current working directory
@@ -1136,7 +1090,7 @@ mod tests {
     #[test]
     fn test_osc7771_clears_buffer_on_c() {
         let mut p = make_parser();
-        p.process_bytes(b"\x1b]7770;3;git\x07");
+        p.process_bytes(&build_osc7772(b"git", 3));
         assert_eq!(p.state().command_buffer(), Some("git"));
         p.process_bytes(b"\x1b]7771;C\x07");
         assert_eq!(p.state().command_buffer(), None);
@@ -1181,36 +1135,10 @@ mod tests {
         assert!(!p.state().in_prompt());
     }
 
-    // -- OSC 7770 buffer reporting --
-
-    #[test]
-    fn test_osc7770_buffer() {
-        let mut p = make_parser();
-        p.process_bytes(b"\x1b]7770;5;hello\x07");
-        assert_eq!(p.state().command_buffer(), Some("hello"));
-        assert_eq!(p.state().buffer_cursor(), 5);
-    }
-
-    #[test]
-    fn test_osc7770_empty() {
-        let mut p = make_parser();
-        p.process_bytes(b"\x1b]7770;0;\x07");
-        assert_eq!(p.state().command_buffer(), Some(""));
-        assert_eq!(p.state().buffer_cursor(), 0);
-    }
-
-    #[test]
-    fn test_osc7770_with_spaces() {
-        let mut p = make_parser();
-        p.process_bytes(b"\x1b]7770;4;echo hello world\x07");
-        assert_eq!(p.state().command_buffer(), Some("echo hello world"));
-        assert_eq!(p.state().buffer_cursor(), 4);
-    }
-
     #[test]
     fn test_buffer_cleared_on_command_exec() {
         let mut p = make_parser();
-        p.process_bytes(b"\x1b]7770;3;git\x07");
+        p.process_bytes(&build_osc7772(b"git", 3));
         assert_eq!(p.state().command_buffer(), Some("git"));
         p.process_bytes(b"\x1b]133;C\x07");
         assert_eq!(p.state().command_buffer(), None);
@@ -1325,17 +1253,17 @@ mod tests {
     }
 
     #[test]
-    fn test_osc7770_sets_buffer_dirty() {
+    fn test_osc7772_sets_buffer_dirty() {
         let mut p = make_parser();
         assert!(!p.state_mut().take_buffer_dirty());
-        p.process_bytes(b"\x1b]7770;3;git\x07");
+        p.process_bytes(&build_osc7772(b"git", 3));
         assert!(p.state_mut().take_buffer_dirty());
     }
 
     #[test]
     fn test_take_buffer_dirty_clears_flag() {
         let mut p = make_parser();
-        p.process_bytes(b"\x1b]7770;3;git\x07");
+        p.process_bytes(&build_osc7772(b"git", 3));
         assert!(p.state_mut().take_buffer_dirty());
         assert!(!p.state_mut().take_buffer_dirty());
     }
@@ -1464,25 +1392,6 @@ mod tests {
         assert_eq!(percent_decode_buffer(b"ab%2"), None);
     }
 
-    // -- OSC 7770 buffer cursor clamping --
-
-    #[test]
-    fn test_osc7770_cursor_clamped_to_buffer_length() {
-        let mut p = make_parser();
-        // cursor=9999 for a 3-char buffer — must clamp to 3
-        p.process_bytes(b"\x1b]7770;9999;abc\x07");
-        assert_eq!(p.state().command_buffer(), Some("abc"));
-        assert_eq!(p.state().buffer_cursor(), 3);
-    }
-
-    #[test]
-    fn test_osc7770_cursor_exact_length_not_clamped() {
-        let mut p = make_parser();
-        // cursor == buffer length is valid (cursor at end)
-        p.process_bytes(b"\x1b]7770;5;hello\x07");
-        assert_eq!(p.state().buffer_cursor(), 5);
-    }
-
     #[test]
     fn test_predict_command_buffer_clamps_cursor() {
         let mut p = make_parser();
@@ -1498,60 +1407,6 @@ mod tests {
         let result = percent_decode_path("/%80%81");
         let expected = PathBuf::from(std::ffi::OsStr::from_bytes(&[b'/', 0x80, 0x81]));
         assert_eq!(result, expected);
-    }
-
-    // -- OSC 7770 legacy framing tests --
-
-    // LEGACY: this test pins the OSC 7770 truncation bug deliberately —
-    // the parser still accepts the 7770 framing for one deprecation cycle
-    // even though it is structurally broken. Slated for removal at v0.12.0,
-    // once stale shells have been pushed to the OSC 7772 framing. See
-    // `osc7772_regression_pin_canonical_bug_witness` below for the positive
-    // case the new framing fixes.
-    //
-    // vte splits OSC parameters on `;`, so a buffer like `if true; then`
-    // becomes a 4-param OSC: `params[2] = "if true"`, `params[3] = " then"`.
-    // The 7770 dispatch arm only reads `params[2]`, silently truncating
-    // the buffer at the first semicolon.
-    #[test]
-    fn osc7770_legacy_truncates_on_semicolon_documented() {
-        let mut p = make_parser();
-        p.process_bytes(b"\x1b]7770;14;if true; then\x07");
-        assert_eq!(
-            p.state().command_buffer(),
-            Some("if true"),
-            "legacy OSC 7770 truncates at first ';' (narrow 7772 alphabet prevents this)"
-        );
-        // Cursor was 14 (one past the end of the full 13-char buffer);
-        // clamped to the truncated buffer length 7.
-        assert_eq!(p.state().buffer_cursor(), 7);
-    }
-
-    #[test]
-    fn test_osc7770_invalid_utf8_rejected() {
-        let mut p = make_parser();
-        // Send OSC 7770 with invalid UTF-8 bytes (0xFF 0xFE) in the buffer payload.
-        // Must be silently rejected — no buffer update, no replacement chars.
-        let mut seq = Vec::new();
-        seq.extend_from_slice(b"\x1b]7770;3;");
-        seq.extend_from_slice(&[0xFF, 0xFE, 0x80]); // invalid UTF-8
-        seq.push(0x07); // BEL terminator
-        p.process_bytes(&seq);
-        assert_eq!(p.state().command_buffer(), None);
-        assert_eq!(p.state().buffer_cursor(), 0);
-    }
-
-    #[test]
-    fn test_osc7770_valid_utf8_accepted() {
-        // Valid UTF-8 (including multi-byte: café) must still work.
-        let mut seq = Vec::new();
-        seq.extend_from_slice(b"\x1b]7770;4;");
-        seq.extend_from_slice("café".as_bytes());
-        seq.push(0x07);
-
-        let mut p = make_parser();
-        p.process_bytes(&seq);
-        assert_eq!(p.state().command_buffer(), Some("café"));
     }
 
     // -- CPR auto-enqueue on CSI 6n --
@@ -1760,8 +1615,7 @@ mod tests {
         let mut p = make_parser();
         p.process_bytes(&build_osc7772(b"prior", 5));
         // Bytes 0xFF 0xFE 0x80 are decoded successfully but are not valid
-        // UTF-8. Mirror the legacy 7770 path: silently drop, no replace
-        // characters, no buffer mutation.
+        // UTF-8. Silently drop, no replace characters, no buffer mutation.
         p.process_bytes(b"\x1b]7772;3;%FF%FE%80\x07");
         assert_eq!(p.state().command_buffer(), Some("prior"));
         assert_eq!(p.state().buffer_cursor(), 5);
@@ -1888,23 +1742,11 @@ mod tests {
     }
 
     #[test]
-    fn osc7770_legacy_dispatch_continues_after_warn_flag_flips() {
-        // Three legacy frames in a row with DIFFERENT cursor/buffer values
-        // and per-frame assertions: the one-shot warn flag flips on the
-        // first, but state updates must continue for every dispatch. A
-        // regression that silently dropped frames 1 or 2 would slip past a
-        // final-only assertion (frame 3 happens to leave the same end
-        // state); per-frame pins catch the silent drop.
+    fn osc7772_cursor_exact_length_not_clamped() {
         let mut p = make_parser();
-        p.process_bytes(b"\x1b]7770;2;ab\x07");
-        assert_eq!(p.state().command_buffer(), Some("ab"));
-        assert_eq!(p.state().buffer_cursor(), 2);
-        p.process_bytes(b"\x1b]7770;4;abcd\x07");
-        assert_eq!(p.state().command_buffer(), Some("abcd"));
-        assert_eq!(p.state().buffer_cursor(), 4);
-        p.process_bytes(b"\x1b]7770;6;abcdef\x07");
-        assert_eq!(p.state().command_buffer(), Some("abcdef"));
-        assert_eq!(p.state().buffer_cursor(), 6);
+        // cursor == buffer length is valid (cursor at end)
+        p.process_bytes(&build_osc7772(b"hello", 5));
+        assert_eq!(p.state().buffer_cursor(), 5);
     }
 
     #[test]

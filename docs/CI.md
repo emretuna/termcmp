@@ -2,7 +2,7 @@
 
 ## Overview
 
-Four CI gates live in `.github/workflows/ci.yml`: Check, Test (macOS + Ubuntu), Shell smoke (zsh + fish, macOS + Ubuntu matrix), and Clippy & Format. Two more gates live outside `ci.yml`: `cargo-deny check` runs alongside `cargo audit` in [`.github/workflows/audit.yml`](../.github/workflows/audit.yml) (Cargo manifest / lockfile changes and a weekly cron), and `Smoke packaged artifacts` runs in [`.github/workflows/release.yml`](../.github/workflows/release.yml) on every release tag — those two are documented under [Audit workflow](#audit-workflow) and [Release-only gates](#release-only-gates) below. Benchmark-regression checking is intentionally **not** a CI gate — it is run manually at release time (see [Release-time benchmark checking](#release-time-benchmark-checking) below).
+Four CI gates live in `.github/workflows/ci.yml`: Check, Test (macOS + Ubuntu), Shell smoke (zsh + fish + bash, macOS + Ubuntu matrix), and Clippy & Format. A fifth gate, the Docker Linux × shell matrix, lives in [`.github/workflows/docker-matrix.yml`](../.github/workflows/docker-matrix.yml) (path-filtered PRs + weekly cron + manual dispatch; see [Docker Linux matrix](#docker-linux-matrix) below). Two more gates live outside `ci.yml`: `cargo-deny check` runs alongside `cargo audit` in [`.github/workflows/audit.yml`](../.github/workflows/audit.yml) (Cargo manifest / lockfile changes and a weekly cron), and `Smoke packaged artifacts` runs in [`.github/workflows/release.yml`](../.github/workflows/release.yml) on every release tag — those two are documented under [Audit workflow](#audit-workflow) and [Release-only gates](#release-only-gates) below. Benchmark-regression checking is intentionally **not** a CI gate — it is run manually at release time (see [Release-time benchmark checking](#release-time-benchmark-checking) below).
 
 ---
 
@@ -24,7 +24,7 @@ Four CI gates live in `.github/workflows/ci.yml`: Check, Test (macOS + Ubuntu), 
 **YAML key:** `test`
 **Runner matrix:** `macos-latest`, `ubuntu-latest`
 
-**Purpose:** runs `cargo test` across both supported platforms. On Linux, zsh is installed via apt before the test step (macOS ships with zsh pre-installed).
+**Purpose:** runs `cargo test` across both supported platforms. On Linux, zsh, fish, and tmux are installed via apt before the test step; on macOS, tmux, fish, and bash (brew, ≥4.4) are installed via brew (macOS ships zsh pre-installed; /bin/bash is 3.2 and too old for the bash roundtrip).
 
 ---
 
@@ -33,12 +33,12 @@ Four CI gates live in `.github/workflows/ci.yml`: Check, Test (macOS + Ubuntu), 
 **Job name in CI:** `Shell smoke (zsh, macos-latest)` / `Shell smoke (fish, ubuntu-latest)` / etc.
 **YAML key:** `shell-smoke`
 **Runner matrix:** `macos-latest` × `ubuntu-latest`
-**Shell matrix:** `zsh` × `fish`
+**Shell matrix:** `zsh` × `fish` × `bash`
 **Trigger:** `needs: [check]` — runs after the `check` job succeeds. Blocking gate.
 
-This is a single matrix job that produces four combinations (2 shells × 2 OS). Each combination runs the appropriate smoke script for its shell.
+This is a single matrix job that produces six combinations (3 shells × 2 OS). Each combination runs the appropriate smoke script for its shell. On macOS the bash smoke uses brew bash (≥4.4); /bin/bash 3.2 cannot run the integration's `bind -x`/`READLINE_POINT` paths.
 
-**Purpose:** exercises the production shell integration scripts (`shell/termcmp.zsh`, `shell/termcmp.fish`) under real shells with `--no-rcs` / `--no-config` and asserts that the buffer-reporting widgets emit OSC 7772 frames with correct percent-encoding. Catches regressions in the encoder for characters that would corrupt a frame mid-stream (semicolons, BEL `0x07`, ESC `0x1B`, literal `%`), validates UTF-8 round-trip, exercises the OSC 7 path encoder, and verifies gate guards.
+**Purpose:** exercises the production shell integration scripts (`shell/termcmp.zsh`, `shell/termcmp.fish`, `shell/termcmp.bash`) under real shells with `--no-rcs` / `--no-config` and asserts that the buffer-reporting widgets emit OSC 7772 frames with correct percent-encoding. Catches regressions in the encoder for characters that would corrupt a frame mid-stream (semicolons, BEL `0x07`, ESC `0x1B`, literal `%`), validates UTF-8 round-trip, exercises the OSC 7 path encoder, and verifies gate guards. The bash smoke additionally asserts OSC 7773 env emission + dedup + the 7774 truncation diagnostic, the `init.bash` proxy-decision guards, and non-interactive refusal. Each smoke also runs its previously orphaned `tests/shell/` script: `test_zle_chaining.zsh` (zsh), `test_fish_idempotency.fish` (fish), `test_bash_idempotency.sh` (bash).
 
 **ttyshim scrub (macOS only):** on macOS runners, a `Run ttyshim scrub test` step runs `scripts/check-ttyshim-scrub.sh` after the shell smoke. This validates that the PTY shim layer correctly scrubs terminal escape sequences.
 
@@ -54,6 +54,7 @@ This is a single matrix job that produces four combinations (2 shells × 2 OS). 
 ```bash
 scripts/check-zsh-zle-smoke.sh
 scripts/check-fish-smoke.sh
+scripts/check-bash-smoke.sh
 scripts/check-ttyshim-scrub.sh   # macOS only
 ```
 
@@ -66,6 +67,27 @@ scripts/check-ttyshim-scrub.sh   # macOS only
 **Runner:** `macos-latest`
 
 **Purpose:** single job running both `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`. Both must pass for the gate to succeed.
+
+---
+
+### Docker Linux matrix
+
+**Job name in CI:** `Linux × shell (Docker)`
+**YAML key:** `linux-matrix` (workflow `docker-matrix.yml`)
+**Runner:** `ubuntu-latest`
+**Trigger:** PRs touching `crates/**`, `shell/**`, `docker/**`, `scripts/**`, `Cargo.toml`, `Cargo.lock`, `tests/**`; weekly cron (`0 6 * * 1`); manual `workflow_dispatch`. Blocking on the filtered PRs.
+
+**Purpose:** reproducible Linux × {bash, zsh, fish} compatibility proof. macOS cannot run in Docker — macOS coverage stays on the `ci.yml` macos-latest runners. [`docker/Dockerfile`](../docker/Dockerfile) has two stages:
+
+- **build** (`rust:1.89-bookworm` + zsh/fish/tmux): `cargo build --release -p termcmp && cargo test --workspace --release` with `CI=1` so missing-shell skips fail loud — the full Linux integration suite (tmux_integration, foreground_mirror, smoke, osc7772 roundtrips, async_timing) runs in the container.
+- **runtime** (`ubuntu:24.04` + bash/zsh/fish/tmux): runs [`scripts/docker-shell-matrix.sh`](../scripts/docker-shell-matrix.sh) — all three shell smokes plus `termcmp doctor` under a clean HOME (all Skip → exit 0; a Fail fails the matrix).
+
+**How to debug locally:**
+
+```bash
+make docker-matrix
+# or: docker build -t termcmp-matrix -f docker/Dockerfile . && docker run --rm termcmp-matrix
+```
 
 ---
 
@@ -187,7 +209,8 @@ These checks are added **alongside** any existing required checks (e.g. `Check`,
 
 | Gate | Branch protection status |
 |---|---|
-| `Shell smoke (zsh, macos-latest)` / `Shell smoke (zsh, ubuntu-latest)` / `Shell smoke (fish, macos-latest)` / `Shell smoke (fish, ubuntu-latest)` | Ready to add. |
+| `Shell smoke (zsh, macos-latest)` / `Shell smoke (zsh, ubuntu-latest)` / `Shell smoke (fish, macos-latest)` / `Shell smoke (fish, ubuntu-latest)` / `Shell smoke (bash, macos-latest)` / `Shell smoke (bash, ubuntu-latest)` | Ready to add. |
+| `Linux × shell (Docker)` (docker-matrix workflow) | Path-filtered to crate/shell/docker/script/test changes. Branch protection cannot express "required only when this path changed"; leave unenforced and let the workflow's own path filter gate it. |
 | `cargo audit` (audit workflow — covers both `cargo audit` and `cargo deny check` steps) | Path-filtered to Cargo manifest / lockfile changes. Branch protection cannot express "required only when this path changed"; leave unenforced and let the workflow's own path filter gate it. |
 | `Smoke packaged artifacts` (release workflow) | Release-only — not a PR check. Gates the `host` job inside `release.yml`; cannot meaningfully be added to PR branch protection. |
 | `Smoke packaged Linux artifacts` (release workflow) | Release-only — not a PR check. |

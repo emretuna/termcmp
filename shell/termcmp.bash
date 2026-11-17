@@ -1,5 +1,6 @@
 # Termcmp -- Bash integration
-# Source this in .bashrc. Requires Bash 4.4+ for bind -x.
+# Source this in .bashrc. Requires Bash 4.4+ (READLINE_LINE/READLINE_POINT
+# in bind -x, compgen -e).
 
 # No-op cleanly when the termcmp binary isn't installed. This keeps the
 # script safe to source unconditionally from .bashrc on machines where the
@@ -50,6 +51,8 @@ _tc_prompt_command() {
     _tc_native_osc133 || printf '\e]7771;A\a'
     # Report current working directory via OSC 7 for filesystem completions
     printf '\e]7;file://%s%s\a' "${HOSTNAME:-}" "$(_tc_urlencode_path "$PWD")"
+    # Report the exported environment via OSC 7773 (dedup'd internally).
+    _tc_report_env
 }
 # Idempotent prepend: avoid chaining `_tc_prompt_command;_tc_prompt_command;…`
 # when the script is sourced more than once (e.g. from a re-sourced .bashrc).
@@ -127,6 +130,107 @@ _tc_urlencode_buffer() {
         esac
     done
     printf '%s' "$encoded"
+}
+
+# Shell-side budgets. Below the Rust hard cap (1 MiB) so we never produce
+# a frame the parser will reject silently. Per-entry cap drops individual
+# pathological values (e.g. a multi-MB LS_COLORS) without losing the rest.
+_TC_ENV_TOTAL_BUDGET=${_TC_ENV_TOTAL_BUDGET:-524288}
+_TC_ENV_PER_VALUE_CAP=${_TC_ENV_PER_VALUE_CAP:-16384}
+
+# Report the exported environment to the proxy via OSC 7773 (entries are
+# `NAME=value` percent-encoded and NUL-separated as `%00`, because vte
+# splits OSC params on `;`). Priority: essentials → credential families →
+# everything else sorted, so PATH/credentials survive a tight budget.
+# Fingerprint dedup skips the work when nothing relevant changed; payload
+# dedup skips the frame when values differ but the emitted text doesn't.
+_tc_report_env() {
+    [[ -n "${TERMCMP_ACTIVE:-}" ]] || return
+
+    local key value entry payload="" prefix
+    local -i used=0 truncated=0
+    local -a exported_keys=()
+    local -A exported=() seen=()
+
+    # `compgen -e` lists exported names (bash builtin, no fork). Sort for a
+    # stable payload so the dedup below is meaningful.
+    while IFS= read -r key; do
+        [[ -n "$key" ]] && exported_keys+=("$key")
+    done < <(compgen -e | LC_ALL=C sort)
+    for key in "${exported_keys[@]}"; do
+        exported["$key"]=1
+    done
+
+    local fingerprint="${#exported_keys[@]}:${PWD}:${SHLVL:-0}"
+    if [[ "$fingerprint" == "${_TC_LAST_ENV_FINGERPRINT-}" ]]; then
+        return
+    fi
+
+    # High-priority groups first so credentials/PATH survive a tight budget.
+    local -a essentials=(PATH HOME USER SHELL PWD OLDPWD LANG TERM \
+        GHOSTTY_RESOURCES_DIR KITTY_WINDOW_ID WEZTERM_UNIX_SOCKET \
+        ALACRITTY_SOCKET ZED_TERM VSCODE_INJECTION ITERM_SESSION_ID)
+    local -a auth_prefixes=(AWS_ GITHUB_ GH_ GOOGLE_ DOCKER_ KUBECONFIG \
+        SSH_AUTH_SOCK XDG_)
+
+    # Ordered candidate list: essentials, then auth-prefixed names, then the
+    # remaining exported names. `seen` marks everything already considered
+    # so later passes cannot emit an entry twice.
+    local -a ordered=()
+    for key in "${essentials[@]}"; do
+        ordered+=("$key")
+        seen["$key"]=1
+    done
+    for key in "${exported_keys[@]}"; do
+        for prefix in "${auth_prefixes[@]}"; do
+            if [[ "$key" == "$prefix"* && -z "${seen[$key]:-}" ]]; then
+                ordered+=("$key")
+                seen["$key"]=1
+                break
+            fi
+        done
+    done
+    for key in "${exported_keys[@]}"; do
+        if [[ -z "${seen[$key]:-}" ]]; then
+            ordered+=("$key")
+            seen["$key"]=1
+        fi
+    done
+
+    for key in "${ordered[@]}"; do
+        # Skip GC-internal vars so we never leak our own state.
+        case "$key" in
+            TERMCMP_*|_TC_*) continue ;;
+        esac
+        [[ "$key" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || continue
+        [[ -n "${exported[$key]:-}" ]] || continue
+        value="${!key}"
+        entry="$(_tc_urlencode_buffer "${key}=${value}")"
+        if (( ${#entry} > _TC_ENV_PER_VALUE_CAP )); then
+            truncated=1
+            continue
+        fi
+        if (( used + ${#entry} + 3 > _TC_ENV_TOTAL_BUDGET )); then
+            truncated=1
+            continue
+        fi
+        payload+="${entry}%00"
+        used=$(( used + ${#entry} + 3 ))
+    done
+
+    if [[ "$payload" == "${_TC_LAST_ENV_PAYLOAD-}" ]]; then
+        _TC_LAST_ENV_FINGERPRINT="$fingerprint"
+        return
+    fi
+    _TC_LAST_ENV_PAYLOAD="$payload"
+    _TC_LAST_ENV_FINGERPRINT="$fingerprint"
+    printf '\e]7773;%s\a' "$payload"
+
+    # Truncation diagnostic on OSC 7774. One-shot via _TC_ENV_TRUNCATED_REPORTED.
+    if (( truncated )) && [[ -z "${_TC_ENV_TRUNCATED_REPORTED-}" ]]; then
+        _TC_ENV_TRUNCATED_REPORTED=1
+        printf '\e]7774;env_truncated;%d\a' "$used"
+    fi
 }
 
 # Report buffer to proxy via OSC 7772 (percent-encoded) when the proxy is

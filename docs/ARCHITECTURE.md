@@ -156,6 +156,8 @@ The PTY proxy runs seven concurrent worker tasks plus a main coordination loop:
 
 Task B notifies Task C via `tokio::sync::Notify` when the buffer is dirty but no immediate trigger fired. Task C resets its timer on each notification and fires a trigger after `delay_ms` (default 150ms) of inactivity. Task D consumes results posted by per-provider tasks so async output can land in an idle shell without waiting for the next keystroke.
 
+**Session topology.** The default always isolates the inner shell (own session + controlling terminal via `setsid`/`TIOCSCTTY`), so `/dev/tty` password prompts and job control work on every terminal and multiplexer. `[experimental] agent_tracking = true` (or the legacy alias `session_isolation = false`) opts into the mirror topology: `ForegroundMirror` points the outer tty's foreground pgrp at inner jobs so tmux `pane_current_command` / herdr `foreground_process_group_id` track the running agent, at the cost of `/dev/tty` prompt contention. Under mirroring, the 100ms `mirror_tick` follows kernel truth first — `tcgetpgrp` on the inner master (the shell's own `tcsetpgrp` choice) is O(1) on macOS; SIGCHLD never fires for grandchildren, so polling is required. On Linux the sessionless slave returns ENOTTY and the tick falls back to the process table, skipping the walk only while following a live non-shell job. A live foreground target is never stolen by a newer background child.
+
 ## Popup Rendering
 
 The popup is rendered entirely via ANSI escape sequences — no alternate screen buffer, no TUI framework. The rendering flow:
@@ -169,6 +171,8 @@ The popup is rendered entirely via ANSI escape sequences — no alternate screen
 All of this is wrapped in DECSET 2026 begin/end markers (or pre-rendered into a single buffer for terminals without synchronized output).
 
 **Scrollback protection**: The popup area is cleared by overwriting with spaces, never by using ED (Erase Display) or EL (Erase Line) — those would push popup text into scrollback history.
+
+**Secure-input suppression**: While the inner PTY has echo disabled with canonical mode on (`stty -echo` + reader — sudo/ssh/git/pinentry/`read -s`), no popup or feedback overlay may render, and any popup already visible must be dismissed. Render paths (`popup_eligible`, the feedback tick) kernel-poll `tcgetattr` on the inner master rather than trusting the parser's published flag, which only updates on stdout reads and goes stale exactly when an echo-off reader produces no output. The 100ms main-loop tick also polls the kernel and, on the echo-off transition, runs the shared secure cleanup (clear command buffer, dismiss popup, invalidate in-flight generations, reset the keystroke model) — so a popup rendered just before `stty -echo` is cleared within a tick instead of floating over the password prompt until the reader emits output.
 
 ## Performance
 
@@ -188,12 +192,12 @@ Shell integration scripts in `shell/` emit semantic prompt markers:
 
 - **OSC 133** — standard semantic prompt protocol (supported by Ghostty, Kitty, WezTerm, Rio)
 - **OSC 7771** — Termcmp's own marker (used as fallback on Alacritty, iTerm2, Terminal.app)
-- **OSC 7773** — Termcmp's exported environment snapshot (zsh only; fish/bash have no 7773 reporter so `shell_env` stays `None` and env-aware providers degrade), consumed by the proxy and stripped before terminal output
+- **OSC 7773** — Termcmp's exported environment snapshot (zsh, fish, and bash all emit it), consumed by the proxy and stripped before terminal output
 - **OSC 7774** — diagnostic feedback (env_truncated, zle_hook_disabled, Unknown)
 
-Prompt markers are emitted simultaneously by the integration scripts, so the parser can use whichever the terminal supports. Native-OSC133 sets are asymmetric: zsh covers Ghostty/`GHOSTTY_RESOURCES_DIR`/Otty/`KITTY_WINDOW_ID`/`WEZTERM_UNIX_SOCKET`/WezTerm/Rio/`ZED_TERM`/`VSCODE_INJECTION`, while fish+bash cover only Ghostty/Otty/`ZED_TERM`/`VSCODE_INJECTION`. The redundant 7771 on Kitty/WezTerm/Rio under fish/bash is harmless: the parser accepts both, `PrivateOscFilter PRIVATE_CODES 7770..7774` strips 7771 and preserves 133/633.
+Prompt markers are emitted simultaneously by the integration scripts, so the parser can use whichever the terminal supports. Native-OSC133 sets are asymmetric: zsh covers Ghostty/`GHOSTTY_RESOURCES_DIR`/Otty/`KITTY_WINDOW_ID`/`WEZTERM_UNIX_SOCKET`/WezTerm/Rio/`ZED_TERM`/`VSCODE_INJECTION`, while fish+bash cover only Ghostty/Otty/`ZED_TERM`/`VSCODE_INJECTION`. The redundant 7771 on Kitty/WezTerm/Rio under fish/bash is harmless: the parser accepts both, `PrivateOscFilter PRIVATE_CODES 7770..7774 (7770 stripped defensively; parser consumes 7771..7774)` strips 7771 and preserves 133/633.
 
-Without shell integration, features are limited — prompt boundary detection falls back to heuristics, and manual trigger (Ctrl+/) is the only way to invoke completions. Bash scope stays as-is: markers + manual Ctrl+/ (`bind -x`), no `init.bash`, no 7773 env / 7774 diagnostics, `command -v termcmp || return` no-op. Bash has no smoke matrix (`shell:[zsh,fish]`) — known gap.
+Without shell integration, features are limited — prompt boundary detection falls back to heuristics, and manual trigger (Ctrl+/) is the only way to invoke completions. Bash has full parity: `shell/init.bash` auto-execs the proxy (interactive tty sessions only), `shell/termcmp.bash` emits OSC 133/7771 prompt markers, OSC 7 cwd, OSC 7773 env snapshots, OSC 7774 truncation diagnostics, and manual Ctrl+/ OSC 7772 buffer reports. Per-keystroke buffer feed is predicted by `pty/src/predict.rs` (Ctrl+K and bracketed paste are modeled; history recall/tab/unmodeled keys reset the model). Bash-native completions run via `BashCompletionProvider` (compspec -F invocation with COMP_* variables). Requires bash 4.4+.
 
 ### Additional Features
 
@@ -205,7 +209,9 @@ Without shell integration, features are limited — prompt boundary detection fa
 
 **Config hot-reload.** A background config watcher (`spawn_blocking`) monitors `~/.config/termcmp/config.toml` for changes. Most settings (theme, keybindings, trigger, popup, suggest, ai) apply immediately without restarting the shell. See [CONFIGURATION.md](CONFIGURATION.md) for the hot-reload table.
 
-**Buffer prediction.** Fish/bash report buffer only on manual Ctrl+/ via OSC 7772; per-keystroke feed is still predicted by replaying keystrokes through a lightweight state machine (`pty/src/predict.rs`). Prediction is less accurate than shell-reported buffers but enables basic completion functionality.
+**Buffer prediction.** Fish/bash report buffer only on manual Ctrl+/ via OSC 7772; per-keystroke feed is still predicted by replaying keystrokes through a lightweight state machine (`pty/src/predict.rs`). Bash prediction now models Ctrl+K and bracketed paste. Prediction is less accurate than shell-reported buffers but enables basic completion functionality.
+
+**Shell-native completion probes.** The zsh/fish/bash async providers query the shell's own completion system in a subprocess. The zsh probe (`pty/src/shell_completion.rs`) spawns an interactive `zsh -i` inside a `zpty` so the user's rc is sourced — `fpath+=`/`compdef` completions installed by brew zsh-completions, oh-my-zsh, kubectl/docker etc. stay visible. It runs `compinit` only when compsys is not already initialized (`(( ! $+_comps ))`); re-running compinit would clear the user's `_comps` registrations. Readiness is marker/quiescence polling (2s per-stage bound, 5s outer hard bound) rather than fixed sleeps, so a typical query lands in well under a second. The bash probe sources the system bash-completion and invokes the command's compspec `-F` function with `COMP_*` variables; it needs no tty.
 
 ### Buffer Reporting (OSC 7772)
 
@@ -229,12 +235,12 @@ unencoded BEL would terminate the envelope mid-payload; an unencoded ESC
 could smuggle a nested escape sequence into the parser's state machine.
 (Narrow alphabet prevents `;`/BEL/ESC splitting OSC params.)
 
-OSC 7770 (the prior raw framing) is accepted by the parser as a deprecated
-read-only path: the first hit per process logs a one-shot
-`tracing::warn!` and subsequent hits drop to `trace!`. The 7770 dispatch
-arm is slated for removal in v0.12.0. zsh, fish, and bash emit OSC 7772
+OSC 7770 (the prior raw framing) was removed. The parser accepts only OSC 7772.
+`PrivateOscFilter` still strips stray 7770 frames so a stale shell integration
+cannot leak them to the terminal; `termcmp doctor` warns on installed scripts
+that still emit 7770. zsh, fish, and bash emit OSC 7772
 (`shell/termcmp.zsh:_tc_report_buffer`, `shell/termcmp.fish:_termcmp_report_buffer`,
-`shell/termcmp.bash:134`); OSC 7770 is a parser-only deprecated read path.
+`shell/termcmp.bash:_tc_report_buffer`).
 
 ### Environment Reporting (OSC 7773)
 

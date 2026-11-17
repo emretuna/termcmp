@@ -383,13 +383,13 @@ Opt-in features that are not yet considered stable.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `multi_terminal` | bool | `false` | Enable unsupported/unknown terminals. All 10 supported terminals (Ghostty, Otty, Kitty, WezTerm, Alacritty, Rio, iTerm2, Terminal.app, Zed, VSCode) work without this flag. Set to `true` only if you want to try Termcmp on an unlisted terminal. |
-| `session_isolation` | bool | `unset` | Give the inner shell its own session and controlling terminal, so `/dev/tty` password prompts (sudo/ssh/git/pinentry) see the inner PTY. When unset, isolation is on in a direct terminal and off inside a detected multiplexer — tmux (`$TMUX` set) or herdr (`$HERDR_ENV=1`) — so `tmux pane_current_command` / herdr `foreground_process_group_id` see the running agent instead of `termcmp`. An explicit value always wins: `true` keeps isolation (and working `/dev/tty` prompts) even inside tmux/herdr, at the cost of agent tracking; `false` restores foreground-process-group mirroring everywhere, at the cost of broken `/dev/tty` password input. The two cannot coexist: mirroring onto the outer tty puts `/dev/tty` readers back in contention with the proxy's reader. Requires restart. |
+| `multi_terminal` | bool | `false` | Deprecated no-op. Unknown terminals always run with the safe profile (PreRenderBuffer + OSC 7771). Kept so existing configs do not warn. |
+| `agent_tracking` | bool | `false` | Opt-in foreground-process-group mirroring for multiplexer agent tracking (tmux `pane_current_command`, herdr `foreground_process_group_id`, workmux). `false` (default) always isolates: the inner shell gets its own session + controlling terminal, so `/dev/tty` password prompts and job control work everywhere. `true` selects the legacy mirror topology; `/dev/tty` readers contend with the proxy reader (documented tradeoff). Read once at startup; changing it requires a restart. |
+| `session_isolation` | bool | `unset` | Legacy alias for `agent_tracking` (inverted). `false` ≡ `agent_tracking = true`; `true` ≡ `agent_tracking = false`. When both are set, `agent_tracking` wins and a warning is logged. The old auto-mirror-inside-multiplexer default is removed: unset now always isolates. |
 
 ```toml
 [experimental]
-multi_terminal = true
-session_isolation = false
+agent_tracking = false
 ```
 
 Termcmp auto-detects the terminal via `TERM_PROGRAM` and terminal-specific env vars (`KITTY_WINDOW_ID`, `WEZTERM_UNIX_SOCKET`, `ALACRITTY_SOCKET`, `ZED_TERM`, `VSCODE_IPC_HOOK_CLI`), then selects the appropriate rendering strategy:
@@ -399,7 +399,7 @@ Termcmp auto-detects the terminal via `TERM_PROGRAM` and terminal-specific env v
 - **Alacritty** — DECSET 2026 synchronized output, OSC 7771 shell integration prompt markers (Alacritty does not support OSC 133).
 - **iTerm2 / Terminal.app** — pre-render buffer (single `write()` atomicity), OSC 7771 shell integration prompt markers.
 
-**tmux support:** Ghostty, Kitty, WezTerm, Alacritty, iTerm2, Zed, and VSCode are detected inside tmux via their respective env vars. Terminal.app inside tmux is not detected (it sets no env var that leaks through tmux). The same leaked-env detection resolves the outer terminal inside herdr (`$HERDR_ENV=1` marks a herdr pane, `$TERM_PROGRAM=herdr`), and herdr panes have agent tracking enabled automatically.
+**tmux support:** Ghostty, Kitty, WezTerm, Alacritty, iTerm2, Zed, and VSCode are detected inside tmux via their respective env vars. Terminal.app inside tmux is not detected (it sets no env var that leaks through tmux). The same leaked-env detection resolves the outer terminal inside herdr (`$HERDR_ENV=1` marks a herdr pane, `$TERM_PROGRAM=herdr`). Agent tracking inside tmux/herdr is opt-in via `agent_tracking = true`; the default isolates the inner shell everywhere.
 
 ## Frecency Boosting
 

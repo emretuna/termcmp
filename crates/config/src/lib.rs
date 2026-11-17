@@ -58,30 +58,28 @@ pub struct TermcmpProviders {
     pub enabled: Vec<String>,
 }
 
-/// Experimental knobs. Every field defaults to "unset/false": an unset
-/// [`ExperimentalConfig::session_isolation`] is resolved per topology by the
-/// proxy — isolated on a direct terminal so `/dev/tty` password prompts work,
-/// mirrored inside tmux/herdr so their agent tracking sees the inner command.
+/// Experimental knobs. `agent_tracking` is opt-in foreground-process-group
+/// mirroring; the default (false) always isolates the inner shell so
+/// `/dev/tty` password prompts and job control work on every terminal and
+/// multiplexer. `session_isolation` is a legacy inverted alias.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExperimentalConfig {
     pub multi_terminal: bool,
-    /// Give the inner shell its own session with the inner PTY slave as its
-    /// controlling terminal. `/dev/tty` readers (sudo, ssh, git, pinentry)
-    /// then reach the inner PTY instead of the outer tty that the proxy's
-    /// reader is concurrently draining. `false` restores the legacy
-    /// single-session topology, which is what foreground process-group
-    /// mirroring onto the outer tty needs (tmux `pane_current_command`, herdr
-    /// `foreground_process_group_id`, workmux). Read once at startup —
-    /// changing it requires a restart.
-    ///
-    /// Tri-state. Unset (`None`) means "isolate on a direct terminal, mirror
-    /// inside a detected multiplexer" — tmux (`$TMUX`) and herdr
-    /// (`$HERDR_ENV=1`) panes get agent tracking automatically, because the
-    /// two topologies cannot coexist: mirroring the child pgrp onto the outer
-    /// tty puts `/dev/tty` readers back in contention with the proxy reader.
-    /// An explicit value always wins: `Some(true)` keeps isolation even in a
-    /// multiplexer (tracking goes dark), `Some(false)` mirrors everywhere.
+    /// Opt-in foreground-process-group mirroring for multiplexer agent
+    /// tracking (tmux pane_current_command, herdr foreground_process_group_id,
+    /// workmux). false (default) = always isolate: the inner shell gets its own
+    /// session + controlling terminal, so /dev/tty password prompts and job
+    /// control work everywhere. true = legacy mirror topology; /dev/tty
+    /// readers contend with the proxy reader (documented tradeoff).
+    /// Read once at startup; changing it requires a restart.
+    pub agent_tracking: bool,
+    /// Legacy alias for `agent_tracking` (inverted): `Some(false)` ==
+    /// `agent_tracking = true` (mirror), `Some(true)` == `agent_tracking =
+    /// false` (isolate). Unset (`None`) contributes nothing; the proxy maps
+    /// it to `agent_tracking` (Step 2.1). When both keys are set,
+    /// `agent_tracking` wins with a logged warning. Kept indefinitely so
+    /// existing user configs never warn as unknown keys.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_isolation: Option<bool>,
 }
@@ -960,6 +958,7 @@ pub fn all_field_paths() -> Vec<&'static str> {
         // [experimental]
         "experimental.multi_terminal",
         "experimental.session_isolation",
+        "experimental.agent_tracking",
         // [ai.completion]
         "ai.completion.enabled",
         "ai.completion.provider",
@@ -2105,6 +2104,7 @@ max_history_entries = 5000
     fn test_experimental_defaults_to_off() {
         let config = TermcmpConfig::default();
         assert!(!config.experimental.multi_terminal);
+        assert!(!config.experimental.agent_tracking);
     }
 
     #[test]
@@ -2119,11 +2119,11 @@ multi_terminal = true
 
     #[test]
     fn test_experimental_session_isolation_default_and_override() {
-        // Unset is the tri-state default: the proxy resolves it per topology.
+        // Legacy alias; the proxy maps it to agent_tracking (Step 2.1).
         assert_eq!(
             TermcmpConfig::default().experimental.session_isolation,
             None,
-            "session isolation must stay unset so the proxy can resolve it per topology"
+            "session isolation must stay unset so the proxy maps it to agent_tracking"
         );
         let config: TermcmpConfig =
             toml::from_str("[experimental]\nsession_isolation = false\n").unwrap();
@@ -2148,6 +2148,15 @@ max_visible = 5
 "#;
         let config: TermcmpConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.experimental.multi_terminal);
+        assert!(!config.experimental.agent_tracking);
+    }
+
+    #[test]
+    fn test_experimental_agent_tracking_default_and_override() {
+        assert!(!TermcmpConfig::default().experimental.agent_tracking);
+        let config: TermcmpConfig =
+            toml::from_str("[experimental]\nagent_tracking = true\n").unwrap();
+        assert!(config.experimental.agent_tracking);
     }
 
     #[test]

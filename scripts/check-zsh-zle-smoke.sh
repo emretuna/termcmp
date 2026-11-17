@@ -178,4 +178,7 @@ assert_guard_line "fresh tmux pane launches proxy" 'GUARD_tmux-fresh=0 VAR=set'
 
 rm -rf "${GUARD_FAKE_BIN}"
 
+# Orphaned ZLE chaining test, wired into the gated smoke path.
+zsh "${REPO_ROOT}/tests/shell/test_zle_chaining.zsh"
+
 echo "OK: zsh/ZLE smoke passed"

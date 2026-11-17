@@ -15,8 +15,13 @@
 //! test ── master ── openpty ── slave = outer tty
 //!                    pre_exec: setsid-free dup2(0,1,2) + close master
 //!                    exec pty-proxy-child (its own setsid + TIOCSCTTY)
-//!                    └─ run_proxy(fish) ── inner pty ── fish
+//!                    └─ run_proxy(bash) ── inner pty ── bash
 //! ```
+//!
+//! The inner shell is `/bin/bash` (present on both CI platforms) rather than
+//! `fish`: on Linux the proxy force-keeps session isolation for fish (fish 4.x
+//! hard-exits without a controlling terminal and there is no Linux ttyshim),
+//! which would defeat the mirror assertions this file exists to make.
 //!
 //! The child is a separate binary because fork-from-the-multithreaded cargo
 //! harness is unsafe; `Command::pre_exec` does the fd wiring in the sanctioned
@@ -27,17 +32,15 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Locate `fish` on PATH; tests skip gracefully when absent (local dev),
+/// Locate the inner shell: `/bin/bash` when present, else skip (local dev),
 /// matching the smoke-script convention used by the other integration tests.
-fn find_fish() -> Option<OsString> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join("fish");
-        if candidate.is_file() {
-            return Some(candidate.into_os_string());
-        }
+/// bash exists on both CI platforms (macOS ships 3.2, Linux 5.x).
+fn find_bash() -> Option<OsString> {
+    if std::path::Path::new("/bin/bash").is_file() {
+        Some(OsString::from("/bin/bash"))
+    } else {
+        None
     }
-    None
 }
 
 /// A running proxy child wired to an openpty pair we hold the master of.
@@ -51,7 +54,7 @@ impl Drop for Harness {
         let pid = self.child.id() as i32;
         unsafe {
             // The child called setsid(), so its pgid == pid; signalling the
-            // process group also reaches fish and any leftover job (sleep).
+            // process group also reaches the shell and any leftover job (sleep).
             libc::kill(pid, libc::SIGTERM);
             libc::kill(-pid, libc::SIGTERM);
         }
@@ -81,7 +84,7 @@ impl Drop for Harness {
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
-        // Best-effort cleanup of any surviving group members (fish/sleep).
+        // Best-effort cleanup of any surviving group members (shell/sleep).
         unsafe {
             libc::kill(-pid, libc::SIGKILL);
         }
@@ -94,7 +97,7 @@ impl Drop for Harness {
 /// Spawn the proxy helper over a fresh openpty pair. The parent keeps only
 /// the master fd; the child gets the slave as fds 0–2 and its controlling
 /// terminal.
-unsafe fn spawn_harness(fish: &OsString) -> Result<Harness, String> {
+unsafe fn spawn_harness(shell: &OsString) -> Result<Harness, String> {
     use std::os::fd::RawFd;
 
     let mut master: RawFd = -1;
@@ -129,12 +132,12 @@ unsafe fn spawn_harness(fish: &OsString) -> Result<Harness, String> {
     };
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_pty_proxy_child"));
-    cmd.env("PTY_PROXY_CHILD_FISH", fish)
-        // Both tests in this file exist to cover the legacy (mirroring)
-        // topology: `session_isolation = false` keeps the inner shell in this
-        // process's session, which is the only topology where the outer tty's
-        // fg pgrp can be pointed at inner jobs.
-        .env("PTY_PROXY_CHILD_SESSION_ISOLATION", "0")
+    cmd.env("PTY_PROXY_CHILD_SHELL", shell)
+        // Both tests in this file exist to cover the opt-in mirror topology:
+        // `agent_tracking = true` keeps the inner shell in this process's
+        // session, which is the only topology where the outer tty's fg pgrp
+        // can be pointed at inner jobs.
+        .env("PTY_PROXY_CHILD_AGENT_TRACKING", "1")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -196,20 +199,59 @@ fn wait_for(mut cond: impl FnMut() -> bool, secs: u64) -> bool {
     cond()
 }
 
+/// True when the inner shell has job control (`$-` contains `m`).
+///
+/// Under the mirror topology the inner slave is not a controlling terminal:
+/// macOS bash 3.2 tolerates `tcsetpgrp` there and does give foreground jobs
+/// their own pgrps, while Linux bash 5.x reports "no job control" and keeps
+/// every child in the shell's own pgrp. The probe is empirical (not a cfg)
+/// because it is the shell's actual decision, not the OS, that matters.
+fn shell_has_job_control(master: std::os::fd::RawFd) -> bool {
+    let mut output = String::new();
+    write_master(master, b"echo TC_JC_FLAGS=$-\n");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        drain_master(master, &mut output);
+        // The echoed command carries the literal `$-`; the shell's response
+        // carries the real flags. Ignore the placeholder so the echo racing
+        // ahead of the answer cannot be read as "no job control".
+        let token = output
+            .split("TC_JC_FLAGS=")
+            .skip(1)
+            .map(|chunk| {
+                chunk
+                    .chars()
+                    .take_while(|c| !c.is_whitespace())
+                    .collect::<String>()
+            })
+            .find(|token| !token.is_empty() && !token.starts_with("$-"));
+        if let Some(token) = token {
+            return token.contains('m');
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// The previously-broken raw-pty topology: after the initial mirror the proxy
 /// is background on its own controlling terminal, and without the SIGTTOU fix
 /// every subsequent TIOCSPGRP fails with EIO, freezing the outer fg pgrp at
 /// the inner shell forever. This asserts a real foreground job (`sleep`) takes
 /// over the outer tty's fg pgrp and hands it back after Ctrl-C.
+///
+/// Skipped on hosts where the inner shell has no job control under the mirror
+/// topology (Linux): without a controlling terminal the shell keeps the job in
+/// its own pgrp, so there is no separate foreground pgrp to track. The resize
+/// test still exercises the mirror tick there.
 #[test]
 fn test_outer_fg_tracks_inner_foreground_job() {
-    let Some(fish) = find_fish() else {
-        eprintln!(
-            "skipping test_outer_fg_tracks_inner_foreground_job: fish not on PATH (local dev)"
-        );
+    let Some(shell) = find_bash() else {
+        eprintln!("skipping test_outer_fg_tracks_inner_foreground_job: /bin/bash absent");
         return;
     };
-    let h = unsafe { spawn_harness(&fish) }.expect("spawn proxy harness");
+    let h = unsafe { spawn_harness(&shell) }.expect("spawn proxy harness");
 
     // Baseline: the mirror points the outer tty at the inner shell's pgrp
     // (≠ the proxy's own pid). Before the fix this value then never changes.
@@ -232,7 +274,15 @@ fn test_outer_fg_tracks_inner_foreground_job() {
     );
     let shell_fg = *shell_fg_pgid.borrow();
 
-    // Start a foreground job inside fish; the outer tty must follow it.
+    if !shell_has_job_control(h.master) {
+        eprintln!(
+            "skipping test_outer_fg_tracks_inner_foreground_job: inner shell has no job \
+             control under the mirror topology on this platform (no controlling terminal)"
+        );
+        return;
+    }
+
+    // Start a foreground job inside the shell; the outer tty must follow it.
     write_master(h.master, b"sleep 300\n");
     let tracked = wait_for(
         || {
@@ -250,7 +300,7 @@ fn test_outer_fg_tracks_inner_foreground_job() {
         comm_of_leader(tcgetpgrp(h.master)),
     );
 
-    // Ctrl-C kills sleep; fish regains the foreground and the mirror must
+    // Ctrl-C kills sleep; the shell regains the foreground and the mirror must
     // hand the outer tty back to the shell's pgrp.
     write_master(h.master, &[0x03]);
     let restored = wait_for(|| tcgetpgrp(h.master) == shell_fg, 3);
@@ -268,11 +318,27 @@ fn test_outer_fg_tracks_inner_foreground_job() {
 /// pre-fix tree where nothing ever resizes the inner PTY.
 #[test]
 fn test_resize_propagates_to_inner_tty() {
-    let Some(fish) = find_fish() else {
-        eprintln!("skipping test_resize_propagates_to_inner_tty: fish not on PATH (local dev)");
+    let Some(shell) = find_bash() else {
+        eprintln!("skipping test_resize_propagates_to_inner_tty: /bin/bash absent");
         return;
     };
-    let h = unsafe { spawn_harness(&fish) }.expect("spawn proxy harness");
+    let h = unsafe { spawn_harness(&shell) }.expect("spawn proxy harness");
+
+    // Wait for the inner shell to start and draw its prompt before resizing.
+    // The inner PTY is born 0x0 and the proxy reconciles it to the outer size
+    // on the mirror tick; resizing before bash has initialized races that
+    // startup reconciliation. Real terminals resize a running shell, so wait
+    // for the prompt first. Match any common prompt suffix: macOS bash 3.2
+    // draws "bash-3.2$ ", Linux bash 5.x (root) draws "root@host:/path# ".
+    let mut startup = String::new();
+    let ready = wait_for(
+        || {
+            drain_master(h.master, &mut startup);
+            startup.contains("$ ") || startup.contains("# ") || startup.contains("bash-")
+        },
+        5,
+    );
+    assert!(ready, "inner shell never drew a prompt; output: {startup}");
 
     // Resize the "terminal" (master side) to something no spawn default uses.
     let size = libc::winsize {

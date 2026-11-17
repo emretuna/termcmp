@@ -28,7 +28,7 @@ termcmp install
 |-------|--------|
 | zsh   | Full support |
 | fish  | Full support |
-| bash  | Planned |
+| bash  | Full support |
 
 ## Features
 
@@ -36,8 +36,8 @@ termcmp install
 - **Frizbee fuzzy matching** — type `gco` to match `git checkout`, `cl` to match `clone`
 - **LLM completions** (optional) — AI-powered suggestions when enabled
 - **Privacy-first** — secrets (API keys, tokens, passwords) are redacted before any LLM request
-- **Multiplexer-safe** — works inside tmux, wezterm, zellij, herdr, screen. Agent tracking works out of the box inside tmux and herdr; setting `[experimental] session_isolation = true` keeps `/dev/tty` prompts working in a multiplexer at the cost of that tracking
-- **Password prompts work** — `sudo`, `ssh`, `git` and `pinentry` read `/dev/tty` directly, so the default session isolation is what makes their prompts receive every keystroke
+- **Multiplexer-safe** — works inside tmux, wezterm, zellij, herdr, screen. By default the inner shell is isolated so `/dev/tty` password prompts (sudo/ssh/git/pinentry) and job control work everywhere. Set `[experimental] agent_tracking = true` to restore foreground-process-group mirroring for tmux/herdr/workmux agent observation (at the cost of `/dev/tty` prompt contention)
+- **Password prompts work** — `sudo`, `ssh`, `git` and `pinentry` read `/dev/tty` directly; the default isolated session gives them the inner PTY
 - **TUI-aware** — popup only appears at the prompt, never inside neovim/lazygit/omp agent
 - **Small terminal friendly** — compact mode for dropdown terminals and small panes
 - **Hot-reload config** — edit `~/.config/termcmp/config.toml`, changes apply immediately

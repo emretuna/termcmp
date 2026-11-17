@@ -92,6 +92,12 @@ fn uninstall_help_does_not_write_zshrc() {
 
 #[test]
 fn install_dry_run_through_clap_does_not_write() {
+    // `run_install` refuses to run as root (would create root-owned files),
+    // so the dry-run path cannot be exercised under root (Docker build stage).
+    if unsafe { libc::getuid() } == 0 {
+        eprintln!("skipping install_dry_run_through_clap_does_not_write: running as root");
+        return;
+    }
     let tmp = TempDir::new().expect("tempdir");
     let home = tmp.path();
 
@@ -139,6 +145,12 @@ fn install_dry_run_through_clap_does_not_write() {
 
 #[test]
 fn install_halts_when_no_shell_rc_files() {
+    // `run_install` refuses to run as root before the no-rc-files check, so
+    // the halt message cannot be exercised under root (Docker build stage).
+    if unsafe { libc::getuid() } == 0 {
+        eprintln!("skipping install_halts_when_no_shell_rc_files: running as root");
+        return;
+    }
     let tmp = TempDir::new().expect("tempdir");
     let home = tmp.path();
 

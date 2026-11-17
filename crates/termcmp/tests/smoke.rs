@@ -5,34 +5,6 @@ use parser::test_utils::build_osc7772_envelope;
 use std::thread;
 use std::time::Duration;
 
-/// Convert an OSC 7772 envelope (raw bytes) into a `printf`-compatible shell
-/// command string. Each non-printable byte is emitted as an octal `\NNN`
-/// escape (3-digit, leading zero) that `/bin/sh`'s `printf` interprets — we
-/// use octal `\NNN` rather than `\xHH` because hex escapes in `printf` are
-/// not universally supported, whereas octal `\NNN` is POSIX-portable.
-///
-/// `%` (0x25) is emitted as `%%`: the envelope payload is percent-encoded, so
-/// any buffer char outside the allow-list arrives as `%XX`. A literal `%` in
-/// `printf`'s format string starts a conversion specifier and would truncate
-/// the OSC frame, so it must be doubled. `'` is backslash-escaped so it does
-/// not close the single-quoted format argument.
-///
-/// The envelope is wrapped in `printf '...'` so the shell emits the bytes to
-/// its stdout (which parser sees as PTY output), and a `; read <gate>`
-/// suffix keeps the shell parked so it cannot race the popup render.
-fn osc_printf_cmd(envelope: &[u8], gate: &str) -> String {
-    let mut escaped = String::new();
-    for &b in envelope {
-        match b {
-            b'\'' => escaped.push_str("\\'"),
-            b'%' => escaped.push_str("%%"), // literal % — printf format escape
-            0x20..=0x7e => escaped.push(b as char), // printable ASCII (not quote/percent)
-            _ => escaped.push_str(&format!("\\{:03o}", b)),
-        }
-    }
-    format!("printf '{}'; read {}", escaped, gate)
-}
-
 /// A percent-encoded byte in the envelope payload (`%XX`) must be doubled to
 /// `%%XX` in the `printf` format string. A bare `%` starts a printf
 /// conversion specifier and would truncate the OSC frame at that point — see
@@ -49,7 +21,7 @@ fn osc_printf_cmd_doubles_percent_in_format_string() {
         String::from_utf8_lossy(&envelope),
     );
 
-    let cmd = osc_printf_cmd(&envelope, "_gate");
+    let cmd = harness::osc_printf_cmd(&envelope, "_gate");
     assert!(
         cmd.contains("%%3B"),
         "printf format must double the percent (%%3B), got: {cmd:?}",
@@ -203,9 +175,12 @@ fn test_memory_baseline() {
         let rss_str = String::from_utf8_lossy(&output.stdout);
         if let Ok(rss_kb) = rss_str.trim().parse::<u64>() {
             let rss_mb = rss_kb / 1024;
+            // Idle RSS is ~8 MB (docs/ARCHITECTURE.md). A 30 MB ceiling gives
+            // CI headroom while still catching a real regression — the old
+            // 500 MB gate could never fail.
             assert!(
-                rss_mb < 500,
-                "RSS is {} MB, exceeds 500 MB threshold",
+                rss_mb < 30,
+                "RSS is {} MB, exceeds the 30 MB idle-memory threshold",
                 rss_mb
             );
         }
@@ -286,7 +261,7 @@ fn test_popup_renders_and_dismisses_on_trigger() {
     envelope.extend_from_slice(b"\x1b]133;A\x07"); // OSC 133;A - prompt start
     envelope.extend_from_slice(&build_osc7772_envelope("git ", 4));
     envelope.push(b'X');
-    proc.send_line(&osc_printf_cmd(&envelope, "_ghost_popup_hold"));
+    proc.send_line(&harness::osc_printf_cmd(&envelope, "_ghost_popup_hold"));
 
     let popup_rendered = proc.wait_for_bytes_after(
         POPUP_RENDER_MARKER,
@@ -381,7 +356,7 @@ fn test_popup_is_cleared_before_later_shell_output() {
     let mut envelope = build_osc7772_envelope("git ", 4);
     envelope.push(b'X');
     let mark_before_redraw = proc.output_len();
-    proc.send_line(&osc_printf_cmd(&envelope, "_tc_smoke_gate"));
+    proc.send_line(&harness::osc_printf_cmd(&envelope, "_tc_smoke_gate"));
 
     let popup_rendered = proc.wait_for_bytes_after(
         POPUP_RENDER_MARKER,
@@ -455,7 +430,7 @@ fn test_popup_defers_until_display_after_osc_only_pty_read() {
     // `printf` interprets the octal escapes into ESC/BEL, which is what
     // frames the OSC 7772 sequence; `read` then parks the shell so it cannot
     // emit follow-up display bytes that would resolve the defer on their own.
-    proc.send_line(&osc_printf_cmd(
+    proc.send_line(&harness::osc_printf_cmd(
         &build_osc7772_envelope("git ", 4),
         "_tc_defer_gate",
     ));
@@ -505,7 +480,10 @@ fn test_popup_renders_for_osc_with_inline_display_byte() {
     // to resolve it.
     let mut envelope_with_display = build_osc7772_envelope("git ", 4);
     envelope_with_display.push(b'X');
-    proc.send_line(&osc_printf_cmd(&envelope_with_display, "_tc_inline_gate"));
+    proc.send_line(&harness::osc_printf_cmd(
+        &envelope_with_display,
+        "_tc_inline_gate",
+    ));
 
     let popup_rendered = proc.wait_for_bytes_after(
         POPUP_RENDER_MARKER,

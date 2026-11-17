@@ -1148,3 +1148,211 @@ fn doctor_fails_on_duplicate_source_lines_in_managed_block() {
          has multiple source lines; got:\n{combined}",
     );
 }
+
+#[test]
+fn doctor_passes_when_bash_integration_installed() {
+    // Bash parity: install now writes init.bash + both managed blocks into
+    // .bashrc. The shared per-shell check must accept that layout exactly
+    // like the zsh one (correct canonical paths, embedded snippets on disk)
+    // and doctor must exit 0 with no [FAIL] lines.
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("repo root");
+    let bash_init = std::fs::read_to_string(repo_root.join("shell/init.bash"))
+        .expect("read shell/init.bash from repo");
+    let bash_integration = std::fs::read_to_string(repo_root.join("shell/termcmp.bash"))
+        .expect("read shell/termcmp.bash from repo");
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+
+    let shell_dir = home.join(".config/termcmp/shell");
+    std::fs::create_dir_all(&shell_dir).unwrap();
+    let init_path = shell_dir.join("init.bash");
+    let script_path = shell_dir.join("termcmp.bash");
+    std::fs::write(&init_path, &bash_init).unwrap();
+    std::fs::write(&script_path, &bash_integration).unwrap();
+
+    let bashrc = home.join(".bashrc");
+    let bashrc_contents = format!(
+        "# >>> termcmp initialize >>>\n\
+         if [[ -f '{init}' ]]; then\n  \
+         builtin source '{init}'\n\
+         fi\n\
+         # <<< termcmp initialize <<<\n\
+         # >>> termcmp shell integration >>>\n\
+         source '{script}'\n\
+         # <<< termcmp shell integration <<<\n",
+        init = init_path.display(),
+        script = script_path.display(),
+    );
+    std::fs::write(&bashrc, &bashrc_contents).unwrap();
+
+    let cfg = home.join("config.toml");
+    std::fs::write(&cfg, "").unwrap();
+
+    let output = Command::new(ghost_bin())
+        .arg("--config")
+        .arg(&cfg)
+        .arg("doctor")
+        .env("HOME", home)
+        .output()
+        .expect("spawn termcmp");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+
+    assert!(
+        output.status.success(),
+        "doctor must exit 0 when bash integration is installed at the correct path \
+         (~/.config/termcmp/shell/...).\nexit: {:?}\ncombined:\n{combined}",
+        output.status.code(),
+    );
+    assert!(
+        !combined.contains("[FAIL]"),
+        "doctor must not report any [FAIL] lines for a clean bash install; got:\n{combined}",
+    );
+}
+
+#[test]
+fn doctor_fails_when_bashrc_sources_missing_file() {
+    // Same stale-path contract as zsh: the check must follow the source
+    // paths written in .bashrc, not just probe the canonical install dir.
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let bashrc = home.join(".bashrc");
+    std::fs::write(
+        &bashrc,
+        "# >>> termcmp initialize >>>\n\
+         if [[ -f '/nonexistent/stale/init.bash' ]]; then\n  \
+         builtin source '/nonexistent/stale/init.bash'\n\
+         fi\n\
+         # <<< termcmp initialize <<<\n\
+         # >>> termcmp shell integration >>>\n\
+         source '/nonexistent/stale/termcmp.bash'\n\
+         # <<< termcmp shell integration <<<\n",
+    )
+    .unwrap();
+
+    // Populate the canonical path too — the stale .bashrc must still Fail.
+    let canonical = home.join(".config/termcmp/shell");
+    std::fs::create_dir_all(&canonical).unwrap();
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .unwrap();
+    std::fs::copy(
+        repo_root.join("shell/init.bash"),
+        canonical.join("init.bash"),
+    )
+    .unwrap();
+    std::fs::copy(
+        repo_root.join("shell/termcmp.bash"),
+        canonical.join("termcmp.bash"),
+    )
+    .unwrap();
+
+    let cfg = home.join("config.toml");
+    std::fs::write(&cfg, "").unwrap();
+
+    let output = Command::new(ghost_bin())
+        .arg("--config")
+        .arg(&cfg)
+        .arg("doctor")
+        .env("HOME", home)
+        .output()
+        .expect("spawn termcmp");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        !output.status.success(),
+        "doctor must NOT succeed when .bashrc sources a missing file even \
+         when the canonical install path has files. Got exit success.\n{combined}",
+    );
+    assert!(
+        combined.contains("/nonexistent/stale/") || combined.to_lowercase().contains("missing"),
+        "doctor must surface the stale bash source path or 'missing'; got:\n{combined}",
+    );
+}
+
+#[test]
+fn doctor_passes_when_fish_integration_installed() {
+    // Fish shares the managed-block layout; install writes single-quoted
+    // paths now (extract_block_source_path only parses quoted paths, so an
+    // unquoted fish block would be reported as UnparseableQuoting).
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("repo root");
+    let fish_init = std::fs::read_to_string(repo_root.join("shell/init.fish"))
+        .expect("read shell/init.fish from repo");
+    let fish_integration = std::fs::read_to_string(repo_root.join("shell/termcmp.fish"))
+        .expect("read shell/termcmp.fish from repo");
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+
+    let shell_dir = home.join(".config/termcmp/shell");
+    std::fs::create_dir_all(&shell_dir).unwrap();
+    let init_path = shell_dir.join("init.fish");
+    let script_path = shell_dir.join("termcmp.fish");
+    std::fs::write(&init_path, &fish_init).unwrap();
+    std::fs::write(&script_path, &fish_integration).unwrap();
+
+    let fish_config = home.join(".config/fish/config.fish");
+    std::fs::create_dir_all(fish_config.parent().unwrap()).unwrap();
+    let fish_contents = format!(
+        "# >>> termcmp initialize >>>\n\
+         if test -f '{init}'\n  \
+         source '{init}'\n\
+         end\n\
+         # <<< termcmp initialize <<<\n\
+         # >>> termcmp shell integration >>>\n\
+         source '{script}'\n\
+         # <<< termcmp shell integration <<<\n",
+        init = init_path.display(),
+        script = script_path.display(),
+    );
+    std::fs::write(&fish_config, &fish_contents).unwrap();
+
+    let cfg = home.join("config.toml");
+    std::fs::write(&cfg, "").unwrap();
+
+    let output = Command::new(ghost_bin())
+        .arg("--config")
+        .arg(&cfg)
+        .arg("doctor")
+        .env("HOME", home)
+        .output()
+        .expect("spawn termcmp");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+
+    assert!(
+        output.status.success(),
+        "doctor must exit 0 when fish integration is installed at the correct path \
+         (~/.config/termcmp/shell/...).\nexit: {:?}\ncombined:\n{combined}",
+        output.status.code(),
+    );
+    assert!(
+        !combined.contains("[FAIL]"),
+        "doctor must not report any [FAIL] lines for a clean fish install; got:\n{combined}",
+    );
+}

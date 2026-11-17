@@ -8,8 +8,9 @@
 //! `set_command_buffer` -> `buffer_dirty` -> debounce/trigger pipeline that
 //! zsh's OSC 7772 feeds.
 //!
-//! **Drift limitation:** non-modeled events (paste, history recall, shell
-//! completion) reset the model to empty. The model resyncs only on the next
+//! **Drift limitation:** non-modeled events (history recall, shell
+//! completion, tab, unclassified key sequences) reset the model to empty.
+//! Bracketed paste and Ctrl+K are modeled. The model resyncs only on the next
 //! typed character or prompt boundary (OSC 133;A / 7771;A).
 
 use crate::input::KeyEvent;
@@ -132,6 +133,16 @@ impl BufferModel {
                     false
                 }
             }
+            KeyEvent::Ctrl('k') => {
+                // Kill-to-end-of-line: truncate at the cursor, keep it put.
+                let byte_off = char_to_byte_offset(&self.buffer, self.cursor);
+                if byte_off < self.buffer.len() {
+                    self.buffer.truncate(byte_off);
+                    true
+                } else {
+                    false
+                }
+            }
             KeyEvent::Enter => {
                 self.clear();
                 true
@@ -144,9 +155,10 @@ impl BufferModel {
             // Ctrl('d'): EOF / delete-char-forward — shell-dependent
             // CtrlSpace: rarely typed, safer to reset
             // Escape: dismisses popup / enters vi-mode
-            // Raw(_): bracketed paste, Alt+key, unclassified sequences
+            // Raw(_) that is not a bracketed-paste envelope: Alt+key,
+            // unclassified sequences
             // CursorPositionReport: parser-internal, shouldn't reach here
-            // Ctrl(c) for c not in {a, e, u, w}: unmodeled control char
+            // Ctrl(c) for c not in {a, e, k, u, w}: unmodeled control char
             KeyEvent::ArrowUp
             | KeyEvent::ArrowDown
             | KeyEvent::ArrowUpSs3
@@ -170,7 +182,27 @@ impl BufferModel {
                 self.clear();
                 !was_empty
             }
-            KeyEvent::Raw(_) | KeyEvent::CursorPositionReport(_, _) => {
+            KeyEvent::Raw(bytes) => {
+                // Bracketed paste: insert the pasted text into the model
+                // instead of resetting — paste is a high-frequency readline
+                // edit. Forwarding is untouched: the key dispatcher sends
+                // the original bytes, envelope included, so the shell still
+                // receives the complete paste sequence.
+                if bytes.len() >= 12
+                    && bytes.starts_with(b"\x1b[200~")
+                    && bytes.ends_with(b"\x1b[201~")
+                {
+                    let text = String::from_utf8_lossy(&bytes[6..bytes.len() - 6]);
+                    let byte_off = char_to_byte_offset(&self.buffer, self.cursor);
+                    self.buffer.insert_str(byte_off, &text);
+                    self.cursor += text.chars().count();
+                    return true;
+                }
+                let was_empty = self.buffer.is_empty() && self.cursor == 0;
+                self.clear();
+                !was_empty
+            }
+            KeyEvent::CursorPositionReport(_, _) => {
                 let was_empty = self.buffer.is_empty() && self.cursor == 0;
                 self.clear();
                 !was_empty
@@ -507,6 +539,30 @@ mod tests {
         assert!(!m.apply_key(&KeyEvent::Ctrl('w')));
     }
 
+    // --- Ctrl+K (kill to end of line) -----------------------------------------
+
+    #[test]
+    fn ctrl_k_kills_to_end() {
+        let mut m = BufferModel {
+            buffer: "git status".into(),
+            cursor: 4,
+        };
+        assert!(m.apply_key(&KeyEvent::Ctrl('k')));
+        assert_eq!(m.buffer, "git ");
+        assert_eq!(m.cursor, 4);
+    }
+
+    #[test]
+    fn ctrl_k_at_end_noop() {
+        let mut m = BufferModel {
+            buffer: "git".into(),
+            cursor: 3,
+        };
+        assert!(!m.apply_key(&KeyEvent::Ctrl('k')));
+        assert_eq!(m.buffer, "git");
+        assert_eq!(m.cursor, 3);
+    }
+
     // --- Enter ----------------------------------------------------------------
 
     #[test]
@@ -616,6 +672,37 @@ mod tests {
         };
         assert!(m.apply_key(&KeyEvent::Raw(vec![0x1b, 0x5b, 0x32, 0x30, 0x30, 0x7e])));
         assert!(m.buffer.is_empty());
+    }
+
+    #[test]
+    fn bracketed_paste_inserts_text() {
+        let mut m = BufferModel::default();
+        assert!(m.apply_key(&KeyEvent::Raw(b"\x1b[200~hello world\x1b[201~".to_vec())));
+        assert_eq!(m.buffer, "hello world");
+        assert_eq!(m.cursor, 11);
+    }
+
+    #[test]
+    fn bracketed_paste_at_cursor() {
+        let mut m = BufferModel {
+            buffer: "git ".into(),
+            cursor: 4,
+        };
+        assert!(m.apply_key(&KeyEvent::Raw(b"\x1b[200~status\x1b[201~".to_vec())));
+        assert_eq!(m.buffer, "git status");
+        assert_eq!(m.cursor, 10);
+    }
+
+    #[test]
+    fn non_paste_raw_still_resets() {
+        // Unterminated bracketed-paste prefix is not an envelope: reset.
+        let mut m = BufferModel {
+            buffer: "git".into(),
+            cursor: 3,
+        };
+        assert!(m.apply_key(&KeyEvent::Raw(b"\x1b[200~partial".to_vec())));
+        assert!(m.buffer.is_empty());
+        assert_eq!(m.cursor, 0);
     }
 
     // --- Non-modelled Ctrl char resets ---------------------------------------

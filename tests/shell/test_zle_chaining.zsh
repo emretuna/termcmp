@@ -113,7 +113,10 @@ _exit_line() { zle .accept-line }
 zle -N _exit_line
 bindkey ' ' _exit_line
 typeset -g FOO=""
-vared -p "" FOO
+# vared exits non-zero when the bound widget calls zle .accept-line;
+# that is the intended exit path, not an error (set -e would abort here
+# before \$CAPTURED_WIDGET is written).
+vared -p "" FOO || true
 print -- "\$CAPTURED_WIDGET" > '$WIDGET_OUT'
 ZEOF
 

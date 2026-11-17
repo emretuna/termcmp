@@ -37,9 +37,9 @@ jobs:
       - name: Install test dependencies
         run: |
           if [[ "$RUNNER_OS" == "Linux" ]]; then
-            sudo apt-get update -qq && sudo apt-get install -y -qq zsh tmux
+            sudo apt-get update -qq && sudo apt-get install -y -qq zsh fish tmux
           else
-            brew install tmux
+            brew install tmux fish bash
           fi
       - run: cargo test
 
@@ -49,7 +49,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest]
-        shell: [zsh, fish]
+        shell: [zsh, fish, bash]
     runs-on: ${{ matrix.os }}
     needs: [check]
     steps:
@@ -63,12 +63,17 @@ jobs:
             if [[ "${{ matrix.shell }}" == "fish" ]]; then
               brew untap aws/tap 2>/dev/null || true
               brew install fish
+            elif [[ "${{ matrix.shell }}" == "bash" ]]; then
+              # macOS /bin/bash is 3.2; the smoke requires >= 4.4.
+              brew install bash
             fi
           fi
       - name: Run ${{ matrix.shell }} smoke
         run: |
           if [[ "${{ matrix.shell }}" == "zsh" ]]; then
             ./scripts/check-zsh-zle-smoke.sh
+          elif [[ "${{ matrix.shell }}" == "bash" ]]; then
+            ./scripts/check-bash-smoke.sh
           else
             ./scripts/check-fish-smoke.sh
           fi

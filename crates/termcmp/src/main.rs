@@ -53,7 +53,7 @@ impl LogLevel {
         ")"
     ),
     about = "Terminal-native autocomplete engine",
-    after_help = "SHELL SUPPORT:\n  zsh   Full support (auto-installed into ~/.zshrc)\n\nWith no subcommand, termcmp starts in proxy mode wrapping $SHELL.\nTo wrap a specific shell, run e.g. `termcmp /bin/zsh -l`.\nIf your shell binary is named like a subcommand, prefix with `--`:\n  termcmp -- install --some-flag"
+    after_help = "SHELL SUPPORT:\n  zsh   Full support (auto-installed into ~/.zshrc)\n  fish  Full support (auto-installed into config.fish)\n  bash  Full support (auto-installed into ~/.bashrc; requires bash 4.4+)\n\nWith no subcommand, termcmp starts in proxy mode wrapping $SHELL.\nTo wrap a specific shell, run e.g. `termcmp /bin/zsh -l`.\nIf your shell binary is named like a subcommand, prefix with `--`:\n  termcmp -- install --some-flag"
 )]
 struct Cli {
     /// Path to config file
@@ -74,7 +74,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Install shell integration (zsh)
+    /// Install shell integration (zsh, fish, bash)
     Install {
         /// Print what would be installed without writing files
         #[arg(long)]
@@ -148,6 +148,25 @@ where
     lookup("SHELL")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| OsString::from(DEFAULT_FALLBACK_SHELL))
+}
+
+/// True when `shell` resolves to the running termcmp binary. Compares
+/// basenames first (catches a bare `termcmp` on PATH, which `canonicalize`
+/// cannot resolve), then canonicalized paths (catches absolute/symlinked
+/// self-reference). A login-shell argv0 leading `-` is stripped.
+fn is_self_reference(shell: &std::ffi::OsStr) -> bool {
+    let base = std::path::Path::new(shell)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.strip_prefix('-').unwrap_or(n));
+    if base == Some("termcmp") {
+        return true;
+    }
+    let resolved = std::fs::canonicalize(shell).ok();
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::canonicalize(p).ok());
+    resolved.is_some() && resolved == exe
 }
 
 fn init_tracing(level: LogLevel, log_file: Option<&Path>) -> Result<()> {
@@ -238,10 +257,33 @@ fn run_proxy(
         let args: Vec<OsString> = iter.collect();
         (shell, args)
     };
+    // $SHELL (or argv) pointing at termcmp itself would stack proxies
+    // forever. Fall back to the POSIX shell with a warning.
+    let shell = if is_self_reference(&shell) {
+        tracing::warn!("shell resolves to termcmp itself — falling back to /bin/sh");
+        std::ffi::OsString::from(DEFAULT_FALLBACK_SHELL)
+    } else {
+        shell
+    };
 
-    let config = config::TermcmpConfig::load(config_path).context("failed to load config")?;
+    let config = match config::TermcmpConfig::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("termcmp: config load failed ({e:#}) — using defaults");
+            tracing::warn!("config load failed: {e:#} — using defaults");
+            config::TermcmpConfig::default()
+        }
+    };
 
     tracing::info!(shell = %Path::new(&shell).display(), "starting termcmp proxy");
+    // Never fork/spawn when there is no interactive terminal: fail fast
+    // with a clear message instead of a cryptic raw-mode error.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin())
+        || !std::io::IsTerminal::is_terminal(&std::io::stdout())
+    {
+        eprintln!("termcmp: stdin/stdout is not a terminal — run termcmp inside an interactive terminal session");
+        anyhow::bail!("not a terminal");
+    }
 
     // Ignore SIGPIPE: during teardown the reader/supervisor may write to a closed peer
     // socket, which on the default disposition would kill the proxy with a signal.
@@ -281,8 +323,8 @@ fn run_proxy(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_default_shell_from, DEFAULT_FALLBACK_SHELL};
-    use std::ffi::OsString;
+    use super::{is_self_reference, resolve_default_shell_from, DEFAULT_FALLBACK_SHELL};
+    use std::ffi::{OsStr, OsString};
 
     #[test]
     fn resolve_default_shell_uses_env_when_set() {
@@ -306,5 +348,15 @@ mod tests {
         // cryptic ENOENT instead of using the fallback.
         let shell = resolve_default_shell_from(|_| Some(OsString::new()));
         assert_eq!(shell, OsString::from(DEFAULT_FALLBACK_SHELL));
+    }
+
+    #[test]
+    fn self_reference_detected_by_basename_and_path() {
+        assert!(is_self_reference(OsStr::new("termcmp")));
+        assert!(is_self_reference(OsStr::new("-termcmp")));
+        assert!(is_self_reference(
+            std::env::current_exe().unwrap().as_os_str()
+        ));
+        assert!(!is_self_reference(OsStr::new("/bin/zsh")));
     }
 }

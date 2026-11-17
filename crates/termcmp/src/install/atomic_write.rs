@@ -158,6 +158,14 @@ mod tests {
         // the io::Error and silently break that contract. Pin it.
         use std::io::ErrorKind;
 
+        // Root bypasses DAC permission checks, so a 0o555 parent is still
+        // writable and PermissionDenied cannot be triggered. Skip under
+        // root (e.g. the Docker Linux matrix build stage).
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("skipping preserves_io_error_kind_in_chain: running as root");
+            return;
+        }
+
         let dir = TempDir::new().unwrap();
         // Make the parent directory unwritable so `NamedTempFile::new_in`
         // fails with PermissionDenied.

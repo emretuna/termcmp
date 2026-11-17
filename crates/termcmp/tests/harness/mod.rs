@@ -1,6 +1,6 @@
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -99,10 +99,65 @@ pub struct TermcmpProcess {
 }
 // `mod harness` compiles per integration-test target; targets that only
 // drive `TmuxSession` (e.g. tmux_integration) don't call every method.
-// `spawn`/`exit_with_code` are used by smoke/cli_help_routing targets.
+// `spawn`/`spawn_with_*`/`exit_with_code` are used by the smoke,
+// startup_compat, and cli_help_routing targets.
 #[allow(dead_code)]
 impl TermcmpProcess {
     pub fn spawn() -> Self {
+        Self::spawn_with_env(&[], &[])
+    }
+
+    /// Spawn with extra environment overrides and removals.
+    ///
+    /// Overrides are applied AFTER the harness defaults (`TERM_PROGRAM=ghostty`
+    /// and the multiplexer-marker removals), so a caller's value always wins.
+    /// Used by `startup_compat` to pin an unknown terminal, a self-referential
+    /// `$SHELL`, and friends.
+    pub fn spawn_with_env(env_overrides: &[(&str, &str)], env_removals: &[&str]) -> Self {
+        Self::spawn_inner(
+            &default_config_path(),
+            Some(default_shell()),
+            env_overrides,
+            env_removals,
+        )
+    }
+
+    /// Spawn with an explicit `--config` path instead of the harness's
+    /// non-existent default. Used to prove a malformed config file falls back
+    /// to defaults instead of aborting startup.
+    pub fn spawn_with_config(
+        config_path: &Path,
+        env_overrides: &[(&str, &str)],
+        env_removals: &[&str],
+    ) -> Self {
+        Self::spawn_inner(
+            config_path,
+            Some(default_shell()),
+            env_overrides,
+            env_removals,
+        )
+    }
+
+    /// Spawn WITHOUT a positional shell argv, so the proxy's `None` arm
+    /// resolves `$SHELL`. Used by the recursion-guard test (SHELL pointing at
+    /// termcmp itself).
+    pub fn spawn_no_shell_arg(env_overrides: &[(&str, &str)]) -> Self {
+        Self::spawn_inner(&default_config_path(), None, env_overrides, &[])
+    }
+
+    /// Spawn with an explicit positional shell (and its extra args) in place
+    /// of the harness default. Used by the missing-shell-binary test.
+    pub fn spawn_with_shell(shell: &str, args: &[&str]) -> Self {
+        Self::spawn_inner(&default_config_path(), Some((shell, args)), &[], &[])
+    }
+
+    /// Shared PTY-backend construction behind every `spawn*` variant.
+    fn spawn_inner(
+        config_path: &Path,
+        shell: Option<(&str, &[&str])>,
+        env_overrides: &[(&str, &str)],
+        env_removals: &[&str],
+    ) -> Self {
         let pty_process_guard = lock_pty_process();
 
         let pty_system = native_pty_system();
@@ -118,48 +173,39 @@ impl TermcmpProcess {
         let bin = env!("CARGO_BIN_EXE_termcmp");
 
         let mut cmd = CommandBuilder::new(bin);
-        // Point --config at a non-existent path so load() returns
-        // TermcmpConfig::default(). Without this, the harness inherits the
-        // developer's ~/.config/termcmp/config.toml (e.g. Ask AI enabled),
-        // which changes popup content and key handling, breaking assertions.
-        let fake_config = std::env::temp_dir().join("termcmp-smoke-nonexistent/config.toml");
-        // Portable shell invocation: /bin/sh is dash on Linux (no --norc),
-        // so passing --norc unconditionally breaks shell startup there.
-        // Prefer /bin/bash with --norc --noprofile when present; otherwise
-        // fall back to plain /bin/sh with no extra args.
-        let (shell, extra_args): (&str, &[&str]) = if std::path::Path::new("/bin/bash").exists() {
-            ("/bin/bash", &["--norc", "--noprofile"])
-        } else {
-            ("/bin/sh", &[])
-        };
         cmd.args([
             "--log-level",
             "error",
             "--config",
-            fake_config.to_str().unwrap(),
-            shell,
+            config_path.to_str().unwrap(),
         ]);
-        cmd.args(extra_args);
+        if let Some((shell, extra_args)) = shell {
+            cmd.arg(shell);
+            cmd.args(extra_args);
+        }
         // Pin the proxy's working directory. portable-pty defaults an unset
         // CommandBuilder cwd to $HOME, which on Linux CI is /root — dotfiles
         // only, so the filesystem-fallback popup finds zero candidates and
         // never renders. The crate root always has visible entries (src/,
         // tests/), making the popup tests deterministic on both platforms.
         cmd.cwd(env!("CARGO_MANIFEST_DIR"));
-        // Force a known terminal so the proxy does not fall back to plain
-        // shell on CI runners where TERM_PROGRAM is unset. Without this, the
-        // proxy replaces itself with /bin/sh and the popup path never runs
-        // (see should_fallback_to_shell in proxy.rs — Unknown terminals
-        // require `[experimental] multi_terminal = true`).
+        // Pin a known terminal so the popup tests exercise the Synchronized
+        // render path deterministically; Unknown terminals now also run (safe
+        // profile) but would change the render-strategy assertions.
         cmd.env("TERM_PROGRAM", "ghostty");
-        // Run in a known-direct terminal topology. The proxy resolves an unset
-        // `session_isolation` per topology, and `TMUX`/`HERDR_ENV` inherit from
-        // the developer's shell (a herdr pane or tmux session on a laptop),
-        // which would silently flip these tests to the mirrored topology and
-        // break the `/dev/tty` passthrough assertions. Multiplexer-specific
-        // behaviour is covered by `TmuxSession`, which sets the marker itself.
+        // Strip multiplexer markers so the developer's ambient TMUX/HERDR_ENV
+        // cannot change detection; topology is now always-isolate by default
+        // regardless, but the markers still affect terminal detection (tmux
+        // client_termname query) and the tmux setenv propagation.
         for marker in ["TMUX", "TMUX_PANE", "HERDR_ENV", "HERDR_PANE_ID"] {
             cmd.env_remove(marker);
+        }
+        // Caller overrides land last so they beat every default above.
+        for (key, value) in env_overrides {
+            cmd.env(key, value);
+        }
+        for removal in env_removals {
+            cmd.env_remove(removal);
         }
 
         let child = pty_pair
@@ -311,17 +357,34 @@ impl TermcmpProcess {
             }
         });
 
-        // Wait for shell to initialize
-        thread::sleep(Duration::from_millis(500));
-
-        // Force shell to produce output after pipe-pane is configured
-        // Send an empty command to get a fresh prompt
+        // Force the shell to produce output now that pipe-pane is
+        // configured: an empty line emits a fresh prompt.
         let _ = std::process::Command::new("tmux")
             .args(["send-keys", "-t", session_name, "Enter"])
             .status();
 
-        // Wait for the prompt to be captured
-        thread::sleep(Duration::from_millis(1000));
+        // Wait for the first captured bytes instead of a fixed 1.5s sleep.
+        // The fixed wait both slowed every tmux test and raced startup under
+        // CI load ("pane alive but silent"): a test could issue its first
+        // assertion before the prompt ever reached the capture file. Bounded
+        // at 10s so a hung pane still fails fast; falls through regardless so
+        // a quiet-but-alive pane does not hard-fail here — the same policy as
+        // the PTY backend's `spawn_inner`.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        {
+            let (lock, cvar) = &*output;
+            let mut data = lock.lock().unwrap();
+            while data.is_empty() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (guard, _) = cvar.wait_timeout(data, remaining).unwrap();
+                data = guard;
+            }
+        }
+        // Single settle so the shell reaches its prompt/read after first bytes.
+        thread::sleep(Duration::from_millis(200));
 
         // Create a dummy child (we don't actually own the tmux process)
         let pty_system = native_pty_system();
@@ -490,6 +553,39 @@ impl TermcmpProcess {
         }
     }
 
+    /// Wait for the process to exit on its own with a non-zero status.
+    ///
+    /// The startup-failure paths (missing shell binary, `$SHELL` recursion
+    /// guard, not-a-tty) abort without any `exit` line, so `exit_with_code`
+    /// cannot be used. Polls every 50ms and panics with the captured output on
+    /// timeout or on an unexpected zero exit.
+    #[allow(dead_code)]
+    pub fn wait_for_nonzero_exit(&mut self, timeout: Duration) -> i32 {
+        let start = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait failed") {
+                let code: i32 = status.exit_code().try_into().unwrap_or(1);
+                assert_ne!(
+                    code,
+                    0,
+                    "expected a non-zero exit; output:\n{}",
+                    String::from_utf8_lossy(&self.output_snapshot()),
+                );
+                return code;
+            }
+            if start.elapsed() >= timeout {
+                let snapshot = self.output_snapshot();
+                self.child.kill().ok();
+                panic!(
+                    "process did not exit within {:?} (expected a non-zero exit); output:\n{}",
+                    timeout,
+                    String::from_utf8_lossy(&snapshot),
+                );
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Return the PID of the termcmp process (if available).
     #[allow(dead_code)]
     pub fn child_pid(&self) -> Option<u32> {
@@ -504,6 +600,61 @@ impl Drop for TermcmpProcess {
             self.child.kill().ok();
         }
     }
+}
+
+/// Path the harness points `--config` at by default: a non-existent file, so
+/// `load()` returns `TermcmpConfig::default()`. Without this the harness
+/// inherits the developer's `~/.config/termcmp/config.toml` (e.g. Ask AI
+/// enabled), which changes popup content and key handling and breaks
+/// assertions.
+#[allow(dead_code)]
+fn default_config_path() -> PathBuf {
+    std::env::temp_dir().join("termcmp-smoke-nonexistent/config.toml")
+}
+
+/// Portable shell invocation: /bin/sh is dash on Linux (no --norc), so passing
+/// --norc unconditionally breaks shell startup there. Prefer /bin/bash with
+/// --norc --noprofile when present; otherwise fall back to plain /bin/sh with
+/// no extra args.
+#[allow(dead_code)]
+fn default_shell() -> (&'static str, &'static [&'static str]) {
+    if Path::new("/bin/bash").exists() {
+        ("/bin/bash", &["--norc", "--noprofile"])
+    } else {
+        ("/bin/sh", &[])
+    }
+}
+
+/// Convert an OSC 7772 envelope (raw bytes) into a `printf`-compatible shell
+/// command string. Each non-printable byte is emitted as an octal `\NNN`
+/// escape (3-digit, leading zero) that `/bin/sh`'s `printf` interprets — we
+/// use octal `\NNN` rather than `\xHH` because hex escapes in `printf` are
+/// not universally supported, whereas octal `\NNN` is POSIX-portable.
+///
+/// `%` (0x25) is emitted as `%%`: the envelope payload is percent-encoded, so
+/// any buffer char outside the allow-list arrives as `%XX`. A literal `%` in
+/// `printf`'s format string starts a conversion specifier and would truncate
+/// the OSC frame, so it must be doubled. `'` is backslash-escaped so it does
+/// not close the single-quoted format argument.
+///
+/// The envelope is wrapped in `printf '...'` so the shell emits the bytes to
+/// its stdout (which parser sees as PTY output), and a `; read <gate>`
+/// suffix keeps the shell parked so it cannot race the popup render.
+///
+/// Shared by the smoke and startup-compat suites (this module is compiled per
+/// integration-test target, hence the `allow(dead_code)`).
+#[allow(dead_code)]
+pub fn osc_printf_cmd(envelope: &[u8], gate: &str) -> String {
+    let mut escaped = String::new();
+    for &b in envelope {
+        match b {
+            b'\'' => escaped.push_str("\\'"),
+            b'%' => escaped.push_str("%%"), // literal % — printf format escape
+            0x20..=0x7e => escaped.push(b as char), // printable ASCII (not quote/percent)
+            _ => escaped.push_str(&format!("\\{:03o}", b)),
+        }
+    }
+    format!("printf '{}'; read {}", escaped, gate)
 }
 
 /// Byte-level substring search — avoids `String::from_utf8_lossy`
@@ -557,27 +708,29 @@ impl TmuxSession {
     /// process (job control, popup rendering, OSC forwarding). Do not wrap
     /// termcmp here.
     ///
-    /// The config is load-bearing: with `session_isolation` left unset, the
-    /// tri-state default resolves to *mirrored* inside a detected
-    /// multiplexer — which every pane is, once tmux sets `$TMUX`. That would
-    /// silently drop the inner shell's controlling terminal and make
-    /// `shell_has_job_control()` false on Linux, turning the job-control
-    /// tests into skips. Tests that want the auto/mirrored default must ask
-    /// for it via [`TmuxSession::spawn_auto_isolation`].
+    /// The config is load-bearing: the default topology is always-isolate
+    /// (the inner shell keeps its own session + controlling terminal, so
+    /// job control works on Linux too). Tests that want the opt-in mirror
+    /// topology must ask for it via [`TmuxSession::spawn_agent_tracking`] or
+    /// the legacy alias [`TmuxSession::spawn_legacy`].
     pub fn spawn() -> Self {
         Self::spawn_with_isolation("[experimental]\nsession_isolation = true\n", "isolated")
     }
 
-    /// Spawn a tmux session whose pane runs termcmp with `session_isolation`
-    /// **unset** — the shipped default a real tmux/herdr user gets.
-    ///
-    /// Inside tmux this must resolve to the mirrored topology so
-    /// `pane_current_command` (tmux) and `foreground_process_group_id`
-    /// (herdr) see the inner command instead of `termcmp`. The config file
-    /// still exists so the developer's own `~/.config/termcmp/config.toml`
-    /// cannot leak into the assertion.
-    pub fn spawn_auto_isolation() -> Self {
-        Self::spawn_with_isolation("[experimental]\n", "auto")
+    /// Spawn a tmux session whose pane runs termcmp with the experimental
+    /// config **unset** — the shipped default a real user gets: always
+    /// isolate, regardless of multiplexer detection. The config file still
+    /// exists so the developer's own `~/.config/termcmp/config.toml` cannot
+    /// leak into the assertion.
+    pub fn spawn_default_topology() -> Self {
+        Self::spawn_with_isolation("[experimental]\n", "default")
+    }
+
+    /// Spawn a tmux session whose pane runs termcmp with
+    /// `agent_tracking = true` — the opt-in mirror topology for
+    /// tmux/herdr/workmux agent observation.
+    pub fn spawn_agent_tracking() -> Self {
+        Self::spawn_with_isolation("[experimental]\nagent_tracking = true\n", "tracking")
     }
 
     /// Shared construction for the two isolation-selecting spawns. `body` is
@@ -601,14 +754,11 @@ impl TmuxSession {
     }
 
     /// Spawn a tmux session in the **legacy** topology: a config file with
-    /// `[experimental] session_isolation = false` is passed via `--config`,
-    /// so the inner shell stays in the proxy's session and the outer tty's
-    /// foreground pgrp can be mirrored onto inner jobs.
-    ///
-    /// Explicit `false` is the opt-out a user sets on a *direct* terminal that
-    /// is not a detected multiplexer (workmux, or any tracker termcmp does not
-    /// recognize). Inside tmux/herdr the same topology arrives automatically
-    /// when the key is unset — see [`TmuxSession::spawn_auto_isolation`].
+    /// `[experimental] session_isolation = false` is passed via `--config`.
+    /// The legacy alias maps to `agent_tracking = true` (mirror): the inner
+    /// shell stays in the proxy's session and the outer tty's foreground
+    /// pgrp can be mirrored onto inner jobs. Kept so existing user configs
+    /// with the alias are exercised end-to-end.
     ///
     /// The config file is left in place (same convention as the exit markers)
     /// — deleting it would race the pane's startup config load.
@@ -672,12 +822,13 @@ impl TmuxSession {
         // NOTE: `-e GHOSTTY_RESOURCES_DIR=/tmp` is load-bearing. Panes
         // inherit the tmux *server* env (from whichever client started it),
         // not this client's `.env()` overrides — so bare CI servers leak no
-        // terminal markers, detection yields Unknown, and the proxy falls
-        // back to a plain shell (every popup test stalls). Worse, tmux
-        // unconditionally rewrites TERM_PROGRAM=tmux in pane environments,
-        // so `-e TERM_PROGRAM=...` can never work; GHOSTTY_RESOURCES_DIR
-        // passes through untouched and still maps to Ghostty in-tmux (any
-        // existing dir satisfies the detection check).
+        // terminal markers and detection yields Unknown, which renders with
+        // the safe profile instead of the Synchronized path these popup
+        // assertions are written against. Worse, tmux unconditionally
+        // rewrites TERM_PROGRAM=tmux in pane environments, so
+        // `-e TERM_PROGRAM=...` can never work; GHOSTTY_RESOURCES_DIR passes
+        // through untouched and still maps to Ghostty in-tmux (any existing
+        // dir satisfies the detection check).
         // `new-session -e` needs tmux >= 3.2 (CI installs current tmux).
         let output = std::process::Command::new("tmux")
             .args([
@@ -786,17 +937,33 @@ impl TmuxSession {
         self.termcmp.wait_for_bytes_after(needle, 0, timeout)
     }
 
+    /// Wait for raw bytes to appear at or after `start_offset` (a length
+    /// snapshot from [`TmuxSession::capture_output`]'s underlying buffer).
+    pub fn wait_for_bytes_after(
+        &self,
+        needle: &[u8],
+        start_offset: usize,
+        timeout: Duration,
+    ) -> bool {
+        self.termcmp
+            .wait_for_bytes_after(needle, start_offset, timeout)
+    }
+
     /// Capture current output snapshot as a String.
     pub fn capture_output(&self) -> String {
         let snapshot = self.termcmp.output_snapshot();
         String::from_utf8_lossy(&snapshot).to_string()
     }
 
-    /// Resize the tmux pane.
+    /// Resize the tmux window (and thus its sole pane). `resize-pane` is
+    /// clamped to the session size for a single-pane session and silently
+    /// no-ops; `resize-window` changes the window dimensions, which tmux
+    /// propagates to the pane pty (SIGWINCH to the foreground pgrp). The
+    /// proxy then reconciles the inner PTY on its mirror tick.
     pub fn resize_pane(&self, width: u32, height: u32) {
         let status = std::process::Command::new("tmux")
             .args([
-                "resize-pane",
+                "resize-window",
                 "-t",
                 &self.session_name,
                 "-x",
@@ -805,8 +972,8 @@ impl TmuxSession {
                 &height.to_string(),
             ])
             .status()
-            .expect("failed to resize pane");
-        assert!(status.success(), "tmux resize-pane failed");
+            .expect("failed to resize window");
+        assert!(status.success(), "tmux resize-window failed");
     }
 
     /// Wait for the pane's process to exit. With `remain-on-exit on` the

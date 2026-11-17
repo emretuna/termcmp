@@ -102,11 +102,10 @@ pub async fn run_proxy(
             "running on unsupported terminal — cursor save/restore may not work correctly"
         );
         eprintln!(
-            "termcmp: WARNING — {} is not a tested terminal. \
-             Popup rendering may not work correctly.\n\
-             Supported terminals: {}",
-            terminal_profile.terminal(),
-            terminal::Terminal::supported_terminals().join(", ")
+            "termcmp: {} is not a tested terminal — using the safe rendering profile \
+             (single-write frames + shell-integration prompt markers). Suggestions work; \
+             report issues at https://github.com/emretuna/termcmp/issues",
+            terminal_profile.terminal()
         );
     } else {
         tracing::info!(
@@ -115,31 +114,6 @@ pub async fn run_proxy(
             prompt = %terminal_profile.prompt_detection(),
             "terminal profile detected"
         );
-    }
-
-    // Gate unknown terminals behind experimental flag.
-    // All known terminals (see `Terminal::supported_terminals`) work without
-    // any flag. Only Unknown terminals need multi_terminal = true.
-    // Note: CommandExt::exec() is the Unix execvp() syscall — no shell
-    // interpretation, no injection risk. `shell` comes from $SHELL or argv.
-    if should_fallback_to_shell(
-        terminal_profile.terminal(),
-        config.experimental.multi_terminal,
-    ) {
-        tracing::warn!(
-            terminal = %terminal_profile.terminal(),
-            "unknown terminal requires [experimental] multi_terminal = true — falling back to plain shell"
-        );
-        eprintln!(
-            "termcmp: {} is not a supported terminal.\n\
-             To try anyway, add to ~/.config/termcmp/config.toml:\n\n  \
-             [experimental]\n  \
-             multi_terminal = true\n",
-            terminal_profile.terminal()
-        );
-        use std::os::unix::process::CommandExt;
-        let err = std::process::Command::new(shell).args(args).exec();
-        anyhow::bail!("failed to exec shell: {}", err);
     }
 
     // Log tmux detection and propagate recursion guard to future panes
@@ -177,10 +151,21 @@ pub async fn run_proxy(
     // Topology is fixed at spawn (see `spawn_shell_with_pty`) and everything
     // below that depends on it reads this. Read once — the flag requires a
     // restart, so the config watcher must not change it mid-run.
-    let isolated = effective_isolation(
-        config.experimental.session_isolation,
-        terminal_profile.is_multiplexer(),
-    );
+    let isolated = effective_isolation(&config.experimental);
+    // fish 4.x hard-exits without a controlling terminal ("No TTY for
+    // interactive shell"). The macOS ttyshim interposes tcgetpgrp, but no
+    // Linux equivalent exists. Never break the shell: keep isolation and
+    // warn that tracking is unavailable for this session.
+    let isolated = if !isolated
+        && detect_shell_kind(shell) == ShellKind::Fish
+        && cfg!(target_os = "linux")
+    {
+        tracing::warn!("agent_tracking is unsupported for fish on Linux (no controlling terminal) — keeping session isolation");
+        eprintln!("termcmp: agent_tracking is unsupported for fish on Linux — keeping session isolation (password prompts and job control stay functional)");
+        true
+    } else {
+        isolated
+    };
     // Foreground pgrp that owned the outer tty before we started (the user's
     // shell). We mirror child pgrps while running and MUST restore this on
     // exit — otherwise our termios restore happens as a background pgrp and
@@ -194,6 +179,21 @@ pub async fn run_proxy(
         crate::topology::ForegroundMirror::initial_fg(outer_fd)
     };
 
+    // Copy the outer terminal size onto the inner PTY BEFORE the shell starts,
+    // so the shell never initializes on a 0x0 tty (openpty leaves it unset).
+    // The 100ms tick still reconciles later change; this removes the startup
+    // race where a resize issued before the first tick had nothing to copy.
+    if let Ok(size) = get_terminal_size() {
+        let ws = libc::winsize {
+            ws_row: size.rows,
+            ws_col: size.cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        unsafe {
+            libc::ioctl(master_fd.as_raw_fd(), libc::TIOCSWINSZ as _, &ws);
+        }
+    }
     // Spawn shell with dup2 to inner slave (own session under isolation)
     let mut child = spawn_shell_with_pty(shell, args, slave_fd.as_raw_fd(), isolated)?;
     let shell_pid = child.id() as libc::pid_t;
@@ -1037,44 +1037,11 @@ pub async fn run_proxy(
                         break;
                     }
                 };
-                if secure_changed && in_secure {
-                    {
-                        match parser_for_stdout.lock() {
-                            Ok(mut p) => p.state_mut().clear_command_buffer(),
-                            Err(e) => {
-                                tracing::warn!(
-                                    "parser mutex poisoned in stdout task (secure_input clear): {e}"
-                                );
-                                break;
-                            }
-                        }
-                    }
-                    let mut cleanup = Vec::new();
-                    let cleanup_ticket = {
-                        let mut h = match handler_for_stdout.lock() {
-                            Ok(h) => h,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "handler mutex poisoned in stdout task (secure_input): {e}"
-                                );
-                                break;
-                            }
-                        };
-                        // dismiss() no-ops when no popup is visible, so it is
-                        // safe even when echo was toggled without a popup.
-                        h.dismiss(&mut cleanup);
-                        h.invalidate_inflight_generations();
-                        h.reset_input_model();
-                        h.overlay_write_ticket()
-                    };
-                    if !cleanup.is_empty() {
-                        if let Err(e) =
-                            write_overlay_if_current(&handler_for_stdout, cleanup_ticket, &cleanup)
-                        {
-                            tracing::debug!("Task B secure-input cleanup write failed: {e}");
-                            break;
-                        }
-                    }
+                if secure_changed
+                    && in_secure
+                    && !dismiss_for_secure_input(&parser_for_stdout, &handler_for_stdout)
+                {
+                    break;
                 }
             }
 
@@ -1317,13 +1284,17 @@ pub async fn run_proxy(
     // Drop the sender we cloned from — we only need the ones in the tasks
     drop(shutdown_tx);
     // Foreground mirror: mirrors the shell's fg pgrp onto the outer tty.
-    // Legacy topology only — under isolation the shell owns its own session,
-    // so the outer tty's fg pgrp cannot be pointed at inner jobs
-    // (TIOCSPGRP on an inner pgrp returns EINVAL) and there is nothing to
-    // mirror. Multiplexer/agent observation is consequently legacy-only.
+    // Opt-in topology (`[experimental] agent_tracking = true`, or the legacy
+    // `session_isolation = false` alias) only — under the default isolation
+    // the shell owns its own session, so the outer tty's fg pgrp cannot be
+    // pointed at inner jobs (TIOCSPGRP on an inner pgrp returns EINVAL) and
+    // there is nothing to mirror. Multiplexer/agent observation is therefore
+    // opt-in; isolation keeps /dev/tty password prompts and job control
+    // working everywhere.
     let shell_pgid = child.id() as libc::pid_t;
-    let mirror = (!isolated).then(|| crate::topology::ForegroundMirror::new(outer_fd, shell_pgid));
-    if let Some(m) = &mirror {
+    let mut mirror =
+        (!isolated).then(|| crate::topology::ForegroundMirror::new(outer_fd, shell_pgid));
+    if let Some(m) = &mut mirror {
         // Initial mirror: point outer tty at shell's pgrp.
         // The ForegroundMirror points the outer tty's fg pgrp at inner jobs,
         // which makes THIS process background relative to its own controlling
@@ -1400,22 +1371,53 @@ pub async fn run_proxy(
                 }
                 // Update foreground mirror — but never after the shell died:
                 // resolving then returns the shell's own (dead) pgrp and we'd
-                // point the outer tty at nothing.
+                // point the outer tty at nothing. Child events are rare, so a
+                // full table walk here is acceptable.
                 if !shell_dead {
-                    if let Some(m) = &mirror {
-                        if let Some(target) = m.resolve_fg_target() {
+                    if let Some(m) = &mut mirror {
+                        if let Some(target) = m.resolve_fg_target(inner_master_fd) {
                             m.mirror(Some(target));
                         }
                     }
                 }
             }
             _ = mirror_tick.tick() => {
-                // Periodic mirror update (same dead-shell guard)
+                // Periodic mirror update (same dead-shell guard). SIGCHLD
+                // only fires for the proxy's direct child (the shell), never
+                // for the shell's jobs — so the tick must poll. macOS:
+                // tcgetpgrp on the inner master is authoritative and O(1).
+                // Linux (sessionless slave, ENOTTY): skip the table walk only
+                // while following a live non-shell job.
                 if !shell_dead {
-                    if let Some(m) = &mirror {
-                        if let Some(target) = m.resolve_fg_target() {
-                            m.mirror(Some(target));
+                    if let Some(m) = &mut mirror {
+                        m.tick(inner_master_fd);
+                    }
+                }
+                // Secure-input transition: poll the kernel directly (the
+                // published flag only updates on stdout reads, and an echo-off
+                // reader produces none). A popup rendered while ECHO was on
+                // must be dismissed within a tick of `stty -echo` — otherwise
+                // it floats over the sudo/ssh/pinentry password prompt until
+                // the reader finally emits output. Publish the flag so
+                // trigger()/feedback gates see it, then run the shared cleanup.
+                if !shell_dead {
+                    let in_secure = inner_secure_input(inner_master_fd);
+                    let changed = match parser.lock() {
+                        Ok(mut p) => {
+                            let state = p.state_mut();
+                            let was = state.in_secure_input();
+                            if was != in_secure {
+                                state.set_secure_input(in_secure);
+                            }
+                            was != in_secure
                         }
+                        Err(e) => {
+                            tracing::warn!("parser mutex poisoned in tick (secure_input): {e}");
+                            false
+                        }
+                    };
+                    if changed && in_secure && !dismiss_for_secure_input(&parser, &handler) {
+                        break;
                     }
                 }
                 // Reconcile inner PTY size with the outer tty. SIGWINCH is
@@ -1478,10 +1480,11 @@ pub async fn run_proxy(
                             tracing::warn!("failed to resize PTY: {}", e);
                         }
                         // Also forward SIGWINCH to the foreground pgrp on outer tty.
-                        // Legacy only: under isolation `master.resize()` already
-                        // makes the kernel signal the inner tty's foreground
-                        // pgrp, and `mirror` is None there anyway.
-                        if let Some(m) = &mirror {
+                        // Opt-in mirror topology only: under isolation
+                        // `master.resize()` already makes the kernel signal the
+                        // inner tty's foreground pgrp, and `mirror` is None
+                        // there anyway.
+                        if let Some(m) = &mut mirror {
                             if let Some(fg) = m.current_fg() {
                                 if fg > 0 {
                                     unsafe { libc::kill(-fg, libc::SIGWINCH) };
@@ -1726,9 +1729,9 @@ impl PrivateOscFilter {
     /// remain in the stream until this filter strips them so the terminal
     /// never sees them.
     ///
-    /// 7770 is the legacy raw buffer (deprecated; parser still accepts it
-    /// with a one-shot warning) and 7772 is the percent-encoded buffer
-    /// report. 7771 is the prompt-boundary fallback (defined inline in
+    /// 7770 is stripped defensively — the parser no longer consumes it,
+    /// but stale shell integrations may still emit it. 7772 is the
+    /// percent-encoded buffer report. 7771 is the prompt-boundary fallback (defined inline in
     /// `parser`'s performer and emitted by `shell/termcmp.zsh`; see
     /// `docs/ARCHITECTURE.md`). 7773 is the env snapshot (see
     /// `docs/ARCHITECTURE.md`). 7774 is the runtime diagnostic frame.
@@ -1996,6 +1999,50 @@ pub(crate) fn write_overlay_if_current(
     })
 }
 
+/// Secure-input transition cleanup: clear the parser command buffer so no
+/// password bytes linger in buffer models, dismiss any visible popup,
+/// invalidate in-flight async generations, and reset the keystroke input
+/// model. Shared by Task B's stdout-read drain and the 100ms main-loop tick.
+/// The tick path is load-bearing: a popup rendered while ECHO was on must be
+/// cleared within a tick of `stty -echo` even though the echo-off reader
+/// produces no stdout reads to drive Task B's drain (sudo/ssh/pinentry).
+/// `dismiss()` no-ops when no popup is visible, so this is safe even when
+/// echo was toggled without a popup. Returns false only on mutex poison or
+/// overlay write failure (caller breaks its loop).
+fn dismiss_for_secure_input(
+    parser: &Arc<Mutex<TerminalParser>>,
+    handler: &Arc<Mutex<InputHandler>>,
+) -> bool {
+    match parser.lock() {
+        Ok(mut p) => p.state_mut().clear_command_buffer(),
+        Err(e) => {
+            tracing::warn!("parser mutex poisoned in secure_input clear: {e}");
+            return false;
+        }
+    }
+    let mut cleanup = Vec::new();
+    let cleanup_ticket = {
+        let mut h = match handler.lock() {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!("handler mutex poisoned in secure_input: {e}");
+                return false;
+            }
+        };
+        h.dismiss(&mut cleanup);
+        h.invalidate_inflight_generations();
+        h.reset_input_model();
+        h.overlay_write_ticket()
+    };
+    if !cleanup.is_empty() {
+        if let Err(e) = write_overlay_if_current(handler, cleanup_ticket, &cleanup) {
+            tracing::debug!("secure-input cleanup write failed: {e}");
+            return false;
+        }
+    }
+    true
+}
+
 fn write_overlay_if_current_using(
     handler: &Arc<Mutex<InputHandler>>,
     ticket: OverlayWriteTicket,
@@ -2160,6 +2207,9 @@ pub(crate) fn build_providers(
             )),
             ShellKind::Zsh => providers.push(std::sync::Arc::new(
                 crate::shell_completion::ZshCompletionProvider::new(config.suggest.max_results),
+            )),
+            ShellKind::Bash => providers.push(std::sync::Arc::new(
+                crate::shell_completion::BashCompletionProvider::new(config.suggest.max_results),
             )),
             _ => {}
         }
@@ -2640,6 +2690,14 @@ async fn feedback_tick_loop(notify: Arc<Notify>, handler: Arc<Mutex<InputHandler
                         break;
                     }
                 };
+                // Never paint feedback over a password prompt. The published
+                // parser flag is stale while ECHO is off (Task B only updates
+                // it on stdout reads, and a secure reader produces none), so
+                // poll the kernel directly. Bash's async completion lane reaches
+                // Empty/Loading feedback even for a `stty -echo; read` line.
+                if h.inner_secure_input() {
+                    break;
+                }
                 let keep_running = if h.feedback_kind().is_loading() {
                     h.render_indicator_only(&mut render_buf);
                     next_ms = 80;
@@ -2670,27 +2728,18 @@ async fn feedback_tick_loop(notify: Arc<Notify>, handler: Arc<Mutex<InputHandler
     }
 }
 
-/// Returns true if termcmp should replace itself with a plain shell
-/// because multi-terminal support is disabled and we're not on Ghostty.
-pub fn should_fallback_to_shell(
-    terminal: &terminal::Terminal,
-    multi_terminal_enabled: bool,
-) -> bool {
-    // All known terminals work without the experimental flag.
-    // Only Unknown terminals require multi_terminal = true.
-    matches!(terminal, terminal::Terminal::Unknown(_)) && !multi_terminal_enabled
-}
-
-/// Session isolation gives the inner shell its own controlling terminal so
-/// `/dev/tty` prompts work, but it makes foreground process-group mirroring
-/// impossible — which tmux `pane_current_command` and herdr
-/// `foreground_process_group_id` depend on for agent tracking. The two cannot
-/// coexist, so an unset config resolves to "isolate on a direct terminal,
-/// mirror inside a multiplexer". An explicit `true`/`false` always wins:
-/// `true` keeps `/dev/tty` prompts working in tmux/herdr at the cost of
-/// tracking, `false` mirrors everywhere.
-fn effective_isolation(cfg_isolation: Option<bool>, in_multiplexer: bool) -> bool {
-    cfg_isolation.unwrap_or(!in_multiplexer)
+/// Resolve the spawn topology. Default: always isolate (inner shell gets
+/// setsid + TIOCSCTTY) so /dev/tty prompts and job control work on every
+/// terminal and multiplexer. Opt-in agent_tracking (or legacy
+/// session_isolation = false) selects the mirror topology.
+fn effective_isolation(exp: &config::ExperimentalConfig) -> bool {
+    if exp.agent_tracking && exp.session_isolation == Some(true) {
+        tracing::warn!(
+            "experimental: agent_tracking = true conflicts with session_isolation = true — agent_tracking wins (mirror topology)"
+        );
+    }
+    let tracking = exp.agent_tracking || exp.session_isolation == Some(false);
+    !tracking
 }
 
 /// Outcome of dispatching a CPR response back through the proxy. Pure
@@ -2718,64 +2767,34 @@ fn dispatch_cpr_response(state: &mut parser::TerminalState, row: u16, col: u16) 
 mod tests {
     use super::*;
     use crate::input::KeyEvent;
-    use config::DescriptionBoxMode;
+    use config::{DescriptionBoxMode, ExperimentalConfig};
     use suggest::{Suggestion, SuggestionKind, SuggestionSource};
-    use terminal::Terminal;
 
     #[test]
-    fn test_known_terminals_never_fall_back() {
-        // All known terminals work without the experimental flag
-        let known = [
-            Terminal::Ghostty,
-            // Otty (Ghostty fork) must work without multi_terminal — it is a
-            // known terminal, so it never falls back to a plain shell.
-            Terminal::Otty,
-            Terminal::Kitty,
-            Terminal::WezTerm,
-            Terminal::Alacritty,
-            Terminal::Rio,
-            Terminal::ITerm2,
-            Terminal::TerminalApp,
-        ];
-        for terminal in &known {
-            assert!(
-                !should_fallback_to_shell(terminal, false),
-                "{terminal} should not fall back without multi_terminal flag"
-            );
-            assert!(
-                !should_fallback_to_shell(terminal, true),
-                "{terminal} should not fall back with multi_terminal flag"
-            );
-        }
-    }
-
-    #[test]
-    fn test_unknown_falls_back_without_flag() {
-        assert!(should_fallback_to_shell(
-            &Terminal::Unknown("foot".into()),
-            false
-        ));
-    }
-
-    #[test]
-    fn test_unknown_runs_with_flag() {
-        assert!(!should_fallback_to_shell(
-            &Terminal::Unknown("foot".into()),
-            true
-        ));
-    }
-
-    #[test]
-    fn test_isolation_resolves_per_topology_when_unset() {
-        // Unset: isolated on a direct terminal, mirrored under tmux/herdr so
-        // their agent tracking sees the inner command instead of termcmp.
-        assert!(effective_isolation(None, false));
-        assert!(!effective_isolation(None, true));
-        // Explicit values always win over the topology.
-        assert!(effective_isolation(Some(true), false));
-        assert!(effective_isolation(Some(true), true));
-        assert!(!effective_isolation(Some(false), false));
-        assert!(!effective_isolation(Some(false), true));
+    fn test_isolation_defaults_to_always_isolate() {
+        assert!(effective_isolation(&ExperimentalConfig::default()));
+        let mut exp = ExperimentalConfig {
+            agent_tracking: true,
+            ..Default::default()
+        };
+        assert!(!effective_isolation(&exp));
+        exp = ExperimentalConfig {
+            session_isolation: Some(false),
+            ..Default::default()
+        };
+        assert!(!effective_isolation(&exp));
+        exp = ExperimentalConfig {
+            session_isolation: Some(true),
+            ..Default::default()
+        };
+        assert!(effective_isolation(&exp));
+        // Conflict: agent_tracking wins (with a logged warning).
+        exp = ExperimentalConfig {
+            agent_tracking: true,
+            session_isolation: Some(true),
+            ..Default::default()
+        };
+        assert!(!effective_isolation(&exp));
     }
 
     #[test]
@@ -2813,6 +2832,8 @@ mod tests {
 
     #[test]
     fn private_osc_filter_strips_osc_7770() {
+        // Defense-in-depth: the parser no longer consumes 7770; the filter
+        // still strips stray frames from stale integrations.
         let mut f = PrivateOscFilter::default();
         let input = b"\x1b]7770;git checkout\x07hello";
         assert_eq!(f.filter(input), b"hello");
@@ -3220,8 +3241,8 @@ mod tests {
         // Emit OSC 133;A to set in_prompt = true so trigger() passes the prompt gate
         parser.lock().unwrap().process_bytes(b"\x1b]133;A\x07");
         let cursor = buffer.chars().count();
-        let osc = format!("\x1b]7770;{cursor};{buffer}\x07");
-        parser.lock().unwrap().process_bytes(osc.as_bytes());
+        let osc = parser::test_utils::build_osc7772_envelope(buffer, cursor);
+        parser.lock().unwrap().process_bytes(&osc);
         parser
     }
 
@@ -3765,17 +3786,18 @@ mod tests {
     }
 
     #[test]
-    fn build_providers_returns_no_llm_when_ai_disabled() {
+    fn build_providers_returns_bash_native_when_ai_disabled() {
         // Default config: ai.completion.enabled = false, ai.ask.enabled = false.
-        // ShellKind::Bash adds no shell-native provider either, so nothing
-        // async is built.
+        // ShellKind::Bash still contributes its native completion provider.
         let config = config::TermcmpConfig::default();
         let (providers, ask_ai) = build_providers(&config, ShellKind::Bash);
         assert!(ask_ai.is_none());
-        assert!(
-            providers.is_empty(),
-            "no async providers expected with AI disabled under bash"
+        assert_eq!(
+            providers.len(),
+            1,
+            "bash native completion provider must be built"
         );
+        assert_eq!(providers[0].name(), "bash");
     }
 
     #[test]
@@ -3788,7 +3810,11 @@ mod tests {
             std::collections::HashMap::from([("test".to_string(), ai_test_provider_config())]);
         let (providers, ask_ai) = build_providers(&config, ShellKind::Bash);
         assert!(ask_ai.is_none(), "ask feature stays disabled");
-        assert_eq!(providers.len(), 1, "completion provider must be built");
+        assert_eq!(
+            providers.len(),
+            2,
+            "bash native + LLM completion providers must be built"
+        );
     }
 
     #[test]
@@ -3801,9 +3827,11 @@ mod tests {
             std::collections::HashMap::from([("test".to_string(), ai_test_provider_config())]);
         let (providers, ask_ai) = build_providers(&config, ShellKind::Bash);
         assert!(ask_ai.is_some(), "ask provider must be built");
-        assert!(
-            providers.is_empty(),
-            "completion stays disabled, so no inline providers"
+        assert_eq!(
+            providers.len(),
+            1,
+            "completion stays disabled; only the bash native provider is built"
         );
+        assert_eq!(providers[0].name(), "bash");
     }
 }

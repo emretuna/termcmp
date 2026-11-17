@@ -115,7 +115,9 @@ pub fn spawn_shell_with_pty(
         });
     }
 
-    let child = cmd.spawn().context("failed to spawn shell process")?;
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn shell {:?}", shell))?;
     Ok(child)
 }
 

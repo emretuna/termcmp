@@ -316,10 +316,10 @@ fn dash_dash_escape_routes_subcommand_named_shell_to_external() {
 /// Pins the `None => run_proxy(..., Vec::new())` routing arm in `main.rs`.
 /// Invokes termcmp with NO positional argv and no subcommand. The
 /// proxy reads `$SHELL` via `resolve_default_shell()`, logs `"starting
-/// termcmp proxy"` with that shell, then bails when `enable_raw_mode`
-/// fails (stdin is routed through `Stdio::null()` and stdout/stderr through
-/// `Stdio::piped()` — none of them is a TTY, so `enable_raw_mode` fails
-/// fast). The log file is the deterministic signal: if the `None` arm
+/// termcmp proxy"` with that shell, then bails at the isatty guard (stdin is
+/// routed through `Stdio::null()` and stdout/stderr through `Stdio::piped()`
+/// — none of them is a TTY, so the guard fails before raw mode is touched).
+/// The log file is the deterministic signal: if the `None` arm
 /// regressed (e.g. swapped with `External`, hard-coded a different shell,
 /// or panicked), the recorded `shell=` line would not match the $SHELL
 /// value we set — or the log would be empty because tracing never

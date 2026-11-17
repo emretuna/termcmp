@@ -5,7 +5,7 @@ BIN := termcmp
 PACKAGE := termcmp
 CRATE_PATH := crates/termcmp
 
-.PHONY: help build release install install-shell doctor check test clippy fmt clean
+.PHONY: help build release install install-shell doctor check test clippy fmt smoke-bash docker-matrix clean
 
 help:
 	@printf '%s\n' \
@@ -19,6 +19,8 @@ help:
 		'  test           Run cargo test' \
 		'  clippy         Run clippy with warnings denied' \
 		'  fmt            Check rustfmt formatting' \
+		'  smoke-bash     Run the bash shell-integration smoke' \
+		'  docker-matrix  Build and run the Linux x shell Docker matrix' \
 		'  clean          Remove Cargo build artifacts'
 
 build:
@@ -57,6 +59,12 @@ clippy:
 
 fmt:
 	$(CARGO) fmt --check
+
+smoke-bash:
+	./scripts/check-bash-smoke.sh
+
+docker-matrix:
+	docker build -t termcmp-matrix -f docker/Dockerfile . && docker run --rm termcmp-matrix
 
 clean:
 	$(CARGO) clean
