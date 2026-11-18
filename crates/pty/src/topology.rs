@@ -5,8 +5,12 @@
 //! `pane_current_command`, herdr `foreground_process_group_id`) see the
 //! actual foreground command instead of `termcmp`.
 //!
-//! Active only with `[experimental] agent_tracking = true` (or the legacy
-//! `session_isolation = false` alias). The default gives the inner shell its
+//! Mirroring is active by default inside multiplexers (tmux, herdr, workmux):
+//! with `[experimental] agent_tracking` unset, the topology is chosen per
+//! terminal — mirror in a multiplexer so agent discovery sees the running
+//! job, isolate on a direct terminal. Explicit `agent_tracking = true` forces
+//! mirroring everywhere; `false` isolates everywhere (the legacy
+//! `session_isolation` alias is inverted). Isolation gives the inner shell its
 //! own session and controlling terminal (so `/dev/tty` password readers reach
 //! the inner PTY), which makes the outer tty's fg pgrp unmirrorable:
 //! `TIOCSPGRP` targeting an inner pgrp fails `EINVAL`. `ForegroundMirror` is

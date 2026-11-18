@@ -58,22 +58,25 @@ pub struct TermcmpProviders {
     pub enabled: Vec<String>,
 }
 
-/// Experimental knobs. `agent_tracking` is opt-in foreground-process-group
-/// mirroring; the default (false) always isolates the inner shell so
-/// `/dev/tty` password prompts and job control work on every terminal and
-/// multiplexer. `session_isolation` is a legacy inverted alias.
+/// Experimental knobs. `agent_tracking` selects foreground-process-group
+/// mirroring for multiplexer agent tracking; unset resolves per topology —
+/// mirror inside tmux/herdr/workmux, isolate on direct terminals so
+/// `/dev/tty` password prompts and job control work there.
+/// `session_isolation` is a legacy inverted alias.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExperimentalConfig {
     pub multi_terminal: bool,
-    /// Opt-in foreground-process-group mirroring for multiplexer agent
-    /// tracking (tmux pane_current_command, herdr foreground_process_group_id,
-    /// workmux). false (default) = always isolate: the inner shell gets its own
-    /// session + controlling terminal, so /dev/tty password prompts and job
-    /// control work everywhere. true = legacy mirror topology; /dev/tty
-    /// readers contend with the proxy reader (documented tradeoff).
-    /// Read once at startup; changing it requires a restart.
-    pub agent_tracking: bool,
+    /// Foreground-process-group mirroring for multiplexer agent tracking
+    /// (tmux pane_current_command, herdr foreground_process_group_id,
+    /// workmux). Unset (default) resolves per topology: mirror inside a
+    /// multiplexer so agent discovery sees the running agent, isolate on a
+    /// direct terminal so /dev/tty password prompts and job control work.
+    /// `true` mirrors everywhere; `false` isolates everywhere. Mirroring
+    /// lets /dev/tty readers contend with the proxy reader (documented
+    /// tradeoff). Read once at startup; changing it requires a restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_tracking: Option<bool>,
     /// Legacy alias for `agent_tracking` (inverted): `Some(false)` ==
     /// `agent_tracking = true` (mirror), `Some(true)` == `agent_tracking =
     /// false` (isolate). Unset (`None`) contributes nothing; the proxy maps
@@ -2104,7 +2107,7 @@ max_history_entries = 5000
     fn test_experimental_defaults_to_off() {
         let config = TermcmpConfig::default();
         assert!(!config.experimental.multi_terminal);
-        assert!(!config.experimental.agent_tracking);
+        assert_eq!(config.experimental.agent_tracking, None);
     }
 
     #[test]
@@ -2148,15 +2151,25 @@ max_visible = 5
 "#;
         let config: TermcmpConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.experimental.multi_terminal);
-        assert!(!config.experimental.agent_tracking);
+        assert_eq!(config.experimental.agent_tracking, None);
     }
 
     #[test]
     fn test_experimental_agent_tracking_default_and_override() {
-        assert!(!TermcmpConfig::default().experimental.agent_tracking);
+        assert_eq!(TermcmpConfig::default().experimental.agent_tracking, None);
         let config: TermcmpConfig =
             toml::from_str("[experimental]\nagent_tracking = true\n").unwrap();
-        assert!(config.experimental.agent_tracking);
+        assert_eq!(config.experimental.agent_tracking, Some(true));
+        let config: TermcmpConfig =
+            toml::from_str("[experimental]\nagent_tracking = false\n").unwrap();
+        assert_eq!(config.experimental.agent_tracking, Some(false));
+        // An unset key must not be written back out, or `termcmp config`
+        // would emit a value that reloads as an explicit setting.
+        let dumped = toml::to_string(&TermcmpConfig::default()).unwrap();
+        assert!(
+            !dumped.contains("agent_tracking"),
+            "unset agent_tracking leaked into serialization: {dumped}"
+        );
     }
 
     #[test]

@@ -15,11 +15,13 @@
 //!
 //! Environment:
 //! - `PTY_PROXY_CHILD_SHELL`: path of the shell to run (required).
-//! - `PTY_PROXY_CHILD_AGENT_TRACKING`: `1` selects the mirror topology
-//!   (inner shell shares this process's session, so `ForegroundMirror` can
-//!   point the outer tty at inner jobs). Anything else — including unset —
-//!   keeps the isolated topology. Resolved explicitly rather than left
-//!   unset so the test's topology never depends on ambient config.
+//! - `PTY_PROXY_CHILD_AGENT_TRACKING`: tri-state explicit override, mirroring
+//!   `[experimental] agent_tracking`. `1` forces the mirror topology (inner
+//!   shell shares this process's session, so `ForegroundMirror` can point the
+//!   outer tty at inner jobs), `0` forces isolation, and unset (or any other
+//!   value) leaves the key unset so the proxy resolves per topology. The test
+//!   harness sets `1` explicitly so its topology never depends on ambient
+//!   config.
 
 use config::TermcmpConfig;
 use std::ffi::OsStr;
@@ -50,7 +52,11 @@ fn main() {
 
     let mut config = TermcmpConfig::default();
     config.experimental.agent_tracking =
-        std::env::var("PTY_PROXY_CHILD_AGENT_TRACKING").as_deref() == Ok("1");
+        match std::env::var("PTY_PROXY_CHILD_AGENT_TRACKING").as_deref() {
+            Ok("1") => Some(true),
+            Ok("0") => Some(false),
+            _ => None,
+        };
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime in proxy child");
     let code = rt

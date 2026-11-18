@@ -114,8 +114,8 @@ const DEFAULT_CONFIG_TOML: &str = "\
 
 # [experimental]
 # multi_terminal = false  # Deprecated no-op: unknown terminals now always run with the safe profile
-# agent_tracking = false  # true mirrors the foreground process group for tmux/herdr/workmux agent tracking (breaks /dev/tty password prompts); false (default) isolates the inner shell so passwords and job control work everywhere
-# session_isolation = true  # Legacy alias: false == agent_tracking = true; true == agent_tracking = false. agent_tracking wins when both are set.
+# agent_tracking = false  # unset (default): mirror inside tmux/herdr/workmux so agent tracking sees the running agent, isolate on direct terminals so /dev/tty prompts and job control work; true mirrors everywhere (breaks /dev/tty password prompts); false isolates everywhere
+# session_isolation = true  # Legacy alias (inverted): false == agent_tracking = true; true == agent_tracking = false. agent_tracking wins when both are set; unset leaves the per-topology default.
 ";
 
 pub(crate) const INIT_BEGIN: &str = "# >>> termcmp initialize >>>";

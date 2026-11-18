@@ -9,14 +9,15 @@ use std::time::Duration;
 
 /// Probe whether the pane's shell runs with job control (`$-` contains `m`).
 ///
-/// Under the default (isolated) topology the proxy gives the inner shell its
-/// own session with the inner PTY slave as its controlling terminal, so every
-/// shell can claim the tty and enable monitor mode — bash 5.x on Linux
-/// included. (In the legacy topology the slave was never the shell's ctty:
-/// macOS + bash 3.2 tolerated tcsetpgrp anyway, Linux bash 5.x reported "no
-/// job control in this shell".) Tests asserting suspend/bg/fg reporting stay
-/// guarded so that a regression to a ctty-less topology skips instead of
-/// failing platform-impossibly.
+/// Under isolation the proxy gives the inner shell its own session with the
+/// inner PTY slave as its controlling terminal, so every shell can claim the
+/// tty and enable monitor mode — bash 5.x on Linux included. Under the mirror
+/// topology (the unset default inside tmux/herdr, or explicit
+/// `agent_tracking = true`) the slave is never the shell's ctty: macOS +
+/// bash 3.2 tolerated tcsetpgrp anyway, Linux bash 5.x reported "no job
+/// control in this shell". Tests asserting suspend/bg/fg reporting stay
+/// guarded so that a ctty-less topology skips instead of failing
+/// platform-impossibly.
 fn shell_has_job_control(tmux: &mut TmuxSession) -> bool {
     tmux.send_line("echo TERMCMP_JC_FLAGS=$-");
     tmux.expect_output("TERMCMP_JC_FLAGS=");
@@ -72,8 +73,8 @@ fn send_signal_until(tmux: &mut TmuxSession, key: &str, expected: &str) {
 /// maps to `agent_tracking = true`): the outer tty's foreground pgrp is
 /// mirrored onto inner jobs, which is what tmux reads. Isolation cannot mirror
 /// (TIOCSPGRP onto an inner pgrp is EINVAL), so this observation needs the
-/// mirror — the shipped default isolates and is pinned by
-/// [`test_tmux_default_config_isolates_inner_shell`].
+/// mirror — the unset default also mirrors inside tmux and is pinned by
+/// [`test_tmux_default_config_mirrors_inner_shell`].
 #[test]
 fn test_tmux_pane_current_command_shows_shell() {
     let tmux = TmuxSession::spawn_legacy();
@@ -139,34 +140,56 @@ fn test_tmux_pane_current_command_updates_with_foreground_job() {
     tmux.exit();
 }
 
-/// Test that the shipped default (experimental config unset) isolates the
-/// inner shell: tmux `pane_current_command` reports `termcmp` both idle and
-/// while a foreground job runs. This is the new default contract — /dev/tty
-/// prompts and job control work everywhere; agent tracking is opt-in via
-/// `agent_tracking = true` (see
-/// `test_tmux_agent_tracking_restores_foreground_visibility`).
+/// Test that the shipped default (experimental config unset) mirrors the
+/// inner shell inside tmux: the pane reports the inner shell while idle and
+/// the running job while it holds the foreground.
+///
+/// The unset default resolves per topology — mirror inside tmux/herdr/workmux
+/// so agent observation works out of the box, isolate on a direct terminal so
+/// `/dev/tty` prompts and job control work everywhere. Explicit
+/// `agent_tracking = true/false` always wins; isolation is pinned by
+/// [`test_tmux_explicit_isolation_hides_foreground_process`].
+///
+/// Same observations as
+/// [`test_tmux_agent_tracking_restores_foreground_visibility`], with the
+/// config left unset, including its `shell_has_job_control` guard: on Linux
+/// the inner slave is not a controlling terminal under the mirror topology, so
+/// bash 5.x keeps every child in the shell's own pgrp and there is no separate
+/// foreground job pgrp for tmux to observe.
 #[test]
-fn test_tmux_default_config_isolates_inner_shell() {
+fn test_tmux_default_config_mirrors_inner_shell() {
     let mut tmux = TmuxSession::spawn_default_topology();
     tmux.expect_output("$");
 
     let idle = tmux.display_message("#{pane_current_command}");
     assert!(
-        idle.contains("termcmp"),
-        "idle pane should report termcmp under isolation, got: {idle}"
+        idle.contains("bash") && !idle.contains("termcmp"),
+        "unset config inside tmux must expose the inner shell while idle, got: {idle}"
     );
 
+    if !shell_has_job_control(&mut tmux) {
+        eprintln!(
+            "skipping foreground-job visibility under the unset default: shell lacks job \
+             control under the mirror topology on this platform"
+        );
+        tmux.exit();
+        return;
+    }
+
     tmux.send_line("sleep 20");
-    // isolation: pane command is static; brief settle for the shell to fork sleep
-    std::thread::sleep(Duration::from_millis(200));
-    let running = tmux.display_message("#{pane_current_command}");
+    let running = tmux.wait_for_pane_command("sleep", Duration::from_secs(3));
     assert!(
-        running.contains("termcmp"),
-        "isolation hides the inner job; pane must keep reporting termcmp, got: {running}"
+        running.contains("sleep"),
+        "unset config inside tmux must expose the foreground job, got: {running}"
     );
 
     tmux.send_keys("C-c");
-    tmux.expect_output("$");
+    let back = tmux.wait_for_pane_command("bash", Duration::from_secs(3));
+    assert!(
+        back.contains("bash"),
+        "mirror must hand the foreground back to the shell after SIGINT, got: {back}"
+    );
+
     tmux.exit();
 }
 
@@ -225,7 +248,8 @@ fn test_tmux_agent_tracking_restores_foreground_visibility() {
 /// `/dev/tty` password readers keeps isolation, and the price is that tmux
 /// reports the pane as running `termcmp`. Uses [`TmuxSession::spawn`], which
 /// writes that key explicitly — the legacy alias still maps to
-/// `agent_tracking = false`, which is also the shipped default.
+/// `agent_tracking = false`, which is the same topology this explicit key
+/// selects, but the unset default inside a multiplexer is now the mirror.
 #[test]
 fn test_tmux_explicit_isolation_hides_foreground_process() {
     let mut tmux = TmuxSession::spawn();
@@ -244,6 +268,99 @@ fn test_tmux_explicit_isolation_hides_foreground_process() {
 
     tmux.send_keys("C-c");
     tmux.exit();
+}
+
+/// Write an empty `[experimental]` config file (the shipped default) so the
+/// developer's real `~/.config/termcmp/config.toml` cannot leak into a
+/// topology assertion.
+fn unset_experimental_config() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "termcmp-unset-experimental-{}-{}.toml",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::write(&path, "[experimental]\n").expect("write unset-experimental config");
+    path
+}
+
+/// Controlling-terminal device name of `pid` via `ps -o tty=`, or `None` when
+/// the process is gone. On macOS `ps` reports the `sess` column as `0` for
+/// unprivileged callers in every topology, so the portable topology signal is
+/// the ctty: isolation points the shell at the inner PTY slave, while the
+/// mirror leaves it on the outer tty that termcmp owns.
+fn tty_name_of(pid: u32) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "tty=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Unset experimental config on a **direct** spawn (no tmux) inside herdr must
+/// resolve to the mirror topology: herdr observes panes through the kernel
+/// foreground pgrp (`foreground_process_group_id`), so the default has to
+/// mirror there just like it does in tmux.
+///
+/// The topology is structural and observable without tmux: the unset default
+/// decides whether the inner shell `setsid`s. Isolation gives the shell its
+/// own session with the inner PTY slave as its controlling terminal, so its
+/// ctty differs from termcmp's (the outer tty). The mirror keeps the shell in
+/// the proxy's session via `setpgid` only, so its ctty is still the outer tty
+/// — the terminal whose foreground pgrp herdr reads. `HERDR_ENV=1` with no
+/// `TMUX` is herdr's real pane environment; `TERM_PROGRAM` stays the harness's
+/// pinned `ghostty`, which is the leaked outer-terminal shape herdr produces.
+#[test]
+fn test_herdr_default_config_mirrors_inner_shell() {
+    let config = unset_experimental_config();
+    let mut proc = harness::TermcmpProcess::spawn_with_config(&config, &[("HERDR_ENV", "1")], &[]);
+
+    // `printf` splits the marker so the echoed command line does not contain
+    // `CTTYPAIR ` — only the executed output does.
+    proc.send_line("printf 'CTTY%s\\n' \"PAIR $$ $(ps -o tty= -p $$)\"");
+    proc.expect_output("CTTYPAIR ");
+
+    let snapshot = proc.output_snapshot();
+    let text = String::from_utf8_lossy(&snapshot).into_owned();
+    let tail = text
+        .split("CTTYPAIR ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no CTTYPAIR output after the marker: {text}"));
+    let mut fields = tail.split_whitespace();
+    let shell_pid: i32 = fields
+        .next()
+        .expect("CTTYPAIR output must carry the shell pid")
+        .parse()
+        .unwrap_or_else(|e| panic!("shell pid must be numeric ({e}); tail: {tail:?}"));
+    let shell_tty = fields
+        .next()
+        .expect("CTTYPAIR output must carry the shell's controlling terminal")
+        .to_string();
+
+    let termcmp_pid = proc.child_pid().expect("termcmp must expose its pid");
+    let termcmp_tty =
+        tty_name_of(termcmp_pid).expect("`ps -o tty=` must resolve termcmp's controlling tty");
+
+    assert_eq!(
+        shell_tty, termcmp_tty,
+        "unset config inside herdr must mirror, but the inner shell (pid {shell_pid}) sits on \
+         a different controlling terminal: shell tty {shell_tty:?}, termcmp (pid {termcmp_pid}) \
+         tty {termcmp_tty:?}. Isolation re-points the shell at the inner PTY slave; the mirror \
+         keeps the outer tty so herdr can read its foreground pgrp."
+    );
+
+    let code = proc.exit_with_code(0);
+    assert_eq!(
+        code, 0,
+        "expected clean exit after the topology probe, got {code}"
+    );
 }
 
 /// Test job control round-trip: suspend, background, foreground, interrupt

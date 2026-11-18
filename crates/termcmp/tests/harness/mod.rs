@@ -194,9 +194,12 @@ impl TermcmpProcess {
         // profile) but would change the render-strategy assertions.
         cmd.env("TERM_PROGRAM", "ghostty");
         // Strip multiplexer markers so the developer's ambient TMUX/HERDR_ENV
-        // cannot change detection; topology is now always-isolate by default
-        // regardless, but the markers still affect terminal detection (tmux
-        // client_termname query) and the tmux setenv propagation.
+        // cannot change detection. They matter twice over now: an unset
+        // `agent_tracking` resolves per topology (mirror inside a multiplexer,
+        // isolate on a direct terminal), and the markers still affect
+        // terminal detection (tmux client_termname query) and tmux setenv
+        // propagation. A test that wants the herdr branch opts back in with
+        // an explicit override, which lands last.
         for marker in ["TMUX", "TMUX_PANE", "HERDR_ENV", "HERDR_PANE_ID"] {
             cmd.env_remove(marker);
         }
@@ -708,20 +711,30 @@ impl TmuxSession {
     /// process (job control, popup rendering, OSC forwarding). Do not wrap
     /// termcmp here.
     ///
-    /// The config is load-bearing: the default topology is always-isolate
-    /// (the inner shell keeps its own session + controlling terminal, so
-    /// job control works on Linux too). Tests that want the opt-in mirror
-    /// topology must ask for it via [`TmuxSession::spawn_agent_tracking`] or
-    /// the legacy alias [`TmuxSession::spawn_legacy`].
+    /// The config is load-bearing: the unset default now resolves per
+    /// topology (mirror inside tmux/herdr/workmux), so tests that need the
+    /// isolated topology must ask for it explicitly — this constructor writes
+    /// `session_isolation = true`, which the inner shell turns into its own
+    /// session + controlling terminal (job control works on Linux too). Tests
+    /// that want the mirror topology use [`TmuxSession::spawn_agent_tracking`],
+    /// the legacy alias [`TmuxSession::spawn_legacy`], or the unset default
+    /// [`TmuxSession::spawn_default_topology`].
     pub fn spawn() -> Self {
         Self::spawn_with_isolation("[experimental]\nsession_isolation = true\n", "isolated")
     }
 
     /// Spawn a tmux session whose pane runs termcmp with the experimental
-    /// config **unset** — the shipped default a real user gets: always
-    /// isolate, regardless of multiplexer detection. The config file still
-    /// exists so the developer's own `~/.config/termcmp/config.toml` cannot
-    /// leak into the assertion.
+    /// config **unset** — the shipped default a real user gets. Resolution is
+    /// per topology: inside tmux (a multiplexer, like herdr/workmux) the unset
+    /// default is the **mirror** topology, so the outer tty's foreground pgrp
+    /// tracks the inner shell and its jobs (tmux `pane_current_command`,
+    /// herdr `foreground_process_group_id`). A direct terminal isolates so
+    /// `/dev/tty` prompts and job control work everywhere. Explicit
+    /// `agent_tracking = true/false` always wins over the default.
+    ///
+    /// The config file still exists (an empty `[experimental]` table) so the
+    /// developer's own `~/.config/termcmp/config.toml` cannot leak into the
+    /// assertion.
     pub fn spawn_default_topology() -> Self {
         Self::spawn_with_isolation("[experimental]\n", "default")
     }

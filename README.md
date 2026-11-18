@@ -36,8 +36,8 @@ termcmp install
 - **Frizbee fuzzy matching** — type `gco` to match `git checkout`, `cl` to match `clone`
 - **LLM completions** (optional) — AI-powered suggestions when enabled
 - **Privacy-first** — secrets (API keys, tokens, passwords) are redacted before any LLM request
-- **Multiplexer-safe** — works inside tmux, wezterm, zellij, herdr, screen. By default the inner shell is isolated so `/dev/tty` password prompts (sudo/ssh/git/pinentry) and job control work everywhere. Set `[experimental] agent_tracking = true` to restore foreground-process-group mirroring for tmux/herdr/workmux agent observation (at the cost of `/dev/tty` prompt contention)
-- **Password prompts work** — `sudo`, `ssh`, `git` and `pinentry` read `/dev/tty` directly; the default isolated session gives them the inner PTY
+- **Multiplexer-safe** — works inside tmux, wezterm, zellij, herdr, screen. Agent tracking works out of the box inside tmux/herdr/workmux: the foreground process group is mirrored so `pane_current_command`-style observation sees the running agent. Direct terminals isolate the inner shell instead, so `/dev/tty` password prompts (sudo/ssh/git/pinentry) and job control work there. Override with `[experimental] agent_tracking`: `false` opts out of multiplexer mirroring, `true` forces mirroring everywhere
+- **Password prompts work** — `sudo`, `ssh`, `git` and `pinentry` read `/dev/tty` directly; on direct terminals the isolated session gives them the inner PTY, and inside multiplexers they work when agent tracking is off (`agent_tracking = false` or `session_isolation = true`)
 - **TUI-aware** — popup only appears at the prompt, never inside neovim/lazygit/omp agent
 - **Small terminal friendly** — compact mode for dropdown terminals and small panes
 - **Hot-reload config** — edit `~/.config/termcmp/config.toml`, changes apply immediately

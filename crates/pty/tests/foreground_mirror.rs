@@ -133,7 +133,7 @@ unsafe fn spawn_harness(shell: &OsString) -> Result<Harness, String> {
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_pty_proxy_child"));
     cmd.env("PTY_PROXY_CHILD_SHELL", shell)
-        // Both tests in this file exist to cover the opt-in mirror topology:
+        // Both tests in this file exist to cover the explicit mirror topology:
         // `agent_tracking = true` keeps the inner shell in this process's
         // session, which is the only topology where the outer tty's fg pgrp
         // can be pointed at inner jobs.

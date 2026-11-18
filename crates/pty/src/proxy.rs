@@ -151,7 +151,7 @@ pub async fn run_proxy(
     // Topology is fixed at spawn (see `spawn_shell_with_pty`) and everything
     // below that depends on it reads this. Read once — the flag requires a
     // restart, so the config watcher must not change it mid-run.
-    let isolated = effective_isolation(&config.experimental);
+    let isolated = effective_isolation(&config.experimental, terminal_profile.is_multiplexer());
     // fish 4.x hard-exits without a controlling terminal ("No TTY for
     // interactive shell"). The macOS ttyshim interposes tcgetpgrp, but no
     // Linux equivalent exists. Never break the shell: keep isolation and
@@ -1284,13 +1284,13 @@ pub async fn run_proxy(
     // Drop the sender we cloned from — we only need the ones in the tasks
     drop(shutdown_tx);
     // Foreground mirror: mirrors the shell's fg pgrp onto the outer tty.
-    // Opt-in topology (`[experimental] agent_tracking = true`, or the legacy
-    // `session_isolation = false` alias) only — under the default isolation
-    // the shell owns its own session, so the outer tty's fg pgrp cannot be
-    // pointed at inner jobs (TIOCSPGRP on an inner pgrp returns EINVAL) and
-    // there is nothing to mirror. Multiplexer/agent observation is therefore
-    // opt-in; isolation keeps /dev/tty password prompts and job control
-    // working everywhere.
+    // Mirror topology only — by default that means inside a multiplexer
+    // (unset `agent_tracking`), and `agent_tracking = true` (or the legacy
+    // `session_isolation = false` alias) forces it on a direct terminal too.
+    // Under isolation the shell owns its own session, so the outer tty's fg
+    // pgrp cannot be pointed at inner jobs (TIOCSPGRP on an inner pgrp returns
+    // EINVAL) and there is nothing to mirror. Isolation keeps /dev/tty
+    // password prompts and job control working.
     let shell_pgid = child.id() as libc::pid_t;
     let mut mirror =
         (!isolated).then(|| crate::topology::ForegroundMirror::new(outer_fd, shell_pgid));
@@ -2728,17 +2728,29 @@ async fn feedback_tick_loop(notify: Arc<Notify>, handler: Arc<Mutex<InputHandler
     }
 }
 
-/// Resolve the spawn topology. Default: always isolate (inner shell gets
-/// setsid + TIOCSCTTY) so /dev/tty prompts and job control work on every
-/// terminal and multiplexer. Opt-in agent_tracking (or legacy
-/// session_isolation = false) selects the mirror topology.
-fn effective_isolation(exp: &config::ExperimentalConfig) -> bool {
-    if exp.agent_tracking && exp.session_isolation == Some(true) {
-        tracing::warn!(
-            "experimental: agent_tracking = true conflicts with session_isolation = true — agent_tracking wins (mirror topology)"
-        );
+/// Resolve the spawn topology for this session.
+///
+/// An explicit `agent_tracking` wins on every topology: `true` mirrors, so
+/// multiplexer detectors see the foreground agent; `false` isolates, giving
+/// the inner shell its own session + controlling terminal. The legacy inverted
+/// `session_isolation` alias applies when `agent_tracking` is unset. With both
+/// unset the default is per topology: mirror inside a multiplexer (tmux, herdr,
+/// workmux) where agent discovery matters, and isolate on a direct terminal so
+/// `/dev/tty` password prompts and job control work there.
+fn effective_isolation(exp: &config::ExperimentalConfig, in_multiplexer: bool) -> bool {
+    if let (Some(tracking), Some(isolation)) = (exp.agent_tracking, exp.session_isolation) {
+        if tracking == isolation {
+            tracing::warn!(
+                "experimental: agent_tracking = {tracking} conflicts with session_isolation = {isolation} — agent_tracking wins ({} topology)",
+                if tracking { "mirror" } else { "isolated" }
+            );
+        }
     }
-    let tracking = exp.agent_tracking || exp.session_isolation == Some(false);
+    let tracking = match (exp.agent_tracking, exp.session_isolation) {
+        (Some(tracking), _) => tracking,
+        (None, Some(isolation)) => !isolation,
+        (None, None) => in_multiplexer,
+    };
     !tracking
 }
 
@@ -2771,30 +2783,49 @@ mod tests {
     use suggest::{Suggestion, SuggestionKind, SuggestionSource};
 
     #[test]
-    fn test_isolation_defaults_to_always_isolate() {
-        assert!(effective_isolation(&ExperimentalConfig::default()));
-        let mut exp = ExperimentalConfig {
-            agent_tracking: true,
+    fn test_isolation_defaults_per_topology() {
+        let default = ExperimentalConfig::default();
+        // Unset resolves per topology: isolate on a direct terminal, mirror
+        // inside a multiplexer so agent discovery sees the foreground job.
+        assert!(effective_isolation(&default, false));
+        assert!(!effective_isolation(&default, true));
+
+        // Explicit agent_tracking wins on both topologies.
+        let tracking = ExperimentalConfig {
+            agent_tracking: Some(true),
             ..Default::default()
         };
-        assert!(!effective_isolation(&exp));
-        exp = ExperimentalConfig {
+        assert!(!effective_isolation(&tracking, false));
+        assert!(!effective_isolation(&tracking, true));
+        let isolating = ExperimentalConfig {
+            agent_tracking: Some(false),
+            ..Default::default()
+        };
+        assert!(effective_isolation(&isolating, false));
+        assert!(effective_isolation(&isolating, true));
+
+        // Legacy alias is inverted: false == tracking true, true == isolate.
+        let alias_tracking = ExperimentalConfig {
             session_isolation: Some(false),
             ..Default::default()
         };
-        assert!(!effective_isolation(&exp));
-        exp = ExperimentalConfig {
+        assert!(!effective_isolation(&alias_tracking, false));
+        assert!(!effective_isolation(&alias_tracking, true));
+        let alias_isolating = ExperimentalConfig {
             session_isolation: Some(true),
             ..Default::default()
         };
-        assert!(effective_isolation(&exp));
+        assert!(effective_isolation(&alias_isolating, false));
+        assert!(effective_isolation(&alias_isolating, true));
+
         // Conflict: agent_tracking wins (with a logged warning).
-        exp = ExperimentalConfig {
-            agent_tracking: true,
+        let conflict = ExperimentalConfig {
+            agent_tracking: Some(true),
             session_isolation: Some(true),
             ..Default::default()
         };
-        assert!(!effective_isolation(&exp));
+        assert!(!effective_isolation(&conflict, false));
+        assert!(!effective_isolation(&conflict, true));
     }
 
     #[test]
