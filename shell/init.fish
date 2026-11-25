@@ -1,5 +1,6 @@
 # Termcmp — terminal init (sourced near the top of config.fish)
-# Detects the terminal emulator and exec's termcmp as a PTY proxy.
+# Exec's termcmp as a PTY proxy in any terminal with a real TTY; unknown
+# terminals run with the safe rendering profile.
 # herdr-managed panes are recognized and each launches its own proxy.
 
 # Walk PPID ancestry looking for a termcmp proxy process. Returns:
@@ -54,6 +55,17 @@ end
 # effect is dropping a leaked TERMCMP_ACTIVE when the walk proves the
 # variable came from a sibling terminal.
 function __termcmp_should_proxy
+    # config.fish is sourced by EVERY fish start, including `fish -c` scripts:
+    # never replace a non-interactive shell with the proxy.
+    status is-interactive; or return 1
+    # Never replace a dumb terminal (Emacs shell-mode: pty + TERM=dumb).
+    if set -q TERM; and test "$TERM" = dumb
+        return 1
+    end
+    if not set -q TERMCMP_INIT_SKIP_TTY_CHECK
+        test -t 0; and test -t 1; or return 1
+    end
+
     if set -q TMUX; and test -n "$TMUX"
         # Inside tmux: two guards prevent stacking proxies.
         #
@@ -84,22 +96,7 @@ function __termcmp_should_proxy
         if set -q TERMCMP_PANE; and test "$TERMCMP_PANE" = "$TMUX_PANE"
             return 1
         end
-        set -l termcmp_supported 0
-        for var in GHOSTTY_RESOURCES_DIR KITTY_WINDOW_ID WEZTERM_UNIX_SOCKET ALACRITTY_SOCKET ZED_TERM VSCODE_IPC_HOOK_CLI ITERM_SESSION_ID
-            if set -q $var; and test -n "$$var"
-                set termcmp_supported 1
-                break
-            end
-        end
-        if test $termcmp_supported -eq 0; and set -q TERM_PROGRAM
-            switch "$TERM_PROGRAM"
-                case rio otty
-                    set termcmp_supported 1
-            end
-        end
-        if test $termcmp_supported -eq 1; and command -q termcmp
-            return 0
-        end
+        command -q termcmp; and return 0
         return 1
     else
         # Outside tmux: TERMCMP_ACTIVE is normally a reliable recursion
@@ -112,10 +109,7 @@ function __termcmp_should_proxy
         # a herdr-managed pane (herdr exports it in every pane shell).
         # A herdr boundary hit (status 3) means this is a FRESH herdr pane:
         # any termcmp higher in the ancestry wraps an outer terminal, so we
-        # must launch our own proxy — exactly like a tmux pane would. The
-        # supported-terminal check is bypassed because the herdr server above
-        # us IS the real terminal; requiring inherited GHOSTTY_* vars would
-        # make behavior depend on herdr's env propagation.
+        # must launch our own proxy — exactly like a tmux pane would.
         if set -q TERMCMP_ACTIVE; or test "$HERDR_ENV" = "1"
             _termcmp_ancestor_is_proxy
             switch $status
@@ -138,25 +132,11 @@ function __termcmp_should_proxy
                     set -e TERMCMP_ACTIVE
             end
         end
-        set -l supported 0
-        for var in KITTY_WINDOW_ID WEZTERM_UNIX_SOCKET ALACRITTY_SOCKET ZED_TERM VSCODE_IPC_HOOK_CLI
-            if set -q $var; and test -n "$$var"
-                set supported 1
-                break
-            end
-        end
-        if test $supported -eq 0; and set -q TERM_PROGRAM
-            switch "$TERM_PROGRAM"
-                case ghostty otty WezTerm rio iTerm.app Apple_Terminal zed vscode
-                    set supported 1
-            end
-        end
-        # Covers plain terminals AND herdr panes whose server is not visible
-        # in ancestry (HERDR_ENV=1 panes inherit the outer terminal's
-        # GHOSTTY_* environment, so the support check still passes there).
-        if test $supported -eq 1; and command -q termcmp
-            return 0
-        end
+        # Any terminal with a real TTY runs the proxy. Unknown terminals get
+        # the safe rendering profile (single-write frames + OSC 7771 prompt
+        # markers); see docs/CONFIGURATION.md (multi_terminal is a deprecated
+        # no-op).
+        command -q termcmp; and return 0
         return 1
     end
 end

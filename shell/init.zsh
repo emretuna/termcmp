@@ -1,5 +1,6 @@
 # Termcmp — terminal init (sourced near the top of .zshrc)
-# Detects the terminal emulator and exec's termcmp as a PTY proxy.
+# Exec's termcmp as a PTY proxy in any terminal with a real TTY; unknown
+# terminals run with the safe rendering profile.
 # herdr-managed panes are recognized and each launches its own proxy.
 
 # Walk PPID ancestry looking for a termcmp proxy process. Returns:
@@ -37,6 +38,12 @@ _tc_ancestor_is_proxy() {
 # effect is dropping a leaked TERMCMP_ACTIVE when the walk proves the
 # variable came from a sibling terminal.
 __termcmp_should_proxy() {
+  # Real, ANSI-capable terminal required: never replace a piped/non-tty
+  # shell (script runners) or a dumb terminal (Emacs shell-mode runs an
+  # interactive shell on a pty with TERM=dumb) with the proxy.
+  [[ "$TERM" == dumb ]] && return 1
+  [[ -t 0 && -t 1 ]] || [[ -n "$TERMCMP_INIT_SKIP_TTY_CHECK" ]] || return 1
+
   if [[ -n "$TMUX" ]]; then
     # Inside tmux: two guards prevent stacking proxies.
     #
@@ -53,19 +60,7 @@ __termcmp_should_proxy() {
     # and inherited from the outer terminal shell that launched tmux.
     [[ "$(ps -o comm= -p "$PPID" 2>/dev/null)" == "termcmp" ]] && return 1
     [[ -n "$TERMCMP_PANE" && "$TERMCMP_PANE" == "$TMUX_PANE" ]] && return 1
-    if [[ -n "$GHOSTTY_RESOURCES_DIR" ]] || \
-       [[ -n "$KITTY_WINDOW_ID" ]] || \
-       [[ -n "$WEZTERM_UNIX_SOCKET" ]] || \
-       [[ -n "$ALACRITTY_SOCKET" ]] || \
-       [[ -n "$ZED_TERM" ]] || \
-       [[ -n "$VSCODE_IPC_HOOK_CLI" ]] || \
-       [[ -n "$ITERM_SESSION_ID" ]] || \
-       [[ "$TERM_PROGRAM" == "rio" ]] || \
-       [[ "$TERM_PROGRAM" == "otty" ]]; then
-      if command -v termcmp >/dev/null 2>&1; then
-        return 0
-      fi
-    fi
+    command -v termcmp >/dev/null 2>&1 && return 0
     return 1
   else
     # Outside tmux: TERMCMP_ACTIVE is normally a reliable recursion
@@ -78,10 +73,7 @@ __termcmp_should_proxy() {
     # a herdr-managed pane (herdr exports it in every pane shell).
     # A herdr boundary hit (status 3) means this is a FRESH herdr pane:
     # any termcmp higher in the ancestry wraps an outer terminal, so we
-    # must launch our own proxy — exactly like a tmux pane would. The
-    # supported-terminal check is bypassed because the herdr server above
-    # us IS the real terminal; requiring inherited GHOSTTY_* vars would
-    # make behavior depend on herdr's env propagation.
+    # must launch our own proxy — exactly like a tmux pane would.
     if [[ -n "$TERMCMP_ACTIVE" || "$HERDR_ENV" == "1" ]]; then
       _tc_ancestor_is_proxy
       case $? in
@@ -98,24 +90,10 @@ __termcmp_should_proxy() {
           unset TERMCMP_ACTIVE ;;
       esac
     fi
-    local supported=0
-    if [[ -n "$KITTY_WINDOW_ID" ]] \
-      || [[ -n "$WEZTERM_UNIX_SOCKET" ]] \
-      || [[ -n "$ALACRITTY_SOCKET" ]] \
-      || [[ -n "$ZED_TERM" ]] \
-      || [[ -n "$VSCODE_IPC_HOOK_CLI" ]]; then
-      supported=1
-    else
-      case "$TERM_PROGRAM" in
-        ghostty|otty|WezTerm|rio|iTerm.app|Apple_Terminal|zed|vscode) supported=1 ;;
-      esac
-    fi
-    # Covers plain terminals AND herdr panes whose server is not visible
-    # in ancestry (HERDR_ENV=1 panes inherit the outer terminal's
-    # GHOSTTY_* environment, so the support check still passes there).
-    if [[ $supported -eq 1 ]] && command -v termcmp >/dev/null 2>&1; then
-      return 0
-    fi
+    # Any terminal with a real TTY runs the proxy. Unknown terminals get the
+    # safe rendering profile (single-write frames + OSC 7771 prompt markers);
+    # see docs/CONFIGURATION.md (multi_terminal is a deprecated no-op).
+    command -v termcmp >/dev/null 2>&1 && return 0
     return 1
   fi
 }

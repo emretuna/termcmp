@@ -120,9 +120,10 @@ guard_case() {
     # Hermetic: strip any termcmp/herdr env inherited from THIS shell
     # before each case; cases set exactly what they need.
     env -u TERMCMP_ACTIVE -u HERDR_ENV -u GHOSTTY_RESOURCES_DIR \
-        -u TMUX -u TERMCMP_PANE \
+        -u TMUX -u TERMCMP_PANE -u TERM_PROGRAM \
         PATH="${GUARD_FAKE_BIN}:${PATH}" \
-        TERMCMP_INIT_NO_AUTORUN=1 CASE="${name}" "$@" \
+        TERMCMP_INIT_NO_AUTORUN=1 CASE="${name}" TERM=xterm-256color \
+        TERMCMP_INIT_SKIP_TTY_CHECK=1 "$@" \
         zsh --no-rcs -c "
 ps() {
   [ \"\$CASE\" = psfail ] && return 1
@@ -157,6 +158,9 @@ GUARD_OUTPUT+="$(guard_case leak TERMCMP_ACTIVE=1 TERM_PROGRAM=ghostty)"$'\n'
 GUARD_OUTPUT+="$(guard_case herdr-env HERDR_ENV=1 TERM_PROGRAM=ghostty)"$'\n'
 GUARD_OUTPUT+="$(guard_case psfail TERMCMP_ACTIVE=1)"$'\n'
 GUARD_OUTPUT+="$(guard_case tmux-direct TMUX=/tmp/tmux-0,default,999)"$'\n'
+GUARD_OUTPUT+="$(guard_case unknown-terminal TERM_PROGRAM=rex)"$'\n'
+GUARD_OUTPUT+="$(guard_case dumb TERM=dumb TERM_PROGRAM=ghostty)"$'\n'
+GUARD_OUTPUT+="$(guard_case tmux-unknown TMUX=/tmp/tmux-0,default,999 TERM_PROGRAM=rex)"$'\n'
 
 assert_guard_line() {
     local label="$1" expected="$2"
@@ -175,6 +179,9 @@ assert_guard_line "HERDR_ENV fallback launches proxy" 'GUARD_herdr-env=0 VAR=uns
 assert_guard_line "inconclusive walk honors guard" 'GUARD_psfail=1 VAR=set'
 assert_guard_line "tmux direct child of proxy skips" 'GUARD_tmux-direct=1 VAR=unset'
 assert_guard_line "fresh tmux pane launches proxy" 'GUARD_tmux-fresh=0 VAR=set'
+assert_guard_line "unknown terminal launches proxy (safe profile)" 'GUARD_unknown-terminal=0 VAR=unset'
+assert_guard_line "dumb terminal never proxies" 'GUARD_dumb=1 VAR=unset'
+assert_guard_line "tmux pane with unknown outer terminal launches proxy" 'GUARD_tmux-unknown=0 VAR=unset'
 
 rm -rf "${GUARD_FAKE_BIN}"
 

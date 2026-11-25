@@ -145,6 +145,7 @@ chmod +x "${GUARD_FAKE_BIN}/termcmp"
 
 cat > "$GUARD_SCRIPT" <<FISH
 set -gx TERMCMP_INIT_NO_AUTORUN 1
+set -gx TERMCMP_INIT_SKIP_TTY_CHECK 1
 set -x PATH ${GUARD_FAKE_BIN} \$PATH
 source ${REPO_ROOT}/shell/init.fish
 
@@ -194,6 +195,7 @@ function expect --argument-names cname
     set -e TMUX
     set -e TERMCMP_PANE
     set -e TERM_PROGRAM
+    set -gx TERM xterm-256color
     switch \$cname
         case herdr
             # Scenarios 1+2: leaked guard var; herdr above us with an
@@ -218,6 +220,14 @@ function expect --argument-names cname
             set -gx TERMCMP_ACTIVE 1
             set -gx GHOSTTY_RESOURCES_DIR /fake
             set -gx TMUX /tmp/tmux-0,default,999
+        case unknown-terminal
+            set -gx TERM_PROGRAM rex
+        case dumb
+            set -gx TERM dumb
+            set -gx TERM_PROGRAM ghostty
+        case tmux-unknown
+            set -gx TMUX /tmp/tmux-0,default,999
+            set -gx TERM_PROGRAM rex
     end
     __termcmp_should_proxy
     set -l st \$status
@@ -235,9 +245,12 @@ expect herdr-env
 expect psfail
 expect tmux-direct
 expect tmux-fresh
+expect unknown-terminal
+expect dumb
+expect tmux-unknown
 FISH
 
-GUARD_OUTPUT="$(fish --no-config "$GUARD_SCRIPT" 2>&1)"
+GUARD_OUTPUT="$(fish -i --no-config "$GUARD_SCRIPT" 2>&1)"
 
 assert_guard_line() {
     local label="$1" expected="$2"
@@ -256,6 +269,9 @@ assert_guard_line "guard: HERDR_ENV fallback launches proxy" 'GUARD_herdr-env=0 
 assert_guard_line "guard: inconclusive walk honors guard" 'GUARD_psfail=1 VAR=set'
 assert_guard_line "guard: tmux direct child of proxy skips" 'GUARD_tmux-direct=1 VAR=unset'
 assert_guard_line "guard: fresh tmux pane launches proxy" 'GUARD_tmux-fresh=0 VAR=set'
+assert_guard_line "guard: unknown terminal launches proxy (safe profile)" 'GUARD_unknown-terminal=0 VAR=unset'
+assert_guard_line "guard: dumb terminal never proxies" 'GUARD_dumb=1 VAR=unset'
+assert_guard_line "guard: tmux pane with unknown outer terminal launches proxy" 'GUARD_tmux-unknown=0 VAR=unset'
 
 # Orphaned fish idempotency test, wired into the gated smoke path.
 fish "$REPO_ROOT/tests/shell/test_fish_idempotency.fish"

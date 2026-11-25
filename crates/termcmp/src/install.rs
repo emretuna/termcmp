@@ -990,23 +990,49 @@ mod tests {
             "non-tmux branch must use TERMCMP_ACTIVE guard"
         );
 
-        // tmux branch: detect outer terminal via env vars
-        assert!(tmux_branch.contains("$GHOSTTY_RESOURCES_DIR"));
-        assert!(tmux_branch.contains("$KITTY_WINDOW_ID"));
-        assert!(tmux_branch.contains("$WEZTERM_UNIX_SOCKET"));
-        assert!(tmux_branch.contains("$ALACRITTY_SOCKET"));
-        assert!(tmux_branch.contains("$ITERM_SESSION_ID"));
-        assert!(tmux_branch.contains("\"$TERM_PROGRAM\" == \"rio\""));
-        assert!(tmux_branch.contains("\"$TERM_PROGRAM\" == \"otty\""));
-        assert!(tmux_branch.contains("$ZED_TERM"));
-        assert!(tmux_branch.contains("$VSCODE_IPC_HOOK_CLI"));
+        // No supported-terminal allow-list anywhere: auto-launch is
+        // unconditional and unknown terminals run with the safe rendering
+        // profile (docs/CONFIGURATION.md — multi_terminal is a deprecated
+        // no-op). Both branches must fall through to the PATH lookup.
+        for gated in [
+            "$GHOSTTY_RESOURCES_DIR",
+            "$KITTY_WINDOW_ID",
+            "$WEZTERM_UNIX_SOCKET",
+            "$ALACRITTY_SOCKET",
+            "$ZED_TERM",
+            "$VSCODE_IPC_HOOK_CLI",
+            "$ITERM_SESSION_ID",
+            "TERM_PROGRAM",
+        ] {
+            assert!(
+                !script.contains(gated),
+                "init.zsh must not gate auto-launch on {gated}"
+            );
+        }
+        assert!(
+            tmux_branch.contains("command -v termcmp >/dev/null 2>&1 && return 0"),
+            "tmux branch must launch the proxy whenever termcmp is on PATH"
+        );
+        assert!(
+            non_tmux_branch.contains("command -v termcmp >/dev/null 2>&1 && return 0"),
+            "non-tmux branch must launch the proxy whenever termcmp is on PATH"
+        );
 
-        // Direct terminal detection (non-tmux)
-        assert!(non_tmux_branch.contains("case \"$TERM_PROGRAM\""));
-        assert!(non_tmux_branch
-            .contains("ghostty|otty|WezTerm|rio|iTerm.app|Apple_Terminal|zed|vscode)"));
-        assert!(non_tmux_branch.contains("$ZED_TERM"));
-        assert!(non_tmux_branch.contains("$VSCODE_IPC_HOOK_CLI"));
+        // Real-TTY + ANSI-capability guards head the decision function:
+        // piped shells (script runners) and dumb terminals (Emacs
+        // shell-mode) must never be replaced by the proxy. Only the tty
+        // guard has a documented test seam; the dumb guard must not.
+        let head = &script[script.find("__termcmp_should_proxy() {").unwrap()..tmux_start];
+        assert!(
+            head.contains("[[ \"$TERM\" == dumb ]] && return 1"),
+            "dumb-terminal guard must sit before the branch split with no override"
+        );
+        assert!(
+            head.contains(
+                "[[ -t 0 && -t 1 ]] || [[ -n \"$TERMCMP_INIT_SKIP_TTY_CHECK\" ]] || return 1"
+            ),
+            "tty guard must sit before the branch split"
+        );
 
         // Ancestor-walk-based reset for inherited TERMCMP_ACTIVE so the
         // `code .` flow still wires the proxy into VSCode's integrated terminal

@@ -1,20 +1,17 @@
-//! Pin the shell init terminal-detection matrix against
-//! `TerminalProfile::detect_from_env`. New terminals MUST be added in both
-//! sides or this test fails.
+//! Pin the shell init auto-launch contract: any terminal with a real,
+//! ANSI-capable TTY launches the proxy. The shell side MUST NOT keep a
+//! supported-terminal allow-list — that gate is what left rex (and every
+//! other unknown terminal) without termcmp. Per-terminal rendering
+//! knowledge lives only in the Rust `TerminalProfile` matrix; new
+//! terminals are added there for their capabilities, while unknown
+//! terminals already run on the safe rendering profile.
 
 use terminal::TerminalProfile;
 
-/// The minimum direct-branch env vars that init.zsh must recognise.
-const SHELL_DIRECT_ENV_VARS: &[&str] = &[
-    "KITTY_WINDOW_ID",
-    "WEZTERM_UNIX_SOCKET",
-    "ALACRITTY_SOCKET",
-    "ZED_TERM",
-    "VSCODE_IPC_HOOK_CLI",
-];
-
-/// The minimum tmux-branch env vars that init.zsh must recognise.
-const SHELL_TMUX_ENV_VARS: &[&str] = &[
+/// Env vars the old shell-side allow-list gated on. They must not appear
+/// in init.zsh at all: any occurrence means auto-launch became conditional
+/// on a per-terminal marker again.
+const OLD_ALLOWLIST_ENV_VARS: &[&str] = &[
     "GHOSTTY_RESOURCES_DIR",
     "KITTY_WINDOW_ID",
     "WEZTERM_UNIX_SOCKET",
@@ -54,39 +51,54 @@ fn tmux_branch(src: &str) -> &str {
 }
 
 #[test]
-fn init_zsh_direct_branch_recognises_required_env_vars() {
+fn init_zsh_has_no_supported_terminal_allowlist() {
     let src = init_zsh_text();
-    let direct = direct_branch(&src);
-    for var in SHELL_DIRECT_ENV_VARS {
+    for var in OLD_ALLOWLIST_ENV_VARS {
         assert!(
-            direct.contains(var),
-            "init.zsh non-tmux direct branch must check ${} (Rust does)",
-            var
+            !src.contains(var),
+            "init.zsh must not gate auto-launch on ${var}; unknown terminals run the proxy on the safe profile"
+        );
+    }
+    assert!(
+        !src.contains("TERM_PROGRAM"),
+        "init.zsh must not branch on TERM_PROGRAM; terminal capabilities are decided by the Rust profile, not the shell"
+    );
+}
+
+#[test]
+fn init_zsh_branches_launch_whenever_termcmp_is_on_path() {
+    let src = init_zsh_text();
+    let branches = [("tmux", tmux_branch(&src)), ("direct", direct_branch(&src))];
+    for (name, branch) in branches {
+        assert!(
+            branch.contains("command -v termcmp >/dev/null 2>&1 && return 0"),
+            "{name} branch must fall through to the PATH lookup unconditionally"
         );
     }
 }
 
 #[test]
-fn init_zsh_tmux_branch_recognises_required_env_vars() {
+fn init_zsh_requires_real_tty_and_drops_dumb_terminals() {
     let src = init_zsh_text();
-    let tmux = tmux_branch(&src);
-    for var in SHELL_TMUX_ENV_VARS {
-        assert!(
-            tmux.contains(var),
-            "init.zsh tmux branch must check ${} (Rust does)",
-            var
-        );
-    }
+    assert!(
+        src.contains("[[ -t 0 && -t 1 ]] || [[ -n \"$TERMCMP_INIT_SKIP_TTY_CHECK\" ]] || return 1"),
+        "init.zsh must require a real tty on stdin+stdout (with the documented test seam)"
+    );
+    assert!(
+        src.contains("[[ \"$TERM\" == dumb ]] && return 1"),
+        "init.zsh must never proxy a TERM=dumb terminal (Emacs shell-mode)"
+    );
 }
 
 #[test]
 fn rust_terminal_enum_has_wezterm_variant() {
-    // Sanity: the WezTerm variant exists in the Rust matrix so the shell
-    // side has a counterpart to keep parity with. Env-based detection of
-    // WezTerm via socket is exercised by terminal's own unit tests
-    // (test_detect_wezterm_direct_via_socket); we can't drive that path
-    // from an integration test without mutating process-global env vars,
-    // which is unsafe under cargo test's parallel runner.
+    // Sanity: the WezTerm variant exists on the Rust side — the one place
+    // per-terminal knowledge is allowed to live now that the shell gate is
+    // gone. Env-based detection of WezTerm via socket is exercised by
+    // terminal's own unit tests (test_detect_wezterm_direct_via_socket); we
+    // can't drive that path from an integration test without mutating
+    // process-global env vars, which is unsafe under cargo test's parallel
+    // runner.
     let profile = TerminalProfile::for_wezterm();
     assert!(matches!(profile.terminal(), terminal::Terminal::WezTerm));
 }
